@@ -5,6 +5,9 @@ mod protocol;
 mod runtime;
 mod transport;
 
+#[cfg(target_os = "android")]
+mod android_jni;
+
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
 pub use model::LcInputEvent;
 
@@ -34,6 +37,7 @@ mod tests {
             announcement.negotiated_version(),
             Some(PROTOCOL_MAX_VERSION)
         );
+        assert_eq!(announcement.platform, "unknown");
         announcement.min_protocol_version = PROTOCOL_MAX_VERSION + 1;
         announcement.max_protocol_version = PROTOCOL_MAX_VERSION + 1;
         assert!(!announcement.is_compatible());
@@ -231,6 +235,7 @@ mod tests {
                 device_name: "First".to_owned(),
                 control_port: first_port,
                 discovery_port,
+                ..CoreConfig::default()
             },
             first_sink,
         )
@@ -241,6 +246,7 @@ mod tests {
                 device_name: "Second".to_owned(),
                 control_port: second_port,
                 discovery_port,
+                ..CoreConfig::default()
             },
             second_sink,
         )

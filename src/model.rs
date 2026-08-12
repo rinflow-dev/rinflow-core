@@ -64,8 +64,10 @@ const LC_MODIFIERS_ALL: u32 = LC_MODIFIER_SHIFT
 pub struct CoreConfig {
     pub device_id: String,
     pub device_name: String,
+    pub platform: String,
     pub control_port: u16,
     pub discovery_port: u16,
+    pub capabilities: u64,
 }
 
 impl Default for CoreConfig {
@@ -73,8 +75,10 @@ impl Default for CoreConfig {
         Self {
             device_id: String::new(),
             device_name: "LinkCursor Mac".to_owned(),
+            platform: "unknown".to_owned(),
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
+            capabilities: LOCAL_CAPABILITIES,
         }
     }
 }
@@ -89,6 +93,12 @@ impl CoreConfig {
         }
         if self.device_id.len() > 1024 || self.device_name.len() > 1024 {
             return Err("device identity fields must not exceed 1024 bytes".to_owned());
+        }
+        if !matches!(
+            self.platform.as_str(),
+            "android" | "macos" | "windows" | "linux" | "unknown"
+        ) {
+            return Err("platform must be android, macos, windows, linux, or unknown".to_owned());
         }
         if self.control_port == 0 || self.discovery_port == 0 {
             return Err("ports must be non-zero".to_owned());
@@ -105,6 +115,8 @@ pub struct Announcement {
     pub capabilities: u64,
     pub device_id: String,
     pub device_name: String,
+    #[serde(default = "unknown_platform")]
+    pub platform: String,
     pub control_port: u16,
 }
 
@@ -114,9 +126,10 @@ impl Announcement {
             product: "linkcursor".to_owned(),
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: LOCAL_CAPABILITIES,
+            capabilities: config.capabilities,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
+            platform: config.platform.clone(),
             control_port: config.control_port,
         }
     }
@@ -142,6 +155,7 @@ pub fn negotiate_protocol(remote_min: u16, remote_max: u16) -> Option<u16> {
 pub struct Peer {
     pub id: String,
     pub name: String,
+    pub platform: String,
     pub address: String,
     pub port: u16,
     pub capabilities: u64,
@@ -149,6 +163,10 @@ pub struct Peer {
     pub socket_address: SocketAddr,
     #[serde(skip)]
     pub last_seen: Instant,
+}
+
+fn unknown_platform() -> String {
+    "unknown".to_owned()
 }
 
 /// Platform-neutral input event passed over the C ABI and the wire protocol.
@@ -264,7 +282,7 @@ impl WireMessage {
         Self::Hello {
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: LOCAL_CAPABILITIES,
+            capabilities: config.capabilities,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             control_port: config.control_port,

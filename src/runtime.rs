@@ -235,6 +235,7 @@ async fn run(
                     let peer = Peer {
                         id: message.device_id.clone(),
                         name: message.device_name,
+                        platform: message.platform,
                         address: source.ip().to_string(),
                         port: message.control_port,
                         capabilities: message.capabilities,
@@ -403,6 +404,7 @@ fn handle_connection_event(event: ConnectionEvent, context: ConnectionEventConte
                             json!({
                                 "id": device_id,
                                 "name": device_name,
+                                "platform": "unknown",
                                 "address": "incoming",
                                 "port": control_port,
                                 "capabilities": capabilities
