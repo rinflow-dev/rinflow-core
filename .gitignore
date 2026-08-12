@@ -1,0 +1,10 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local environment and OS metadata
+.DS_Store
+.env
+.env.*
+!.env.example
