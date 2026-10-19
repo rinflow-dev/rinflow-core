@@ -1,3 +1,4 @@
+mod api;
 mod ffi;
 mod input;
 mod model;
@@ -8,8 +9,9 @@ mod transport;
 #[cfg(target_os = "android")]
 mod android_jni;
 
+pub use api::Core;
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
-pub use model::LcInputEvent;
+pub use model::{CoreConfig, LcInputEvent};
 
 #[cfg(test)]
 mod tests {

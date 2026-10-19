@@ -74,7 +74,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             device_id: String::new(),
-            device_name: "LinkCursor Mac".to_owned(),
+            device_name: "LinkCursor".to_owned(),
             platform: "unknown".to_owned(),
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
