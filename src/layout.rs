@@ -374,6 +374,141 @@ pub fn placed(peer: &[Display], offset: Offset) -> Vec<Display> {
         .collect()
 }
 
+/// Distance, in points, between an edge and where the pointer lands after
+/// crossing it, so a small move back does not bounce straight across again.
+pub const CROSSING_MARGIN: f64 = 2.0;
+/// How far inside its edge the pointer reappears when control is given back
+/// without crossing (release key, peer gone).
+const RETURN_INSET: f64 = 8.0;
+
+/// The pointer while it drives a peer, tracked in the peer's space.
+///
+/// The controlling device keeps its own cursor parked meanwhile, so this is
+/// the only position there is. Motion moves it within the peer's displays,
+/// sliding along edges that lead nowhere as the peer's own cursor does, and
+/// moving it out through a portal ends the crossing at the matching local
+/// point. The peer plays the same motion, so both stay in step.
+#[derive(Clone, Debug)]
+pub struct RemotePointer {
+    peer: Vec<Display>,
+    /// Every portal to this peer, in this device's space: the pointer may
+    /// come back through any of them.
+    portals: Vec<Portal>,
+    offset: Offset,
+    entry: Portal,
+    x: f64,
+    y: f64,
+}
+
+impl RemotePointer {
+    /// Crosses through `portal` from the local point `(x, y)` on its edge.
+    /// The position is where the pointer appears on the peer (send it as an
+    /// absolute move so the peer's cursor starts there too).
+    pub fn enter(
+        peer: &[Display],
+        portals: &[Portal],
+        offset: Offset,
+        portal: Portal,
+        x: f64,
+        y: f64,
+    ) -> Self {
+        let peer = peer_or_default(peer);
+        let display = peer.get(portal.peer_display).copied().unwrap_or(peer[0]);
+        let (mut px, mut py) = clamp_into(&display, x - offset.x, y - offset.y);
+        match portal.side {
+            Side::Right => px = (px + CROSSING_MARGIN).min(display.right() - 1.0),
+            Side::Left => px = (px - CROSSING_MARGIN).max(display.x),
+            Side::Bottom => py = (py + CROSSING_MARGIN).min(display.bottom() - 1.0),
+            Side::Top => py = (py - CROSSING_MARGIN).max(display.y),
+        }
+        Self {
+            peer,
+            portals: portals.to_vec(),
+            offset,
+            entry: portal,
+            x: px,
+            y: py,
+        }
+    }
+
+    /// Where the pointer is on the peer, in the peer's space.
+    pub fn position(&self) -> (f64, f64) {
+        (self.x, self.y)
+    }
+
+    /// Moves by `(dx, dy)` points. Returns the local point to continue at
+    /// when the move leaves the peer through a portal; the crossing is then
+    /// over and this pointer should be dropped.
+    pub fn move_by(&mut self, dx: f64, dy: f64) -> Option<(f64, f64)> {
+        let (x, y) = (self.x + dx, self.y + dy);
+        if self.peer.iter().any(|display| contains(display, x, y)) {
+            (self.x, self.y) = (x, y);
+            return None;
+        }
+        let (local_x, local_y) = (x + self.offset.x, y + self.offset.y);
+        if let Some(exit) = self
+            .portals
+            .iter()
+            .find_map(|portal| exit_through(portal, local_x, local_y))
+        {
+            return Some(exit);
+        }
+        let current = self
+            .peer
+            .iter()
+            .find(|display| contains(display, self.x, self.y))
+            .copied()
+            .unwrap_or(self.peer[0]);
+        (self.x, self.y) = clamp_into(&current, x, y);
+        None
+    }
+
+    /// A local point just inside the edge the pointer left through, near
+    /// `(x, y)`, for giving control back without crossing.
+    pub fn return_point(&self, x: f64, y: f64) -> (f64, f64) {
+        let portal = &self.entry;
+        let along = |value: f64| value.clamp(portal.from, (portal.to - 1.0).max(portal.from));
+        match portal.side {
+            Side::Right => (portal.line - RETURN_INSET, along(y)),
+            Side::Left => (portal.line + RETURN_INSET, along(y)),
+            Side::Bottom => (along(x), portal.line - RETURN_INSET),
+            Side::Top => (along(x), portal.line + RETURN_INSET),
+        }
+    }
+}
+
+fn contains(display: &Display, x: f64, y: f64) -> bool {
+    x >= display.x && x < display.right() && y >= display.y && y < display.bottom()
+}
+
+/// The nearest point inside the display (the far edges are exclusive).
+fn clamp_into(display: &Display, x: f64, y: f64) -> (f64, f64) {
+    (
+        x.clamp(display.x, display.right() - 1.0),
+        y.clamp(display.y, display.bottom() - 1.0),
+    )
+}
+
+/// If the local point `(x, y)` lies back on this device's side of the
+/// portal's edge and within its extent, where the pointer continues locally.
+fn exit_through(portal: &Portal, x: f64, y: f64) -> Option<(f64, f64)> {
+    let (back, along) = match portal.side {
+        Side::Right => (x < portal.line, y),
+        Side::Left => (x >= portal.line, y),
+        Side::Bottom => (y < portal.line, x),
+        Side::Top => (y >= portal.line, x),
+    };
+    if !back || !(portal.from..portal.to).contains(&along) {
+        return None;
+    }
+    Some(match portal.side {
+        Side::Right => (portal.line - CROSSING_MARGIN, y),
+        Side::Left => (portal.line + CROSSING_MARGIN, y),
+        Side::Bottom => (x, portal.line - CROSSING_MARGIN),
+        Side::Top => (x, portal.line + CROSSING_MARGIN),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +558,34 @@ mod tests {
             (back[0].side, back[0].line, back[0].from, back[0].to),
             (Side::Left, 0.0, 0.0, 800.0)
         );
+    }
+
+    #[test]
+    fn the_remote_pointer_moves_on_the_peer_and_comes_back_through_the_portal() {
+        let mac = [display(0.0, 0.0, 1512.0, 982.0)];
+        let offset = Offset {
+            x: 1440.0,
+            y: 100.0,
+        };
+        let found = portals(&[LAPTOP], &mac, offset);
+        // Crossing at local y 500 lands two points inside the Mac's left edge.
+        let mut pointer = RemotePointer::enter(&mac, &found, offset, found[0], 1440.0, 500.0);
+        assert_eq!(pointer.position(), (2.0, 400.0));
+        // A small move back does not bounce straight across again.
+        assert_eq!(pointer.move_by(-1.0, 0.0), None);
+        assert_eq!(pointer.position(), (1.0, 400.0));
+        // Nothing is above the Mac: the pointer slides along its top edge.
+        assert_eq!(pointer.move_by(100.0, -1000.0), None);
+        assert_eq!(pointer.position(), (101.0, 0.0));
+        // Below the laptop (local y 950) the Mac's left edge leads nowhere.
+        assert_eq!(pointer.move_by(0.0, 850.0), None);
+        assert_eq!(pointer.move_by(-200.0, 0.0), None);
+        assert_eq!(pointer.position(), (0.0, 850.0));
+        // Within the portal it comes back two points inside the laptop.
+        assert_eq!(pointer.move_by(0.0, -400.0), None);
+        assert_eq!(pointer.move_by(-3.0, 0.0), Some((1438.0, 550.0)));
+        // Released without crossing: just inside the edge it left through.
+        assert_eq!(pointer.return_point(1440.0, 2000.0), (1432.0, 899.0));
     }
 
     #[test]
