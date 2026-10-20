@@ -16,13 +16,24 @@ pub enum PushOutcome {
     DroppedCoalescible,
 }
 
+/// What the platform shell queued, in the order it called the core. Target
+/// changes and resets travel in the same queue as input, so input sent right
+/// after a target change goes to the new target and nothing sent after a
+/// reset is discarded by it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlatformEntry {
+    Event(LcInputEvent),
+    SetTarget(Option<String>),
+    Reset,
+}
+
 #[derive(Clone)]
 pub struct PlatformInputQueue {
     shared: Arc<Mutex<PlatformInputState>>,
 }
 
 struct PlatformInputState {
-    entries: VecDeque<LcInputEvent>,
+    entries: VecDeque<PlatformEntry>,
     notification_pending: bool,
 }
 
@@ -43,13 +54,15 @@ impl PlatformInputQueue {
         event.reserved = 0;
         let mut state = self.shared.lock().expect("platform input queue poisoned");
 
-        let outcome = if let Some(previous) = state.entries.back_mut()
+        let outcome = if let Some(PlatformEntry::Event(previous)) = state.entries.back_mut()
             && coalesce(previous, &event)
         {
             PushOutcome::Coalesced
         } else {
             if state.entries.len() >= SOFT_QUEUE_LIMIT {
-                if let Some(index) = state.entries.iter().position(LcInputEvent::is_coalescible) {
+                if let Some(index) = state.entries.iter().position(
+                    |entry| matches!(entry, PlatformEntry::Event(event) if event.is_coalescible()),
+                ) {
                     state.entries.remove(index);
                 } else if event.is_coalescible() {
                     return Ok((PushOutcome::DroppedCoalescible, false));
@@ -58,16 +71,28 @@ impl PlatformInputQueue {
             if state.entries.len() >= HARD_QUEUE_LIMIT {
                 return Err("platform critical input queue is full");
             }
-            state.entries.push_back(event);
+            state.entries.push_back(PlatformEntry::Event(event));
             PushOutcome::Queued
         };
 
-        let should_notify = !state.notification_pending;
-        state.notification_pending = true;
-        Ok((outcome, should_notify))
+        Ok((outcome, Self::notify(&mut state)))
     }
 
-    pub fn drain(&self) -> Vec<LcInputEvent> {
+    /// Queues a target change or reset behind the input already queued.
+    /// Returns whether the runtime must be notified.
+    pub fn push_control(&self, entry: PlatformEntry) -> bool {
+        let mut state = self.shared.lock().expect("platform input queue poisoned");
+        state.entries.push_back(entry);
+        Self::notify(&mut state)
+    }
+
+    fn notify(state: &mut PlatformInputState) -> bool {
+        let should_notify = !state.notification_pending;
+        state.notification_pending = true;
+        should_notify
+    }
+
+    pub fn drain(&self) -> Vec<PlatformEntry> {
         let mut state = self.shared.lock().expect("platform input queue poisoned");
         state.notification_pending = false;
         state.entries.drain(..).collect()
@@ -257,11 +282,6 @@ impl RemoteInputState {
     /// Marks that the peer stopped driving this device. True if it was.
     pub fn end_control(&mut self) -> bool {
         std::mem::replace(&mut self.controlled, false)
-    }
-
-    pub fn reset_for_connection(&mut self) -> Vec<LcInputEvent> {
-        self.last_sequence = 0;
-        self.release_events()
     }
 
     pub fn accept_range(&mut self, first_sequence: u64, count: usize) -> SequenceStatus {

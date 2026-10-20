@@ -10,9 +10,24 @@ pub struct LcCore {
     thread: CoreThread,
 }
 
+/// Version 3 adds several sessions at once, `lc_core_disconnect_peer` and
+/// `lc_core_set_input_target`. Version 2 calls keep their meaning, applied
+/// to the input target.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    2
+    3
+}
+
+/// Reads a C string argument; `None` for null or invalid UTF-8.
+unsafe fn string_argument(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: the caller passes a valid null-terminated string.
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 #[unsafe(no_mangle)]
@@ -87,6 +102,48 @@ pub unsafe extern "C" fn lc_core_disconnect(core: *mut LcCore) -> bool {
         }
         let core = unsafe { &*core };
         core.thread.send(Command::Disconnect).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_disconnect_peer(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        core.thread.send(Command::DisconnectPeer(peer_id)).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// `peer_id` may be null to stop sending input to anyone.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_input_target(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let target = if peer_id.is_null() {
+            None
+        } else {
+            match unsafe { string_argument(peer_id) } {
+                Some(peer_id) => Some(peer_id),
+                None => return false,
+            }
+        };
+        core.thread.send(Command::SetInputTarget(target)).is_ok()
     }))
     .unwrap_or(false)
 }

@@ -27,7 +27,6 @@ pub enum ConnectionEvent {
 }
 
 pub struct ActiveConnection {
-    pub id: u64,
     pub peer_id: Option<String>,
     pub protocol_version: Option<u16>,
     pub capabilities: u64,
@@ -93,7 +92,6 @@ pub fn spawn_connection(
     });
 
     Ok(ActiveConnection {
-        id: connection_id,
         peer_id: None,
         protocol_version: None,
         capabilities: 0,

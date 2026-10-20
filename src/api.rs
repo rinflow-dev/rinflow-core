@@ -21,12 +21,29 @@ impl Core {
         Ok(Self { thread })
     }
 
+    /// Opens a session with the peer unless one exists, and makes it the
+    /// input target. Sessions with other peers stay open.
     pub fn connect(&self, peer_id: &str) -> Result<(), String> {
         self.thread.send(Command::Connect(peer_id.to_owned()))
     }
 
+    /// Closes the session with the input target (every session if no
+    /// target is set).
     pub fn disconnect(&self) -> Result<(), String> {
         self.thread.send(Command::Disconnect)
+    }
+
+    pub fn disconnect_peer(&self, peer_id: &str) -> Result<(), String> {
+        self.thread
+            .send(Command::DisconnectPeer(peer_id.to_owned()))
+    }
+
+    /// Chooses the peer that `send_input` and `reset_input` go to. The old
+    /// target first gets a reset, so nothing stays pressed there. `None`
+    /// drops input until a target is set.
+    pub fn set_input_target(&self, peer_id: Option<&str>) -> Result<(), String> {
+        self.thread
+            .send(Command::SetInputTarget(peer_id.map(str::to_owned)))
     }
 
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {

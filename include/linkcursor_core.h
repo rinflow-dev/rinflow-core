@@ -4,7 +4,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define LC_CORE_ABI_VERSION 2
+/*
+ * 3: several sessions at once (one per peer), lc_core_disconnect_peer and
+ *    lc_core_set_input_target. The version 2 calls are unchanged and act on
+ *    the input target. Session events carry "peer_id".
+ */
+#define LC_CORE_ABI_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,8 +72,17 @@ LcCore *lc_core_create(
 );
 
 void lc_core_destroy(LcCore *core);
+
+/* Opens a session with the peer (unless one exists) and makes it the input
+ * target. Sessions with other peers stay open. */
 bool lc_core_connect(LcCore *core, const char *peer_id);
+/* Closes the session with the input target, or every session if none is set. */
 bool lc_core_disconnect(LcCore *core);
+bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
+/* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
+ * target gets a reset first. NULL drops input until a target is set. When no
+ * target was ever set, the first peer to connect becomes the target. */
+bool lc_core_set_input_target(LcCore *core, const char *peer_id);
 bool lc_core_send_input(LcCore *core, const LcInputEvent *event);
 bool lc_core_reset_input(LcCore *core);
 

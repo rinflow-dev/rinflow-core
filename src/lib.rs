@@ -20,7 +20,9 @@ pub use model::{
 
 #[cfg(test)]
 mod tests {
-    use super::input::{OutboundInputQueue, PushOutcome, RemoteInputState};
+    use super::input::{
+        OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
+    };
     use super::model::{
         Announcement, CoreConfig, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
         LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL,
@@ -285,6 +287,32 @@ mod tests {
     }
 
     #[test]
+    fn target_changes_stay_ordered_with_input() {
+        let queue = PlatformInputQueue::new();
+        let first = LcInputEvent {
+            kind: LC_INPUT_MOUSE_MOVE,
+            delta_x: 1.0,
+            ..LcInputEvent::default()
+        };
+        let second = LcInputEvent {
+            delta_x: 2.0,
+            ..first
+        };
+        queue.push(first).expect("first motion");
+        queue.push_control(PlatformEntry::SetTarget(Some("other".to_owned())));
+        // Motion after the switch must not merge into motion for the old target.
+        queue.push(second).expect("second motion");
+        assert_eq!(
+            queue.drain(),
+            vec![
+                PlatformEntry::Event(first),
+                PlatformEntry::SetTarget(Some("other".to_owned())),
+                PlatformEntry::Event(second),
+            ]
+        );
+    }
+
+    #[test]
     fn remote_control_starts_once_and_ends_once() {
         let mut state = RemoteInputState::default();
         assert!(state.begin_control());
@@ -506,6 +534,194 @@ mod tests {
 
         first.stop_and_join();
         second.stop_and_join();
+    }
+
+    struct TestCore {
+        thread: CoreThread,
+        events: Receiver<String>,
+        input: Receiver<LcInputEvent>,
+        port: u16,
+    }
+
+    fn test_core(device_id: &str, discovery_port: u16) -> TestCore {
+        let (events_tx, events) = mpsc::channel();
+        let (input_tx, input) = mpsc::channel();
+        let port = free_tcp_port();
+        let thread = CoreThread::spawn(
+            CoreConfig {
+                device_id: device_id.to_owned(),
+                control_port: port,
+                discovery_port,
+                ..CoreConfig::default()
+            },
+            EventSink::new(
+                move |event| {
+                    let _ = events_tx.send(event);
+                },
+                move |event| {
+                    let _ = input_tx.send(event);
+                },
+            ),
+        )
+        .expect("start core");
+        TestCore {
+            thread,
+            events,
+            input,
+            port,
+        }
+    }
+
+    /// Waits until every listed peer was discovered, in whatever order.
+    fn wait_for_peers(core: &TestCore, peer_ids: &[&str]) {
+        let mut missing: Vec<&str> = peer_ids.to_vec();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !missing.is_empty() {
+            let message = core
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("peers not discovered: {missing:?}"));
+            let event: Value = serde_json::from_str(&message).expect("valid event JSON");
+            if event["event"] == "peer_up" {
+                missing.retain(|id| event["peer"]["id"] != *id);
+            }
+        }
+    }
+
+    fn wait_connected(core: &TestCore, peer_id: &str) {
+        wait_for_event(&core.events, Duration::from_secs(6), |event| {
+            event["event"] == "connected" && event["peer"]["id"] == peer_id
+        });
+    }
+
+    fn motion(delta_x: f64) -> LcInputEvent {
+        LcInputEvent {
+            kind: LC_INPUT_MOUSE_MOVE,
+            delta_x,
+            ..LcInputEvent::default()
+        }
+    }
+
+    /// The motion events received within `wait`, as their `delta_x`.
+    fn received(core: &TestCore, wait: Duration) -> Vec<f64> {
+        let deadline = Instant::now() + wait;
+        let mut deltas = Vec::new();
+        while let Ok(event) = core
+            .input
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if event.kind == LC_INPUT_MOUSE_MOVE {
+                deltas.push(event.delta_x);
+            }
+        }
+        deltas
+    }
+
+    fn events_named(core: &TestCore, name: &str) -> Vec<Value> {
+        core.events
+            .try_iter()
+            .filter_map(|event| serde_json::from_str::<Value>(&event).ok())
+            .filter(|event| event["event"] == name)
+            .collect()
+    }
+
+    #[test]
+    fn sessions_with_several_peers_stay_open_and_input_follows_the_target() {
+        let discovery_port = free_udp_port();
+        let mut a = test_core("multi-a", discovery_port);
+        let mut b = test_core("multi-b", discovery_port);
+        let mut c = test_core("multi-c", discovery_port);
+        wait_for_peers(&a, &["multi-b", "multi-c"]);
+
+        a.thread.send(Command::Connect("multi-b".into())).unwrap();
+        wait_connected(&a, "multi-b");
+        a.thread.send(Command::Connect("multi-c".into())).unwrap();
+        wait_connected(&a, "multi-c");
+        wait_connected(&b, "multi-a");
+        wait_connected(&c, "multi-a");
+
+        // The last connect made C the target; B's session stays open.
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&c, Duration::from_millis(400)), vec![1.0]);
+        assert!(received(&b, Duration::from_millis(100)).is_empty());
+
+        a.thread
+            .send(Command::SetInputTarget(Some("multi-b".into())))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![2.0]);
+        assert!(received(&c, Duration::from_millis(100)).is_empty());
+        // Switching away gave control back to C.
+        wait_for_event(&c.events, Duration::from_secs(2), |event| {
+            event["event"] == "remote_control_ended" && event["peer_id"] == "multi-a"
+        });
+
+        // Closing C leaves B connected and still receiving input.
+        a.thread
+            .send(Command::DisconnectPeer("multi-c".into()))
+            .unwrap();
+        wait_for_event(&c.events, Duration::from_secs(3), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "multi-a"
+        });
+        a.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![3.0]);
+        assert!(events_named(&b, "disconnected").is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
+    }
+
+    #[test]
+    fn an_unidentified_connection_does_not_replace_a_session() {
+        let discovery_port = free_udp_port();
+        let mut a = test_core("stranger-a", discovery_port);
+        let mut b = test_core("stranger-b", discovery_port);
+        wait_for_peers(&a, &["stranger-b"]);
+        a.thread
+            .send(Command::Connect("stranger-b".into()))
+            .unwrap();
+        wait_connected(&a, "stranger-b");
+        wait_connected(&b, "stranger-a");
+
+        // Something on the network connects to B and never says hello.
+        let _stranger = std::net::TcpStream::connect(("127.0.0.1", b.port)).expect("connect to B");
+        std::thread::sleep(Duration::from_millis(200));
+
+        a.thread.send(Command::SendInput(motion(5.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![5.0]);
+        assert!(events_named(&b, "disconnected").is_empty());
+        assert!(events_named(&a, "disconnected").is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn peers_dialing_each_other_at_once_keep_exactly_one_session() {
+        let discovery_port = free_udp_port();
+        let mut a = test_core("dial-a", discovery_port);
+        let mut b = test_core("dial-b", discovery_port);
+        wait_for_peers(&a, &["dial-b"]);
+        wait_for_peers(&b, &["dial-a"]);
+
+        a.thread.send(Command::Connect("dial-b".into())).unwrap();
+        b.thread.send(Command::Connect("dial-a".into())).unwrap();
+        wait_connected(&a, "dial-b");
+        wait_connected(&b, "dial-a");
+        // Let both duplicates arrive and be resolved.
+        std::thread::sleep(Duration::from_millis(500));
+
+        a.thread.send(Command::SendInput(motion(7.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(500)), vec![7.0]);
+        b.thread.send(Command::SendInput(motion(8.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(500)), vec![8.0]);
+        // Duplicates are closed quietly: neither side saw a disconnect.
+        assert!(events_named(&a, "disconnected").is_empty());
+        assert!(events_named(&b, "disconnected").is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
     }
 
     fn wait_for_event(
