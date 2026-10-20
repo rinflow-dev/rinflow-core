@@ -2,12 +2,14 @@ use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
 use crate::remap::ShortcutRemap;
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 /// `disconnected` reason when the peer closed the connection (it quit, was
@@ -39,6 +41,7 @@ pub struct ActiveConnection {
     pub shortcut_remap: ShortcutRemap,
     control: mpsc::Sender<WireMessage>,
     input: OutboundInputQueue,
+    bulk: BulkQueue,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
@@ -58,9 +61,39 @@ impl ActiveConnection {
         self.input.reset();
     }
 
+    /// Queues a bulk transfer (clipboard chunks) behind input, replacing one
+    /// still queued: newer contents make the rest of older ones pointless.
+    pub fn send_bulk(&self, messages: Vec<WireMessage>) {
+        self.bulk.replace(messages);
+    }
+
     pub fn abort(self) {
         self.read_task.abort();
         self.write_task.abort();
+    }
+}
+
+/// Frames sent only when no control message or input is waiting, so a large
+/// transfer delays input by at most one frame.
+#[derive(Clone, Default)]
+struct BulkQueue {
+    shared: Arc<(Mutex<VecDeque<WireMessage>>, Notify)>,
+}
+
+impl BulkQueue {
+    fn replace(&self, messages: Vec<WireMessage>) {
+        let mut queue = self.shared.0.lock().expect("bulk queue poisoned");
+        queue.clear();
+        queue.extend(messages);
+        self.shared.1.notify_one();
+    }
+
+    fn pop(&self) -> Option<WireMessage> {
+        self.shared.0.lock().expect("bulk queue poisoned").pop_front()
+    }
+
+    async fn notified(&self) {
+        self.shared.1.notified().await;
     }
 }
 
@@ -74,6 +107,7 @@ pub fn spawn_connection(
     let (reader, writer) = stream.into_split();
     let (control_tx, control_rx) = mpsc::channel(64);
     let input = OutboundInputQueue::new();
+    let bulk = BulkQueue::default();
 
     let read_events = events.clone();
     let read_task = tokio::spawn(async move {
@@ -89,8 +123,9 @@ pub fn spawn_connection(
 
     let write_events = events;
     let write_input = input.clone();
+    let write_bulk = bulk.clone();
     let write_task = tokio::spawn(async move {
-        if let Err(error) = write_loop(writer, control_rx, write_input, hello).await {
+        if let Err(error) = write_loop(writer, control_rx, write_input, write_bulk, hello).await {
             let _ = write_events.send(ConnectionEvent::Closed {
                 connection_id,
                 reason: format!("write failed: {error}"),
@@ -105,6 +140,7 @@ pub fn spawn_connection(
         shortcut_remap: ShortcutRemap::None,
         control: control_tx,
         input,
+        bulk,
         read_task,
         write_task,
     })
@@ -149,6 +185,7 @@ async fn write_loop(
     mut writer: OwnedWriteHalf,
     mut controls: mpsc::Receiver<WireMessage>,
     input: OutboundInputQueue,
+    bulk: BulkQueue,
     hello: WireMessage,
 ) -> io::Result<()> {
     write_frame(&mut writer, &hello).await?;
@@ -163,6 +200,11 @@ async fn write_loop(
             write_frame(&mut writer, &message).await?;
             continue;
         }
+        // Bulk data only when nothing else waits, one frame at a time.
+        if let Some(message) = bulk.pop() {
+            write_frame(&mut writer, &message).await?;
+            continue;
+        }
 
         tokio::select! {
             biased;
@@ -171,6 +213,7 @@ async fn write_loop(
                 write_frame(&mut writer, &message).await?;
             }
             _ = input.notified() => {}
+            _ = bulk.notified() => {}
         }
     }
     writer.shutdown().await

@@ -1,3 +1,4 @@
+use crate::clipboard::{CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_SIZE};
 use crate::layout::{Display, MAX_DISPLAYS, Offset, validate_displays};
 use crate::model::{LcInputEvent, MAX_INPUT_BATCH_SIZE, WireMessage};
 use std::io;
@@ -14,6 +15,7 @@ const MESSAGE_PING: u8 = 4;
 const MESSAGE_PONG: u8 = 5;
 const MESSAGE_SCREEN_INFO: u8 = 6;
 const MESSAGE_PLACEMENT: u8 = 7;
+const MESSAGE_CLIPBOARD_CHUNK: u8 = 8;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
     let message_type = match message {
@@ -24,6 +26,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::Pong { .. } => MESSAGE_PONG,
         WireMessage::ScreenInfo { .. } => MESSAGE_SCREEN_INFO,
         WireMessage::Placement { .. } => MESSAGE_PLACEMENT,
+        WireMessage::ClipboardChunk { .. } => MESSAGE_CLIPBOARD_CHUNK,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -97,6 +100,19 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
                 None => encoder.u8(0),
             }
             encoder.u64(*updated_ms);
+        }
+        WireMessage::ClipboardChunk {
+            id,
+            total,
+            offset,
+            data,
+        } => {
+            check_clipboard_chunk(*total, *offset, data.len())?;
+            encoder.u32(*id);
+            encoder.u32(*total);
+            encoder.u32(*offset);
+            encoder.u32(data.len() as u32);
+            encoder.bytes.extend_from_slice(data);
         }
     }
     Ok(encoder.bytes)
@@ -215,6 +231,19 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 updated_ms: decoder.u64()?,
             }
         }
+        MESSAGE_CLIPBOARD_CHUNK => {
+            let id = decoder.u32()?;
+            let total = decoder.u32()?;
+            let offset = decoder.u32()?;
+            let length = decoder.u32()? as usize;
+            check_clipboard_chunk(total, offset, length)?;
+            WireMessage::ClipboardChunk {
+                id,
+                total,
+                offset,
+                data: decoder.take(length)?.to_vec(),
+            }
+        }
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;
@@ -223,6 +252,14 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn check_clipboard_chunk(total: u32, offset: u32, length: usize) -> io::Result<()> {
+    let (total, offset) = (total as usize, offset as usize);
+    if total > MAX_CLIPBOARD_SIZE || length > CLIPBOARD_CHUNK_SIZE || offset + length > total {
+        return Err(invalid_data("invalid clipboard chunk"));
+    }
+    Ok(())
 }
 
 struct Encoder {

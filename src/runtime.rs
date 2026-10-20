@@ -1,7 +1,8 @@
+use crate::clipboard::{self, Clipboard, ClipboardAssembler};
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
+    Announcement, CAPABILITY_CLIPBOARD, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
     PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::remap::ShortcutRemap;
@@ -78,6 +79,8 @@ pub enum Command {
         peer_id: String,
         side: Side,
     },
+    /// The system clipboard changed; empty when it holds nothing shared.
+    SetClipboard(Clipboard),
     Stop,
 }
 
@@ -231,6 +234,9 @@ async fn run(
         peer_displays: HashMap::new(),
         pending_disconnects: Vec::new(),
         portals: Vec::new(),
+        clipboard: None,
+        next_clipboard_id: 0,
+        controlling: None,
     };
 
     sink.emit_value(json!({
@@ -252,6 +258,7 @@ async fn run(
                     Some(Command::SetLocalDisplays(displays)) => state.set_local_displays(displays),
                     Some(Command::SetPlacement { peer_id, offset }) => state.set_placement(&peer_id, offset),
                     Some(Command::PlaceBeside { peer_id, side }) => state.place_beside(&peer_id, side),
+                    Some(Command::SetClipboard(clipboard)) => state.set_clipboard(clipboard),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -299,6 +306,9 @@ struct Session {
     remote_input: RemoteInputState,
     /// Last sign of life: creation, handshake or pong.
     last_seen: Instant,
+    /// The clipboard last exchanged with this peer, either way.
+    clipboard_synced: Option<u64>,
+    clipboard_in: ClipboardAssembler,
 }
 
 impl Session {
@@ -333,6 +343,12 @@ struct Runtime<'a> {
     pending_disconnects: Vec<PendingDisconnect>,
     /// The portals last reported in `portals_changed`.
     portals: Vec<Value>,
+    /// This device's clipboard, encoded, with its digest.
+    clipboard: Option<(u64, Arc<Vec<u8>>)>,
+    next_clipboard_id: u32,
+    /// The peer this device's input is driving, from the first event sent
+    /// after a target change or reset until the next one.
+    controlling: Option<String>,
 }
 
 /// How long a disconnect may be held back while a duplicate connection that
@@ -458,9 +474,18 @@ impl Runtime<'_> {
         for entry in entries {
             match entry {
                 PlatformEntry::Event(event) => {
-                    if let Some(session) = self.target_session()
-                        && let Err(error) = session.connection.send_input(event)
-                    {
+                    let Some(target) = self.input_target.clone() else {
+                        continue;
+                    };
+                    let Some(id) = self.established_session(&target) else {
+                        continue;
+                    };
+                    if self.controlling.as_deref() != Some(target.as_str()) {
+                        // Control moves to the peer, and the clipboard with it.
+                        self.controlling = Some(target);
+                        self.sync_clipboard(id);
+                    }
+                    if let Err(error) = self.sessions[&id].connection.send_input(event) {
                         self.sink.emit_error(error);
                     }
                 }
@@ -470,10 +495,54 @@ impl Runtime<'_> {
         }
     }
 
-    fn reset_target_input(&self) {
+    fn reset_target_input(&mut self) {
+        self.controlling = None;
         if let Some(session) = self.target_session() {
             session.connection.reset_input();
         }
+    }
+
+    /// Takes the system clipboard the shell reports. Sent to a peer when
+    /// control moves to it or comes back from it (see `clipboard.rs`).
+    fn set_clipboard(&mut self, clipboard: Clipboard) {
+        if clipboard.is_empty() {
+            self.clipboard = None;
+            return;
+        }
+        if let Err(error) = clipboard.validate() {
+            self.sink.emit_error(format!("clipboard not shared: {error}"));
+            self.clipboard = None;
+            return;
+        }
+        let encoded = clipboard.encode();
+        self.clipboard = Some((clipboard::digest(&encoded), Arc::new(encoded)));
+    }
+
+    /// Hands the peer of session `id` this device's clipboard, unless it has
+    /// it already (sent to it, or received from it).
+    fn sync_clipboard(&mut self, id: u64) {
+        let Some((digest, encoded)) = &self.clipboard else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if !self.config.clipboard
+            || session.connection.capabilities & CAPABILITY_CLIPBOARD == 0
+            || session.clipboard_synced == Some(*digest)
+        {
+            return;
+        }
+        session.clipboard_synced = Some(*digest);
+        self.next_clipboard_id = self.next_clipboard_id.wrapping_add(1);
+        session
+            .connection
+            .send_bulk(clipboard::chunks(self.next_clipboard_id, encoded));
+        self.sink.emit_value(json!({
+            "event": "clipboard_sent",
+            "peer_id": session.peer_id(),
+            "size": encoded.len()
+        }));
     }
 
     fn accept(&mut self, stream: TcpStream) {
@@ -506,6 +575,8 @@ impl Runtime<'_> {
                         outgoing,
                         remote_input: RemoteInputState::default(),
                         last_seen: Instant::now(),
+                        clipboard_synced: None,
+                        clipboard_in: ClipboardAssembler::default(),
                     },
                 );
             }
@@ -942,6 +1013,9 @@ impl Runtime<'_> {
                     "remote reset",
                     peer_id.as_deref(),
                 );
+                // Whatever was copied here while it drove this device goes
+                // back with the control.
+                self.sync_clipboard(id);
             }
             WireMessage::Ping { sequence } => {
                 let _ = session
@@ -958,6 +1032,43 @@ impl Runtime<'_> {
                 if let Some(peer_id) = session.peer_id().map(str::to_owned) {
                     self.remote_placement(&peer_id, offset, updated_ms);
                 }
+            }
+            WireMessage::ClipboardChunk {
+                id: transfer,
+                total,
+                offset,
+                data,
+            } => {
+                if !self.config.clipboard {
+                    return;
+                }
+                let peer_id = session.peer_id().map(str::to_owned);
+                let encoded = match session.clipboard_in.push(transfer, total, offset, &data) {
+                    Ok(Some(encoded)) => encoded,
+                    Ok(None) => return,
+                    Err(error) => {
+                        self.sink.emit_error(format!("clipboard not received: {error}"));
+                        return;
+                    }
+                };
+                let clipboard = match Clipboard::decode(&encoded) {
+                    Ok(clipboard) => clipboard,
+                    Err(error) => {
+                        self.sink.emit_error(format!("clipboard not received: {error}"));
+                        return;
+                    }
+                };
+                // The peer has these contents: they are not sent back to it.
+                // They are this device's clipboard now, as the shell will
+                // make them, so they travel on to the next peer.
+                let digest = clipboard::digest(&encoded);
+                session.clipboard_synced = Some(digest);
+                self.clipboard = Some((digest, Arc::new(encoded)));
+                self.sink.emit_value(json!({
+                    "event": "clipboard",
+                    "peer_id": peer_id,
+                    "formats": clipboard.to_json()
+                }));
             }
         }
     }

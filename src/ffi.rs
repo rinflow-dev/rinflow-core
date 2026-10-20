@@ -1,3 +1,4 @@
+use crate::clipboard::Clipboard;
 use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
@@ -11,10 +12,11 @@ pub struct LcCore {
     thread: CoreThread,
 }
 
-/// Version 4 adds the arrangement: display descriptions and placements.
+/// Version 5 adds the clipboard: `lc_core_set_clipboard`, the `clipboard`
+/// config key and the `clipboard` event.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    4
+    5
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -229,6 +231,32 @@ pub unsafe extern "C" fn lc_core_place_beside(
         core.thread
             .send(Command::PlaceBeside { peer_id, side })
             .is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// `clipboard_json`: `{"formats":[{"mime":…,"data":base64},…]}`, the system
+/// clipboard after a change; no formats when it holds nothing shared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_clipboard(
+    core: *mut LcCore,
+    clipboard_json: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let Some(json) = (unsafe { string_argument(clipboard_json) }) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return false;
+        };
+        let Ok(clipboard) = Clipboard::from_json(&value) else {
+            return false;
+        };
+        core.thread.send(Command::SetClipboard(clipboard)).is_ok()
     }))
     .unwrap_or(false)
 }

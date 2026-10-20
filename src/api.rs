@@ -1,3 +1,4 @@
+use crate::clipboard::Clipboard;
 use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
@@ -67,6 +68,12 @@ impl Core {
             peer_id: peer_id.to_owned(),
             side,
         })
+    }
+
+    /// The system clipboard after a change (empty when it holds nothing
+    /// shared). Needs `CoreConfig::clipboard`; see `clipboard.rs`.
+    pub fn set_clipboard(&self, clipboard: Clipboard) -> Result<(), String> {
+        self.thread.send(Command::SetClipboard(clipboard))
     }
 
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {
