@@ -63,11 +63,23 @@
 - **只读需要的类型**：只取上表三种，不要把剪贴板里所有类型都读出来（大文件拷贝时剪贴板里可能有很大的表示）。
 - **线程**：核心库回调在它自己的线程上，按现有 `RustCore` 的做法转到主线程再操作 `NSPasteboard`。
 
-### 1.5 Windows 实现要点（Windows agent 侧，供对照）
+### 1.5 Windows 实现（已完成：`linkcursor-windows/agent/src/clipboard.rs`）
 
-- 用 `AddClipboardFormatListener` 收 `WM_CLIPBOARDUPDATE`，在一个隐藏窗口所在的线程上处理。
-- 剪贴板包含 `ExcludeClipboardContentFromMonitorProcessing`，或 `CanIncludeInClipboardHistory` 为 0 时，视为隐私内容，报告空。
+- 在一个专用线程的仅消息窗口上用 `AddClipboardFormatListener` 收 `WM_CLIPBOARDUPDATE`。
+- 剪贴板包含 `ExcludeClipboardContentFromMonitorProcessing` 或 `Clipboard Viewer Ignore`，或者 `CanIncludeInClipboardHistory` 为 0 时，视为隐私内容，报告空。
 - 自己写入后会收到一次 `WM_CLIPBOARDUPDATE`：用 `GetClipboardSequenceNumber()` 记下写入后的序号，跳过这一次。
+- 读取顺序是 HTML（从 CF_HTML 头部的偏移取出片段）、PNG（没有时把 `CF_DIB` 转成 PNG）、文本。写入 PNG 时同时写一份 32 位 `CF_DIB`，写入 HTML 时生成 CF_HTML 头部。
+- 设置程序"设备"页有"同步剪贴板"开关，默认关闭，保存在 `%LOCALAPPDATA%\LinkCursor\settings.json`。agent 总是在配置里打开 `clipboard`，以便随时开关：
+  - 关闭时报告空剪贴板，不写入收到的内容；
+  - 收到对方的剪贴板时立刻再报告一次空，清掉核心库保存的那份，避免它被转发给第三台设备。
+- 用模拟 Mac 端到端测过：
+  - 开关关闭时完全不同步；
+  - 中文文本双向同步；
+  - 图片双向同步：Windows → Mac 收到正确尺寸的 PNG，Mac → Windows 得到 PNG 和位图；
+  - HTML（CF_HTML 是正确的 UTF-8）；
+  - 隐私内容不发送。
+
+  Mac 端实现后，可以用同样的步骤和 Windows 互测。
 
 ### 1.6 已知限制
 
