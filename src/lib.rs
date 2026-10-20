@@ -193,6 +193,14 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(transfer_files::parse_uri_list(&list), paths);
         }
+        if cfg!(windows) {
+            let windows = vec![
+                PathBuf::from(r"C:\Users\a b\报告#1.pdf"),
+                PathBuf::from(r"\\server\share\x"),
+            ];
+            let list = transfer_files::uri_list(&windows);
+            assert_eq!(transfer_files::parse_uri_list(&list), windows);
+        }
         let mixed =
             b"# comment\r\nhttps://example.com/x\r\nfile://server/share/x\r\nfile:///tmp/ok\r\n";
         let parsed = transfer_files::parse_uri_list(mixed);

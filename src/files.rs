@@ -397,8 +397,13 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
     }
     let decoded = percent_decode(rest)?;
     if cfg!(windows) {
-        // file:///C:/Users/… → C:\Users\…
-        let path = decoded.strip_prefix('/').unwrap_or(&decoded);
+        // file:///C:/Users/… → C:\Users\…; file:////server/share/… is UNC
+        // (\\server\share\…) and keeps both slashes.
+        let path = if decoded.starts_with("//") {
+            &decoded
+        } else {
+            decoded.strip_prefix('/').unwrap_or(&decoded)
+        };
         Some(PathBuf::from(path.replace('/', "\\")))
     } else {
         Some(PathBuf::from(decoded))
