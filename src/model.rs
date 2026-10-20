@@ -71,7 +71,8 @@ pub struct CoreConfig {
     pub discovery_port: u16,
     pub capabilities: u64,
     /// Translate Command and Control shortcuts when a controlling peer uses
-    /// the other platform convention (see `remap.rs`).
+    /// the other platform convention (see `remap.rs`). Off by default: keys
+    /// keep their position, so a Mac's Command is the Windows key.
     pub shortcut_remap: bool,
     /// This device's displays in logical points (see `layout.rs`).
     pub displays: Vec<Display>,
@@ -99,7 +100,7 @@ impl Default for CoreConfig {
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
             capabilities: LOCAL_CAPABILITIES,
-            shortcut_remap: true,
+            shortcut_remap: false,
             displays: Vec::new(),
             placements: Vec::new(),
         }

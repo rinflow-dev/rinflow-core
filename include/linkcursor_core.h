@@ -33,9 +33,11 @@ typedef struct LcCore LcCore;
  *   without it the values come from a notched wheel at 10 points per line.
  * - Leave sequence at zero; the core assigns it.
  *
- * Received keys are already translated between Command and Control when the
- * controlling peer uses the other platform's shortcut convention (config
- * key "shortcut_remap", on by default).
+ * Keys keep their position by default: a Mac's Command arrives as the
+ * Windows/Super key, Control as Control, Option as Alt, as with Deskflow.
+ * With the config key "shortcut_remap" on, Command and Control are instead
+ * translated when the controlling peer uses the other platform's shortcut
+ * convention (see remap.rs).
  */
 typedef struct LcInputEvent {
     uint32_t kind;

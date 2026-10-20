@@ -217,6 +217,21 @@ mod tests {
     }
 
     #[test]
+    fn keys_keep_their_position_by_default() {
+        // Command stays the GUI key (the Windows key on a PC), as in Deskflow.
+        assert!(!CoreConfig::default().shortcut_remap);
+        let mut command = LcInputEvent {
+            kind: LC_INPUT_KEY_DOWN,
+            code: 0xE3,
+            modifiers: LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND,
+            ..LcInputEvent::default()
+        };
+        let sent = command;
+        ShortcutRemap::None.apply(&mut command);
+        assert_eq!(command, sent);
+    }
+
+    #[test]
     fn shortcut_remap_depends_on_both_platforms() {
         assert_eq!(
             ShortcutRemap::between("macos", "windows"),
@@ -377,6 +392,9 @@ mod tests {
                 platform: "windows".to_owned(),
                 control_port: second_port,
                 discovery_port,
+                // Opt in, to cover the translation end to end; by default
+                // keys keep their position.
+                shortcut_remap: true,
                 ..CoreConfig::default()
             },
             second_sink,
@@ -434,7 +452,7 @@ mod tests {
             .expect("receive key down");
         assert_eq!(key_down.kind, LC_INPUT_KEY_DOWN);
 
-        // Mac Command arrives on Windows as Control.
+        // With shortcut_remap on, Mac Command arrives on Windows as Control.
         first
             .send(Command::SendInput(LcInputEvent {
                 kind: LC_INPUT_KEY_DOWN,
