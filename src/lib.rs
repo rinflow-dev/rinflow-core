@@ -1,4 +1,5 @@
 mod api;
+mod clipboard;
 mod ffi;
 mod input;
 pub mod layout;
@@ -12,6 +13,10 @@ mod transport;
 mod android_jni;
 
 pub use api::Core;
+pub use clipboard::{
+    CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardFormat, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
+    MIME_TEXT,
+};
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
@@ -25,6 +30,10 @@ pub use model::{
 
 #[cfg(test)]
 mod tests {
+    use super::clipboard::{
+        self, CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardAssembler, ClipboardFormat,
+        MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT,
+    };
     use super::input::{
         OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
     };
@@ -44,6 +53,97 @@ mod tests {
     use std::net::{TcpListener, UdpSocket};
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, Instant};
+
+    fn text_clipboard(text: &str) -> Clipboard {
+        Clipboard {
+            formats: vec![ClipboardFormat {
+                mime: MIME_TEXT.to_owned(),
+                data: text.as_bytes().to_vec(),
+            }],
+        }
+    }
+
+    #[test]
+    fn clipboard_round_trips_through_bytes_json_and_chunks() {
+        let clipboard = Clipboard {
+            formats: vec![
+                ClipboardFormat {
+                    mime: MIME_HTML.to_owned(),
+                    data: b"<b>hi</b>".to_vec(),
+                },
+                ClipboardFormat {
+                    mime: MIME_TEXT.to_owned(),
+                    data: "hi 你好".as_bytes().to_vec(),
+                },
+                ClipboardFormat {
+                    mime: MIME_PNG.to_owned(),
+                    // Several chunks' worth, to cross chunk boundaries.
+                    data: (0..CLIPBOARD_CHUNK_SIZE * 2 + 17).map(|i| i as u8).collect(),
+                },
+            ],
+        };
+        clipboard.validate().expect("valid clipboard");
+        let encoded = clipboard.encode();
+        assert_eq!(Clipboard::decode(&encoded).unwrap(), clipboard);
+
+        let json = serde_json::json!({ "formats": clipboard.to_json() });
+        assert_eq!(Clipboard::from_json(&json).unwrap(), clipboard);
+
+        let frames = clipboard::chunks(9, &encoded);
+        assert_eq!(frames.len(), 3);
+        let mut assembler = ClipboardAssembler::default();
+        let mut complete = None;
+        for frame in frames {
+            // Every frame survives the wire format.
+            let frame = decode_message(&encode_message(&frame).unwrap()).unwrap();
+            let WireMessage::ClipboardChunk {
+                id,
+                total,
+                offset,
+                data,
+            } = frame
+            else {
+                panic!("not a clipboard chunk: {frame:?}");
+            };
+            assert!(complete.is_none());
+            complete = assembler.push(id, total, offset, &data).unwrap();
+        }
+        assert_eq!(complete.unwrap(), encoded);
+    }
+
+    #[test]
+    fn clipboard_limits_and_broken_transfers_are_refused() {
+        let huge = Clipboard {
+            formats: vec![ClipboardFormat {
+                mime: MIME_PNG.to_owned(),
+                data: vec![0; MAX_CLIPBOARD_SIZE],
+            }],
+        };
+        assert!(huge.validate().is_err());
+        assert!(
+            encode_message(&WireMessage::ClipboardChunk {
+                id: 1,
+                total: 10,
+                offset: 8,
+                data: vec![0; 4],
+            })
+            .is_err()
+        );
+
+        let encoded = text_clipboard("abc").encode();
+        let mut assembler = ClipboardAssembler::default();
+        // A transfer must start at its beginning.
+        assert!(assembler.push(1, encoded.len() as u32, 2, &encoded[2..]).is_err());
+        // A newer transfer replaces one in progress.
+        assert_eq!(assembler.push(2, 100, 0, &[0; 10]).unwrap(), None);
+        assert_eq!(
+            assembler
+                .push(3, encoded.len() as u32, 0, &encoded)
+                .unwrap()
+                .unwrap(),
+            encoded
+        );
+    }
 
     #[test]
     fn announcement_negotiates_only_overlapping_protocol_versions() {
@@ -814,6 +914,96 @@ mod tests {
     }
 
     #[track_caller]
+    /// The text of the next `clipboard` event, if one arrives within `wait`.
+    fn clipboard_text(core: &TestCore, wait: Duration) -> Option<String> {
+        let deadline = Instant::now() + wait;
+        while let Ok(message) = core
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            let event: Value = serde_json::from_str(&message).expect("valid event JSON");
+            if event["event"] == "clipboard" {
+                let clipboard =
+                    Clipboard::from_json(&serde_json::json!({ "formats": event["formats"] }))
+                        .expect("clipboard event formats");
+                let text = &clipboard.formats[0];
+                assert_eq!(text.mime, MIME_TEXT);
+                return Some(String::from_utf8(text.data.clone()).unwrap());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_clipboard_follows_control_both_ways_without_echo() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let with_clipboard = |config: &mut CoreConfig| config.clipboard = true;
+        let mut a = test_core_with("clip-a", discovery_port, with_clipboard);
+        let mut b = test_core_with("clip-b", discovery_port, with_clipboard);
+        wait_for_peers(&a, &["clip-b"]);
+        a.thread.send(Command::Connect("clip-b".into())).unwrap();
+        wait_connected(&a, "clip-b");
+        wait_connected(&b, "clip-a");
+
+        // A copies, then drives B: B gets A's clipboard.
+        a.thread
+            .send(Command::SetClipboard(text_clipboard("from a")))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(
+            clipboard_text(&b, Duration::from_secs(2)).as_deref(),
+            Some("from a")
+        );
+
+        // Copying on B while A drives it, then giving control back, brings
+        // B's clipboard to A.
+        b.thread
+            .send(Command::SetClipboard(text_clipboard("from b")))
+            .unwrap();
+        a.thread.send(Command::ResetInput).unwrap();
+        assert_eq!(
+            clipboard_text(&a, Duration::from_secs(2)).as_deref(),
+            Some("from b")
+        );
+
+        // A's shell writes it and reports the change; driving B again sends
+        // nothing, B has those contents already.
+        a.thread
+            .send(Command::SetClipboard(text_clipboard("from b")))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(clipboard_text(&b, Duration::from_millis(500)), None);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_peer_without_clipboard_support_gets_none_and_stays_connected() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with("plain-a", discovery_port, |config| config.clipboard = true);
+        let mut b = test_core("plain-b", discovery_port);
+        wait_for_peers(&a, &["plain-b"]);
+        a.thread.send(Command::Connect("plain-b".into())).unwrap();
+        wait_connected(&a, "plain-b");
+        wait_connected(&b, "plain-a");
+
+        a.thread
+            .send(Command::SetClipboard(text_clipboard("secret")))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(500)), vec![1.0]);
+        assert!(events_named(&a, "clipboard_sent").is_empty());
+        assert!(events_named(&b, "disconnected").is_empty());
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(500)), vec![2.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
     fn wait_for_event(
         receiver: &Receiver<String>,
         timeout: Duration,

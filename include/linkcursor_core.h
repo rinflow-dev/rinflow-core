@@ -11,8 +11,10 @@
  *    lc_core_place_beside, config keys "displays" and "placements", events
  *    "peer_displays", "placement_changed" and "portals_changed". Wire
  *    protocol version 3.
+ * 5: the clipboard: lc_core_set_clipboard, config key "clipboard", events
+ *    "clipboard" and "clipboard_sent".
  */
-#define LC_CORE_ABI_VERSION 4
+#define LC_CORE_ABI_VERSION 5
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,6 +110,24 @@ bool lc_core_set_local_displays(LcCore *core, const char *displays_json);
 bool lc_core_set_placement(LcCore *core, const char *peer_id, const char *offset_json);
 /* side: "left", "right", "top" or "bottom". */
 bool lc_core_place_beside(LcCore *core, const char *peer_id, const char *side);
+
+/*
+ * Clipboard (config key "clipboard": true when the shell implements it).
+ * The clipboard follows the pointer: it goes to a peer when this device
+ * starts driving it, and a peer's comes back when it gives control back,
+ * each only if it changed since the last exchange with that peer.
+ *
+ * Report the system clipboard after every change:
+ *   {"formats":[{"mime":"text/plain;charset=utf-8","data":"<base64>"}, …]}
+ * most specific first; "formats":[] when it holds nothing shared (for
+ * example contents marked concealed by a password manager). Types:
+ * "text/plain;charset=utf-8", "text/html;charset=utf-8", "image/png".
+ * At most 8 MiB in all. A peer's clipboard arrives as the event
+ *   {"event":"clipboard","peer_id":…,"formats":[…same shape…]}
+ * to be written to the system clipboard; that write must not be reported
+ * back as a change.
+ */
+bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
 
 enum {
     LC_INPUT_MOUSE_MOVE = 1,

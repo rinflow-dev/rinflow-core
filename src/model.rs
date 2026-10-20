@@ -16,6 +16,10 @@ pub const CAPABILITY_INPUT_V2: u64 = 1 << 0;
 pub const CAPABILITY_RELATIVE_POINTER: u64 = 1 << 1;
 pub const CAPABILITY_HIGH_RESOLUTION_SCROLL: u64 = 1 << 3;
 pub const CAPABILITY_HID_KEYBOARD: u64 = 1 << 4;
+/// Exchanges clipboards (`ClipboardChunk`); advertised when the shell enables
+/// `CoreConfig::clipboard`. Never sent to a peer without it: an older peer
+/// closes the connection on a message type it does not know.
+pub const CAPABILITY_CLIPBOARD: u64 = 1 << 5;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
@@ -74,6 +78,9 @@ pub struct CoreConfig {
     /// the other platform convention (see `remap.rs`). Off by default: keys
     /// keep their position, so a Mac's Command is the Windows key.
     pub shortcut_remap: bool,
+    /// The shell reads and writes the system clipboard: `lc_core_set_clipboard`
+    /// and the `clipboard` event (see `clipboard.rs`). Off by default.
+    pub clipboard: bool,
     /// This device's displays in logical points (see `layout.rs`).
     pub displays: Vec<Display>,
     /// Placements saved by the shell from earlier `placement_changed` events.
@@ -101,6 +108,7 @@ impl Default for CoreConfig {
             discovery_port: DEFAULT_DISCOVERY_PORT,
             capabilities: LOCAL_CAPABILITIES,
             shortcut_remap: false,
+            clipboard: false,
             displays: Vec::new(),
             placements: Vec::new(),
         }
@@ -108,6 +116,15 @@ impl Default for CoreConfig {
 }
 
 impl CoreConfig {
+    /// What this device announces and offers in `Hello`.
+    pub fn advertised_capabilities(&self) -> u64 {
+        if self.clipboard {
+            self.capabilities | CAPABILITY_CLIPBOARD
+        } else {
+            self.capabilities
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.device_id.trim().is_empty() {
             return Err("device_id must not be empty".to_owned());
@@ -161,7 +178,7 @@ impl Announcement {
             product: "linkcursor".to_owned(),
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: config.capabilities,
+            capabilities: config.advertised_capabilities(),
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             platform: config.platform.clone(),
@@ -333,6 +350,15 @@ pub enum WireMessage {
         offset: Option<Offset>,
         updated_ms: u64,
     },
+    /// Part of the sender's clipboard (see `clipboard.rs`): bytes
+    /// `offset..offset + data.len()` of transfer `id`, `total` bytes long.
+    /// Only sent to peers with `CAPABILITY_CLIPBOARD`.
+    ClipboardChunk {
+        id: u32,
+        total: u32,
+        offset: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl WireMessage {
@@ -340,7 +366,7 @@ impl WireMessage {
         Self::Hello {
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: config.capabilities,
+            capabilities: config.advertised_capabilities(),
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             control_port: config.control_port,
