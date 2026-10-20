@@ -1,4 +1,6 @@
-//! Shortcut-modifier translation between Apple and PC conventions.
+//! Shortcut-modifier translation between Apple and PC conventions, used
+//! only when `CoreConfig::shortcut_remap` is on. By default keys keep their
+//! position (Command is the Windows/Super key), as with Deskflow.
 //!
 //! macOS uses Command for shortcuts (⌘C) where Windows, Linux and Android use
 //! Control (Ctrl+C). The receiving core translates keys from a peer that uses
