@@ -3,6 +3,7 @@ mod ffi;
 mod input;
 mod model;
 mod protocol;
+mod remap;
 mod runtime;
 mod transport;
 
@@ -11,17 +12,23 @@ mod android_jni;
 
 pub use api::Core;
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
-pub use model::{CoreConfig, LcInputEvent};
+pub use model::{
+    CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
+    LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
+    LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_INPUT_SCROLL, LcInputEvent,
+};
 
 #[cfg(test)]
 mod tests {
     use super::input::{OutboundInputQueue, PushOutcome, RemoteInputState};
     use super::model::{
         Announcement, CoreConfig, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
-        LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LcInputEvent, PROTOCOL_MAX_VERSION,
-        WireMessage,
+        LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL,
+        LC_MODIFIER_LEFT_COMMAND, LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LcInputEvent,
+        PROTOCOL_MAX_VERSION, WireMessage,
     };
     use super::protocol::{decode_message, encode_message};
+    use super::remap::ShortcutRemap;
     use super::runtime::{Command, CoreThread, EventSink};
     use serde_json::Value;
     use std::net::{TcpListener, UdpSocket};
@@ -202,6 +209,91 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_remap_depends_on_both_platforms() {
+        assert_eq!(
+            ShortcutRemap::between("macos", "windows"),
+            ShortcutRemap::AppleToPc
+        );
+        assert_eq!(
+            ShortcutRemap::between("linux", "macos"),
+            ShortcutRemap::PcToApple
+        );
+        assert_eq!(
+            ShortcutRemap::between("macos", "macos"),
+            ShortcutRemap::None
+        );
+        assert_eq!(
+            ShortcutRemap::between("windows", "linux"),
+            ShortcutRemap::None
+        );
+        assert_eq!(
+            ShortcutRemap::between("unknown", "windows"),
+            ShortcutRemap::None
+        );
+    }
+
+    #[test]
+    fn apple_to_pc_turns_command_into_control_and_keeps_control() {
+        let key = |code, modifiers| LcInputEvent {
+            kind: LC_INPUT_KEY_DOWN,
+            code,
+            modifiers,
+            ..LcInputEvent::default()
+        };
+        let mut command_c = key(0x06, LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND);
+        ShortcutRemap::AppleToPc.apply(&mut command_c);
+        assert_eq!(command_c.code, 0x06);
+        assert_eq!(
+            command_c.modifiers,
+            LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL
+        );
+
+        let mut right_command = key(0xE7, 0);
+        ShortcutRemap::AppleToPc.apply(&mut right_command);
+        assert_eq!(right_command.code, 0xE4);
+
+        let mut control = key(0xE0, LC_MODIFIER_CONTROL | LC_MODIFIER_SHIFT);
+        ShortcutRemap::AppleToPc.apply(&mut control);
+        assert_eq!(control.code, 0xE0);
+        assert_eq!(control.modifiers, LC_MODIFIER_CONTROL | LC_MODIFIER_SHIFT);
+    }
+
+    #[test]
+    fn pc_to_apple_swaps_control_and_super() {
+        let mut control = LcInputEvent {
+            kind: LC_INPUT_KEY_UP,
+            code: 0xE0,
+            modifiers: LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL,
+            ..LcInputEvent::default()
+        };
+        ShortcutRemap::PcToApple.apply(&mut control);
+        assert_eq!(control.code, 0xE3);
+        assert_eq!(
+            control.modifiers,
+            LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND
+        );
+
+        let mut super_key = LcInputEvent {
+            kind: LC_INPUT_KEY_DOWN,
+            code: 0xE3,
+            modifiers: LC_MODIFIER_COMMAND,
+            ..LcInputEvent::default()
+        };
+        ShortcutRemap::PcToApple.apply(&mut super_key);
+        assert_eq!(super_key.code, 0xE0);
+        assert_eq!(super_key.modifiers, LC_MODIFIER_CONTROL);
+    }
+
+    #[test]
+    fn remote_control_starts_once_and_ends_once() {
+        let mut state = RemoteInputState::default();
+        assert!(state.begin_control());
+        assert!(!state.begin_control());
+        assert!(state.end_control());
+        assert!(!state.end_control());
+    }
+
+    #[test]
     fn config_requires_an_identity() {
         assert!(CoreConfig::default().validate().is_err());
     }
@@ -235,6 +327,7 @@ mod tests {
             CoreConfig {
                 device_id: "first-test-device".to_owned(),
                 device_name: "First".to_owned(),
+                platform: "macos".to_owned(),
                 control_port: first_port,
                 discovery_port,
                 ..CoreConfig::default()
@@ -246,6 +339,7 @@ mod tests {
             CoreConfig {
                 device_id: "second-test-device".to_owned(),
                 device_name: "Second".to_owned(),
+                platform: "windows".to_owned(),
                 control_port: second_port,
                 discovery_port,
                 ..CoreConfig::default()
@@ -256,6 +350,11 @@ mod tests {
 
         wait_for_event(&first_events_rx, Duration::from_secs(8), |event| {
             event["event"] == "peer_up" && event["peer"]["id"] == "second-test-device"
+        });
+        // The receiver picks the shortcut translation from the platform it
+        // discovered, so it has to know the sender before the session starts.
+        wait_for_event(&second_events_rx, Duration::from_secs(8), |event| {
+            event["event"] == "peer_up" && event["peer"]["id"] == "first-test-device"
         });
         first
             .send(Command::Connect("second-test-device".to_owned()))
@@ -284,6 +383,9 @@ mod tests {
         assert_eq!(received.delta_x, expected.delta_x);
         assert_eq!(received.delta_y, expected.delta_y);
         assert_eq!(received.sequence, 1);
+        wait_for_event(&second_events_rx, Duration::from_secs(3), |event| {
+            event["event"] == "remote_control_started"
+        });
 
         first
             .send(Command::SendInput(LcInputEvent {
@@ -296,12 +398,111 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("receive key down");
         assert_eq!(key_down.kind, LC_INPUT_KEY_DOWN);
+
+        // Mac Command arrives on Windows as Control.
+        first
+            .send(Command::SendInput(LcInputEvent {
+                kind: LC_INPUT_KEY_DOWN,
+                code: 0xE3,
+                modifiers: LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND,
+                ..LcInputEvent::default()
+            }))
+            .expect("send command down");
+        let command_down = second_input_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("receive command down");
+        assert_eq!(command_down.code, 0xE0);
+        assert_eq!(
+            command_down.modifiers,
+            LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL
+        );
+
         first.send(Command::ResetInput).expect("reset remote input");
         let key_up = second_input_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("receive synthetic key up");
         assert_eq!(key_up.kind, LC_INPUT_KEY_UP);
         assert_eq!(key_up.code, 0x04);
+        let control_up = second_input_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("receive synthetic control up");
+        assert_eq!((control_up.kind, control_up.code), (LC_INPUT_KEY_UP, 0xE0));
+        wait_for_event(&second_events_rx, Duration::from_secs(3), |event| {
+            event["event"] == "remote_control_ended" && event["reason"] == "remote reset"
+        });
+
+        first.stop_and_join();
+        second.stop_and_join();
+    }
+
+    /// A lone event must go out at once, not wait for more input or the
+    /// one-second keepalive. Without this a key release could lag behind.
+    #[test]
+    fn single_input_event_is_delivered_promptly() {
+        let discovery_port = free_udp_port();
+        let (first_events_tx, first_events_rx) = mpsc::channel();
+        let (second_events_tx, second_events_rx) = mpsc::channel();
+        let (second_input_tx, second_input_rx) = mpsc::channel();
+        let mut first = CoreThread::spawn(
+            CoreConfig {
+                device_id: "latency-first".to_owned(),
+                control_port: free_tcp_port(),
+                discovery_port,
+                ..CoreConfig::default()
+            },
+            EventSink::new(
+                move |event| {
+                    let _ = first_events_tx.send(event);
+                },
+                |_| {},
+            ),
+        )
+        .expect("start first core");
+        let mut second = CoreThread::spawn(
+            CoreConfig {
+                device_id: "latency-second".to_owned(),
+                control_port: free_tcp_port(),
+                discovery_port,
+                ..CoreConfig::default()
+            },
+            EventSink::new(
+                move |event| {
+                    let _ = second_events_tx.send(event);
+                },
+                move |event| {
+                    let _ = second_input_tx.send(event);
+                },
+            ),
+        )
+        .expect("start second core");
+        wait_for_event(&first_events_rx, Duration::from_secs(8), |event| {
+            event["event"] == "peer_up" && event["peer"]["id"] == "latency-second"
+        });
+        first
+            .send(Command::Connect("latency-second".to_owned()))
+            .expect("request connection");
+        wait_for_event(&first_events_rx, Duration::from_secs(6), |event| {
+            event["event"] == "connected"
+        });
+        wait_for_event(&second_events_rx, Duration::from_secs(6), |event| {
+            event["event"] == "connected"
+        });
+
+        for round in 0..3 {
+            let sent = Instant::now();
+            first
+                .send(Command::SendInput(LcInputEvent {
+                    kind: LC_INPUT_MOUSE_MOVE,
+                    delta_x: 1.0,
+                    ..LcInputEvent::default()
+                }))
+                .expect("send input");
+            second_input_rx
+                .recv_timeout(Duration::from_millis(150))
+                .unwrap_or_else(|_| panic!("round {round}: input not delivered within 150 ms"));
+            assert!(sent.elapsed() < Duration::from_millis(150));
+            std::thread::sleep(Duration::from_millis(300));
+        }
 
         first.stop_and_join();
         second.stop_and_join();

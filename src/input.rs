@@ -242,9 +242,23 @@ pub struct RemoteInputState {
     last_sequence: u64,
     pressed_keys: HashMap<u32, LcInputEvent>,
     pressed_buttons: u32,
+    /// The peer is driving this device: input arrived since the session
+    /// started or since the last reset.
+    controlled: bool,
 }
 
 impl RemoteInputState {
+    /// Marks that remote input is arriving. True when this starts a new
+    /// period of remote control.
+    pub fn begin_control(&mut self) -> bool {
+        !std::mem::replace(&mut self.controlled, true)
+    }
+
+    /// Marks that the peer stopped driving this device. True if it was.
+    pub fn end_control(&mut self) -> bool {
+        std::mem::replace(&mut self.controlled, false)
+    }
+
     pub fn reset_for_connection(&mut self) -> Vec<LcInputEvent> {
         self.last_sequence = 0;
         self.release_events()

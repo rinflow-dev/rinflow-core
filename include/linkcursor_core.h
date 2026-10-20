@@ -12,6 +12,24 @@ extern "C" {
 
 typedef struct LcCore LcCore;
 
+/*
+ * Platform-neutral input event.
+ *
+ * - code: USB HID usage (keyboard page) for key events; one-based button
+ *   number for button events (1 left, 2 right, 3 middle, 4 back, 5 forward).
+ *   buttons has bit n-1 set while button n is held.
+ * - delta_x / delta_y: logical points (pixels at 100 % scale). The receiver
+ *   multiplies them by its own display scale.
+ * - scroll_x / scroll_y: logical points. Positive scroll_y scrolls toward the
+ *   top of the content, positive scroll_x toward the left (macOS signs).
+ *   LC_INPUT_FLAG_PRECISE_SCROLL marks trackpad or smooth-wheel input;
+ *   without it the values come from a notched wheel at 10 points per line.
+ * - Leave sequence at zero; the core assigns it.
+ *
+ * Received keys are already translated between Command and Control when the
+ * controlling peer uses the other platform's shortcut convention (config
+ * key "shortcut_remap", on by default).
+ */
 typedef struct LcInputEvent {
     uint32_t kind;
     uint32_t flags;

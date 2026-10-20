@@ -68,6 +68,9 @@ pub struct CoreConfig {
     pub control_port: u16,
     pub discovery_port: u16,
     pub capabilities: u64,
+    /// Translate Command and Control shortcuts when a controlling peer uses
+    /// the other platform convention (see `remap.rs`).
+    pub shortcut_remap: bool,
 }
 
 impl Default for CoreConfig {
@@ -79,6 +82,7 @@ impl Default for CoreConfig {
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
             capabilities: LOCAL_CAPABILITIES,
+            shortcut_remap: true,
         }
     }
 }
@@ -171,9 +175,20 @@ fn unknown_platform() -> String {
 
 /// Platform-neutral input event passed over the C ABI and the wire protocol.
 ///
-/// `code` is a USB HID usage for keyboard events and a one-based button number
-/// for pointer button events. Rust assigns `sequence` immediately before an
-/// event is written to the network; platform callers should leave it as zero.
+/// - `code` is a USB HID usage (keyboard page) for keyboard events and a
+///   one-based button number for pointer button events: 1 left, 2 right,
+///   3 middle, 4 back, 5 forward. `buttons` has bit `n - 1` set while button
+///   `n` is held.
+/// - `delta_x`/`delta_y` are logical points (pixels at 100 % scale); the
+///   receiver multiplies them by its own display scale.
+/// - `scroll_x`/`scroll_y` are logical points. Positive `scroll_y` scrolls
+///   toward the top of the content (wheel turned away from the user) and
+///   positive `scroll_x` toward the left, as on macOS. With
+///   `LC_INPUT_FLAG_PRECISE_SCROLL` they come from a trackpad or smooth
+///   wheel; without it, from a notched wheel at 10 points per line.
+///
+/// Rust assigns `sequence` immediately before an event is written to the
+/// network; platform callers should leave it as zero.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LcInputEvent {

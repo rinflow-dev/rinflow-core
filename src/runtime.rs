@@ -3,6 +3,7 @@ use crate::model::{
     Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
     WireMessage, negotiate_protocol,
 };
+use crate::remap::ShortcutRemap;
 use crate::transport::{
     ActiveConnection, ConnectionEvent, connect_in_background, spawn_connection,
 };
@@ -390,12 +391,23 @@ fn handle_connection_event(event: ConnectionEvent, context: ConnectionEventConte
                         return;
                     }
                     let protocol_version = negotiated.expect("checked above");
+                    let peer_platform = peers
+                        .get(&device_id)
+                        .map(|peer| peer.platform.as_str())
+                        .unwrap_or("unknown");
+                    let shortcut_remap = if config.shortcut_remap {
+                        ShortcutRemap::between(peer_platform, &config.platform)
+                    } else {
+                        ShortcutRemap::None
+                    };
                     if let Some(connection) = active.as_mut() {
                         connection.peer_id = Some(device_id.clone());
                         connection.protocol_version = Some(protocol_version);
                         connection.capabilities = capabilities;
+                        connection.shortcut_remap = shortcut_remap;
                     }
-                    emit_release_events(remote_input.reset_for_connection(), sink, "new session");
+                    let releases = remote_input.reset_for_connection();
+                    end_remote_control(releases, remote_input, sink, "new session");
                     *last_pong = Instant::now();
                     let peer_value = peers
                         .get(&device_id)
@@ -437,7 +449,17 @@ fn handle_connection_event(event: ConnectionEvent, context: ConnectionEventConte
                         }
                         SequenceStatus::InOrder => {}
                     }
-                    for event in events {
+                    if remote_input.begin_control() {
+                        sink.emit_value(json!({ "event": "remote_control_started" }));
+                    }
+                    let shortcut_remap = active
+                        .as_ref()
+                        .map(|connection| connection.shortcut_remap)
+                        .unwrap_or_default();
+                    for mut event in events {
+                        // Translate before observing, so the synthetic key-ups
+                        // for held keys use the same codes the shell saw.
+                        shortcut_remap.apply(&mut event);
                         remote_input.observe(event);
                         (sink.input)(event);
                     }
@@ -446,7 +468,9 @@ fn handle_connection_event(event: ConnectionEvent, context: ConnectionEventConte
                     if remote_input.accept_sequence(sequence) == SequenceStatus::Duplicate {
                         return;
                     }
-                    emit_release_events(remote_input.release_events(), sink, "remote reset");
+                    // The controlling peer sends a reset when it gives control back.
+                    let releases = remote_input.release_events();
+                    end_remote_control(releases, remote_input, sink, "remote reset");
                 }
                 WireMessage::Ping { sequence } => {
                     if let Some(connection) = active.as_ref() {
@@ -477,7 +501,23 @@ fn disconnect_active(
     if let Some(connection) = active.take() {
         connection.abort();
     }
-    emit_release_events(remote_input.release_events(), sink, reason);
+    let releases = remote_input.release_events();
+    end_remote_control(releases, remote_input, sink, reason);
+}
+
+/// Releases everything the peer still holds, then reports that remote
+/// control ended. The releases go out first, so a shell that stops playing
+/// input on `remote_control_ended` has already lifted every key and button.
+fn end_remote_control(
+    releases: Vec<LcInputEvent>,
+    remote_input: &mut RemoteInputState,
+    sink: &EventSink,
+    reason: &str,
+) {
+    emit_release_events(releases, sink, reason);
+    if remote_input.end_control() {
+        sink.emit_value(json!({ "event": "remote_control_ended", "reason": reason }));
+    }
 }
 
 fn emit_release_events(events: Vec<LcInputEvent>, sink: &EventSink, reason: &str) {

@@ -1,6 +1,7 @@
 use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
+use crate::remap::ShortcutRemap;
 use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +31,8 @@ pub struct ActiveConnection {
     pub peer_id: Option<String>,
     pub protocol_version: Option<u16>,
     pub capabilities: u64,
+    /// Applied to input received from this peer; set once its platform is known.
+    pub shortcut_remap: ShortcutRemap,
     control: mpsc::Sender<WireMessage>,
     input: OutboundInputQueue,
     read_task: JoinHandle<()>,
@@ -94,6 +97,7 @@ pub fn spawn_connection(
         peer_id: None,
         protocol_version: None,
         capabilities: 0,
+        shortcut_remap: ShortcutRemap::None,
         control: control_tx,
         input,
         read_task,
