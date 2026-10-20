@@ -141,8 +141,12 @@ impl Clipboard {
         let formats = formats
             .iter()
             .map(|format| {
-                let mime = format["mime"].as_str().ok_or("clipboard format needs \"mime\"")?;
-                let data = format["data"].as_str().ok_or("clipboard format needs \"data\"")?;
+                let mime = format["mime"]
+                    .as_str()
+                    .ok_or("clipboard format needs \"mime\"")?;
+                let data = format["data"]
+                    .as_str()
+                    .ok_or("clipboard format needs \"data\"")?;
                 let data = BASE64
                     .decode(data)
                     .map_err(|_| "clipboard data is not base64")?;

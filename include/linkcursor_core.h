@@ -13,8 +13,12 @@
  *    protocol version 3.
  * 5: the clipboard: lc_core_set_clipboard, config key "clipboard", events
  *    "clipboard" and "clipboard_sent".
+ * 6: clipboards and files travel on a separate data link; files:
+ *    lc_core_accept_files, lc_core_cancel_files, config keys "files",
+ *    "download_directory", "max_auto_receive_bytes", events "files_offered",
+ *    "files_progress", "files_received", "files_failed".
  */
-#define LC_CORE_ABI_VERSION 5
+#define LC_CORE_ABI_VERSION 6
 
 #ifdef __cplusplus
 extern "C" {
@@ -128,6 +132,31 @@ bool lc_core_place_beside(LcCore *core, const char *peer_id, const char *side);
  * back as a change.
  */
 bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
+
+/*
+ * Files (config: "files": true, which needs "clipboard": true and
+ * "download_directory"; optional "max_auto_receive_bytes", default 512 MiB).
+ * Desktop: files copied to the system clipboard travel with it.
+ *
+ * Sending: when the system clipboard holds files, report them in
+ * lc_core_set_clipboard as "text/uri-list" (file:// URLs, one per line)
+ * next to the other formats (their names as text, for example). The core
+ * replaces the local paths with a manifest; a peer that receives it pulls
+ * the files from this device while it runs.
+ *
+ * Receiving: within the limit, files are fetched at once into the download
+ * directory (folders kept, names cleaned, never overwriting). Events:
+ *   {"event":"files_offered","peer_id":…,"transfer":N,"count":…,"total_size":…}
+ *       over the limit: ask the user, then lc_core_accept_files(core, N)
+ *       (or lc_core_cancel_files)
+ *   {"event":"files_progress","transfer":N,"received":…,"total":…}
+ *   {"event":"files_received","peer_id":…,"transfer":N,"paths":[…]}
+ *       followed by a "clipboard" event whose formats start with
+ *       "text/uri-list" of those paths: write it so pasting gives the files
+ *   {"event":"files_failed","peer_id":…,"transfer":N,"reason":…}
+ */
+bool lc_core_accept_files(LcCore *core, uint32_t transfer);
+bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
 
 enum {
     LC_INPUT_MOUSE_MOVE = 1,

@@ -1,14 +1,18 @@
-use crate::clipboard::{self, Clipboard, ClipboardAssembler};
+mod data;
+
+use crate::clipboard::{Clipboard, ClipboardAssembler};
+use crate::files::Offer;
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_CLIPBOARD, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
+    Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
     PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::remap::ShortcutRemap;
 use crate::transport::{
     ActiveConnection, ConnectionEvent, connect_in_background, spawn_connection,
 };
+use data::{DataLink, Download};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -81,6 +85,10 @@ pub enum Command {
     },
     /// The system clipboard changed; empty when it holds nothing shared.
     SetClipboard(Clipboard),
+    /// Receive the offered files of this transfer (`files_offered`).
+    AcceptFiles(u32),
+    /// Stop receiving this transfer.
+    CancelFiles(u32),
     Stop,
 }
 
@@ -237,6 +245,11 @@ async fn run(
         clipboard: None,
         next_clipboard_id: 0,
         controlling: None,
+        data_links: HashMap::new(),
+        offer: None,
+        next_transfer: 0,
+        download: None,
+        uploads: HashMap::new(),
     };
 
     sink.emit_value(json!({
@@ -259,6 +272,8 @@ async fn run(
                     Some(Command::SetPlacement { peer_id, offset }) => state.set_placement(&peer_id, offset),
                     Some(Command::PlaceBeside { peer_id, side }) => state.place_beside(&peer_id, side),
                     Some(Command::SetClipboard(clipboard)) => state.set_clipboard(clipboard),
+                    Some(Command::AcceptFiles(transfer)) => state.accept_files(transfer),
+                    Some(Command::CancelFiles(transfer)) => state.cancel_files(transfer),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -309,6 +324,13 @@ struct Session {
     /// The clipboard last exchanged with this peer, either way.
     clipboard_synced: Option<u64>,
     clipboard_in: ClipboardAssembler,
+    /// A clipboard sync waits for the data link.
+    clipboard_pending: bool,
+    /// Connection ID of the session's data link (see `runtime/data.rs`).
+    data: Option<u64>,
+    /// The token this side invited the peer with, and when.
+    data_token: Option<u64>,
+    data_invited: Option<Instant>,
 }
 
 impl Session {
@@ -349,6 +371,15 @@ struct Runtime<'a> {
     /// The peer this device's input is driving, from the first event sent
     /// after a target change or reset until the next one.
     controlling: Option<String>,
+    /// Data links by connection ID.
+    data_links: HashMap<u64, DataLink>,
+    /// Files on this device's clipboard.
+    offer: Option<Arc<Offer>>,
+    next_transfer: u32,
+    /// Files being received.
+    download: Option<Download>,
+    /// File uploads in progress, by data link.
+    uploads: HashMap<u64, tokio::task::JoinHandle<()>>,
 }
 
 /// How long a disconnect may be held back while a duplicate connection that
@@ -359,6 +390,19 @@ struct PendingDisconnect {
     peer_id: String,
     reason: String,
     deadline: Instant,
+}
+
+/// Unpredictable enough for data-link tokens and file names (not for keys).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::hash::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.finish()
 }
 
 fn now_ms() -> u64 {
@@ -502,49 +546,6 @@ impl Runtime<'_> {
         }
     }
 
-    /// Takes the system clipboard the shell reports. Sent to a peer when
-    /// control moves to it or comes back from it (see `clipboard.rs`).
-    fn set_clipboard(&mut self, clipboard: Clipboard) {
-        if clipboard.is_empty() {
-            self.clipboard = None;
-            return;
-        }
-        if let Err(error) = clipboard.validate() {
-            self.sink.emit_error(format!("clipboard not shared: {error}"));
-            self.clipboard = None;
-            return;
-        }
-        let encoded = clipboard.encode();
-        self.clipboard = Some((clipboard::digest(&encoded), Arc::new(encoded)));
-    }
-
-    /// Hands the peer of session `id` this device's clipboard, unless it has
-    /// it already (sent to it, or received from it).
-    fn sync_clipboard(&mut self, id: u64) {
-        let Some((digest, encoded)) = &self.clipboard else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        if !self.config.clipboard
-            || session.connection.capabilities & CAPABILITY_CLIPBOARD == 0
-            || session.clipboard_synced == Some(*digest)
-        {
-            return;
-        }
-        session.clipboard_synced = Some(*digest);
-        self.next_clipboard_id = self.next_clipboard_id.wrapping_add(1);
-        session
-            .connection
-            .send_bulk(clipboard::chunks(self.next_clipboard_id, encoded));
-        self.sink.emit_value(json!({
-            "event": "clipboard_sent",
-            "peer_id": session.peer_id(),
-            "size": encoded.len()
-        }));
-    }
-
     fn accept(&mut self, stream: TcpStream) {
         // A new connection never replaces an existing session; at the limit
         // it is simply refused.
@@ -577,6 +578,10 @@ impl Runtime<'_> {
                         last_seen: Instant::now(),
                         clipboard_synced: None,
                         clipboard_in: ClipboardAssembler::default(),
+                        clipboard_pending: false,
+                        data: None,
+                        data_token: None,
+                        data_invited: None,
                     },
                 );
             }
@@ -921,11 +926,21 @@ impl Runtime<'_> {
                 connection_id,
                 message,
             } => self.message(connection_id, message),
+            ConnectionEvent::DataConnectResult {
+                session,
+                token,
+                result,
+            } => match result {
+                Ok(stream) => self.data_connected(session, token, stream),
+                Err(error) => self.sink.emit_error(format!("data link failed: {error}")),
+            },
             ConnectionEvent::Closed {
                 connection_id,
                 reason,
             } => {
-                if self.sessions.contains_key(&connection_id) {
+                if self.data_links.contains_key(&connection_id) {
+                    self.close_data_link(connection_id, &reason);
+                } else if self.sessions.contains_key(&connection_id) {
                     self.close_session(connection_id, &reason, true);
                 }
             }
@@ -933,12 +948,21 @@ impl Runtime<'_> {
     }
 
     fn message(&mut self, id: u64, message: WireMessage) {
+        if self.data_links.contains_key(&id) {
+            return self.data_message(id, message);
+        }
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if !matches!(&message, WireMessage::Hello { .. }) && !session.established() {
-            self.close_session(id, "message before hello", true);
-            return;
+        if !session.established() {
+            match message {
+                WireMessage::Hello { .. } => {}
+                // An accepted connection that is really a data link.
+                WireMessage::DataHello { device_id, token } => {
+                    return self.attach_data_link(id, device_id, token);
+                }
+                _ => return self.close_session(id, "message before hello", true),
+            }
         }
 
         match message {
@@ -1033,43 +1057,13 @@ impl Runtime<'_> {
                     self.remote_placement(&peer_id, offset, updated_ms);
                 }
             }
-            WireMessage::ClipboardChunk {
-                id: transfer,
-                total,
-                offset,
-                data,
-            } => {
-                if !self.config.clipboard {
-                    return;
-                }
-                let peer_id = session.peer_id().map(str::to_owned);
-                let encoded = match session.clipboard_in.push(transfer, total, offset, &data) {
-                    Ok(Some(encoded)) => encoded,
-                    Ok(None) => return,
-                    Err(error) => {
-                        self.sink.emit_error(format!("clipboard not received: {error}"));
-                        return;
-                    }
-                };
-                let clipboard = match Clipboard::decode(&encoded) {
-                    Ok(clipboard) => clipboard,
-                    Err(error) => {
-                        self.sink.emit_error(format!("clipboard not received: {error}"));
-                        return;
-                    }
-                };
-                // The peer has these contents: they are not sent back to it.
-                // They are this device's clipboard now, as the shell will
-                // make them, so they travel on to the next peer.
-                let digest = clipboard::digest(&encoded);
-                session.clipboard_synced = Some(digest);
-                self.clipboard = Some((digest, Arc::new(encoded)));
-                self.sink.emit_value(json!({
-                    "event": "clipboard",
-                    "peer_id": peer_id,
-                    "formats": clipboard.to_json()
-                }));
-            }
+            WireMessage::DataInvite { token } => self.data_invited(id, token),
+            // Data-link messages have no business on a control connection.
+            WireMessage::DataHello { .. }
+            | WireMessage::ClipboardChunk { .. }
+            | WireMessage::FileRequest { .. }
+            | WireMessage::FileChunk { .. }
+            | WireMessage::FileCancel { .. } => {}
         }
     }
 
@@ -1155,6 +1149,7 @@ impl Runtime<'_> {
             });
         }
         self.send_placement(&hello.device_id);
+        self.invite_data_link(id);
         // A disconnect held back for this peer is moot now.
         self.flush_disconnects(false);
     }
@@ -1191,6 +1186,12 @@ impl Runtime<'_> {
         };
         let peer_id = session.peer_id().map(str::to_owned);
         session.connection.abort();
+        if let Some(link) = session.data {
+            self.close_data_link(link, reason);
+        }
+        if self.download_session() == Some(id) {
+            self.fail_download(reason, false);
+        }
         end_remote_control(
             &mut session.remote_input,
             self.sink,
@@ -1286,6 +1287,7 @@ impl Runtime<'_> {
         for (id, reason) in stale {
             self.close_session(id, reason, true);
         }
+        self.reinvite_data_links();
     }
 }
 

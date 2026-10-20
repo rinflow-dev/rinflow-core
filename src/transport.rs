@@ -31,10 +31,24 @@ pub enum ConnectionEvent {
         peer_id: String,
         result: Result<TcpStream, String>,
     },
+    /// The data link a session asked for (see `DataInvite`).
+    DataConnectResult {
+        session: u64,
+        token: u64,
+        result: Result<TcpStream, String>,
+    },
 }
+
+/// Bytes the system may hold for a connection before a write waits. Small on
+/// purpose: what sits in the socket buffer is sent in order whatever this
+/// side's priorities are, so a few megabytes of file data there would hold
+/// input up for a second on Wi-Fi. 128 KiB still fills a LAN.
+const SEND_BUFFER_SIZE: usize = 128 * 1024;
 
 pub struct ActiveConnection {
     pub peer_id: Option<String>,
+    /// Where the connection goes; a data link is dialed to the same place.
+    pub remote: Option<SocketAddr>,
     pub protocol_version: Option<u16>,
     pub capabilities: u64,
     /// Applied to input received from this peer; set once its platform is known.
@@ -42,6 +56,7 @@ pub struct ActiveConnection {
     control: mpsc::Sender<WireMessage>,
     input: OutboundInputQueue,
     bulk: BulkQueue,
+    files: mpsc::Sender<WireMessage>,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
@@ -67,6 +82,17 @@ impl ActiveConnection {
         self.bulk.replace(messages);
     }
 
+    /// For tasks that send on their own: small messages ahead of bulk data.
+    pub fn control_sender(&self) -> mpsc::Sender<WireMessage> {
+        self.control.clone()
+    }
+
+    /// File chunks, sent last. Bounded: a sender waits while the connection
+    /// is busy, so a file is read only as fast as it goes out.
+    pub fn file_sender(&self) -> mpsc::Sender<WireMessage> {
+        self.files.clone()
+    }
+
     pub fn abort(self) {
         self.read_task.abort();
         self.write_task.abort();
@@ -89,7 +115,11 @@ impl BulkQueue {
     }
 
     fn pop(&self) -> Option<WireMessage> {
-        self.shared.0.lock().expect("bulk queue poisoned").pop_front()
+        self.shared
+            .0
+            .lock()
+            .expect("bulk queue poisoned")
+            .pop_front()
     }
 
     async fn notified(&self) {
@@ -104,10 +134,13 @@ pub fn spawn_connection(
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) -> io::Result<ActiveConnection> {
     stream.set_nodelay(true)?;
+    socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER_SIZE)?;
+    let remote = stream.peer_addr().ok();
     let (reader, writer) = stream.into_split();
     let (control_tx, control_rx) = mpsc::channel(64);
     let input = OutboundInputQueue::new();
     let bulk = BulkQueue::default();
+    let (files_tx, files_rx) = mpsc::channel(4);
 
     let read_events = events.clone();
     let read_task = tokio::spawn(async move {
@@ -125,7 +158,9 @@ pub fn spawn_connection(
     let write_input = input.clone();
     let write_bulk = bulk.clone();
     let write_task = tokio::spawn(async move {
-        if let Err(error) = write_loop(writer, control_rx, write_input, write_bulk, hello).await {
+        if let Err(error) =
+            write_loop(writer, control_rx, write_input, write_bulk, files_rx, hello).await
+        {
             let _ = write_events.send(ConnectionEvent::Closed {
                 connection_id,
                 reason: format!("write failed: {error}"),
@@ -135,12 +170,14 @@ pub fn spawn_connection(
 
     Ok(ActiveConnection {
         peer_id: None,
+        remote,
         protocol_version: None,
         capabilities: 0,
         shortcut_remap: ShortcutRemap::None,
         control: control_tx,
         input,
         bulk,
+        files: files_tx,
         read_task,
         write_task,
     })
@@ -186,6 +223,7 @@ async fn write_loop(
     mut controls: mpsc::Receiver<WireMessage>,
     input: OutboundInputQueue,
     bulk: BulkQueue,
+    mut files: mpsc::Receiver<WireMessage>,
     hello: WireMessage,
 ) -> io::Result<()> {
     write_frame(&mut writer, &hello).await?;
@@ -200,8 +238,13 @@ async fn write_loop(
             write_frame(&mut writer, &message).await?;
             continue;
         }
-        // Bulk data only when nothing else waits, one frame at a time.
+        // Bulk data only when nothing else waits, one frame at a time:
+        // clipboards before files.
         if let Some(message) = bulk.pop() {
+            write_frame(&mut writer, &message).await?;
+            continue;
+        }
+        if let Ok(message) = files.try_recv() {
             write_frame(&mut writer, &message).await?;
             continue;
         }
@@ -214,6 +257,7 @@ async fn write_loop(
             }
             _ = input.notified() => {}
             _ = bulk.notified() => {}
+            Some(message) = files.recv() => write_frame(&mut writer, &message).await?,
         }
     }
     writer.shutdown().await
@@ -230,6 +274,29 @@ async fn write_frame(writer: &mut OwnedWriteHalf, message: &WireMessage) -> io::
     writer.write_u32(payload.len() as u32).await?;
     writer.write_all(&payload).await?;
     writer.flush().await
+}
+
+/// Dials the data link for session `session` (see `DataInvite`).
+pub fn connect_data_in_background(
+    session: u64,
+    token: u64,
+    address: SocketAddr,
+    events: mpsc::UnboundedSender<ConnectionEvent>,
+) {
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            TcpStream::connect(address),
+        )
+        .await
+        .map_err(|_| "connection timed out".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        let _ = events.send(ConnectionEvent::DataConnectResult {
+            session,
+            token,
+            result,
+        });
+    });
 }
 
 pub fn connect_in_background(

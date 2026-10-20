@@ -1,4 +1,5 @@
 use crate::clipboard::{CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_SIZE};
+use crate::files::FILE_CHUNK_SIZE;
 use crate::layout::{Display, MAX_DISPLAYS, Offset, validate_displays};
 use crate::model::{LcInputEvent, MAX_INPUT_BATCH_SIZE, WireMessage};
 use std::io;
@@ -16,6 +17,12 @@ const MESSAGE_PONG: u8 = 5;
 const MESSAGE_SCREEN_INFO: u8 = 6;
 const MESSAGE_PLACEMENT: u8 = 7;
 const MESSAGE_CLIPBOARD_CHUNK: u8 = 8;
+const MESSAGE_DATA_INVITE: u8 = 9;
+const MESSAGE_DATA_HELLO: u8 = 10;
+const MESSAGE_FILE_REQUEST: u8 = 11;
+const MESSAGE_FILE_CHUNK: u8 = 12;
+const MESSAGE_FILE_CANCEL: u8 = 13;
+const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
     let message_type = match message {
@@ -27,6 +34,11 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::ScreenInfo { .. } => MESSAGE_SCREEN_INFO,
         WireMessage::Placement { .. } => MESSAGE_PLACEMENT,
         WireMessage::ClipboardChunk { .. } => MESSAGE_CLIPBOARD_CHUNK,
+        WireMessage::DataInvite { .. } => MESSAGE_DATA_INVITE,
+        WireMessage::DataHello { .. } => MESSAGE_DATA_HELLO,
+        WireMessage::FileRequest { .. } => MESSAGE_FILE_REQUEST,
+        WireMessage::FileChunk { .. } => MESSAGE_FILE_CHUNK,
+        WireMessage::FileCancel { .. } => MESSAGE_FILE_CANCEL,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -113,6 +125,41 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.u32(*offset);
             encoder.u32(data.len() as u32);
             encoder.bytes.extend_from_slice(data);
+        }
+        WireMessage::DataInvite { token } => encoder.u64(*token),
+        WireMessage::DataHello { device_id, token } => {
+            encoder.string(device_id)?;
+            encoder.u64(*token);
+        }
+        WireMessage::FileRequest {
+            transfer,
+            entry,
+            offset,
+        } => {
+            encoder.u32(*transfer);
+            encoder.u32(*entry);
+            encoder.u64(*offset);
+        }
+        WireMessage::FileChunk {
+            transfer,
+            entry,
+            offset,
+            data,
+        } => {
+            if data.len() > FILE_CHUNK_SIZE {
+                return Err(invalid_data("file chunk too large"));
+            }
+            encoder.u32(*transfer);
+            encoder.u32(*entry);
+            encoder.u64(*offset);
+            encoder.u32(data.len() as u32);
+            encoder.bytes.extend_from_slice(data);
+        }
+        WireMessage::FileCancel { transfer, reason } => {
+            let reason: String = reason.chars().take(MAX_REASON_LENGTH / 4).collect();
+            encoder.u32(*transfer);
+            encoder.u16(reason.len() as u16);
+            encoder.bytes.extend_from_slice(reason.as_bytes());
         }
     }
     Ok(encoder.bytes)
@@ -243,6 +290,43 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 offset,
                 data: decoder.take(length)?.to_vec(),
             }
+        }
+        MESSAGE_DATA_INVITE => WireMessage::DataInvite {
+            token: decoder.u64()?,
+        },
+        MESSAGE_DATA_HELLO => WireMessage::DataHello {
+            device_id: decoder.string()?,
+            token: decoder.u64()?,
+        },
+        MESSAGE_FILE_REQUEST => WireMessage::FileRequest {
+            transfer: decoder.u32()?,
+            entry: decoder.u32()?,
+            offset: decoder.u64()?,
+        },
+        MESSAGE_FILE_CHUNK => {
+            let transfer = decoder.u32()?;
+            let entry = decoder.u32()?;
+            let offset = decoder.u64()?;
+            let length = decoder.u32()? as usize;
+            if length > FILE_CHUNK_SIZE {
+                return Err(invalid_data("file chunk too large"));
+            }
+            WireMessage::FileChunk {
+                transfer,
+                entry,
+                offset,
+                data: decoder.take(length)?.to_vec(),
+            }
+        }
+        MESSAGE_FILE_CANCEL => {
+            let transfer = decoder.u32()?;
+            let length = decoder.u16()? as usize;
+            if length > MAX_REASON_LENGTH {
+                return Err(invalid_data("cancel reason too long"));
+            }
+            let reason = String::from_utf8(decoder.take(length)?.to_vec())
+                .map_err(|_| invalid_data("cancel reason is not UTF-8"))?;
+            WireMessage::FileCancel { transfer, reason }
         }
         _ => return Err(invalid_data("unknown wire message type")),
     };
