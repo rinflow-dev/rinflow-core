@@ -10,6 +10,11 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// `disconnected` reason when the peer closed the connection (it quit, was
+/// told to disconnect, or dropped a duplicate connection): an orderly end,
+/// unlike the `read failed: …` / `write failed: …` reasons.
+pub const PEER_CLOSED: &str = "peer closed the connection";
+
 #[derive(Debug)]
 pub enum ConnectionEvent {
     Message {
@@ -72,12 +77,14 @@ pub fn spawn_connection(
 
     let read_events = events.clone();
     let read_task = tokio::spawn(async move {
-        if let Err(error) = read_loop(connection_id, reader, read_events.clone()).await {
-            let _ = read_events.send(ConnectionEvent::Closed {
-                connection_id,
-                reason: format!("read failed: {error}"),
-            });
-        }
+        let reason = match read_loop(connection_id, reader, read_events.clone()).await {
+            Ok(()) => PEER_CLOSED.to_owned(),
+            Err(error) => format!("read failed: {error}"),
+        };
+        let _ = read_events.send(ConnectionEvent::Closed {
+            connection_id,
+            reason,
+        });
     });
 
     let write_events = events;
@@ -109,7 +116,12 @@ async fn read_loop(
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) -> io::Result<()> {
     loop {
-        let length = reader.read_u32().await? as usize;
+        let length = match reader.read_u32().await {
+            Ok(length) => length as usize,
+            // The stream ended between frames: the peer closed the connection.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if length == 0 || length > MAX_FRAME_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

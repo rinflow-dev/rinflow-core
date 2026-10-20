@@ -6,10 +6,12 @@
 
 /*
  * 3: several sessions at once (one per peer), lc_core_disconnect_peer and
- *    lc_core_set_input_target. The version 2 calls are unchanged and act on
- *    the input target. Session events carry "peer_id".
+ *    lc_core_set_input_target. Session events carry "peer_id".
+ * 4: the arrangement: lc_core_set_local_displays, lc_core_set_placement,
+ *    lc_core_place_beside, config keys "displays" and "placements", events
+ *    "peer_displays" and "placement_changed". Wire protocol version 3.
  */
-#define LC_CORE_ABI_VERSION 3
+#define LC_CORE_ABI_VERSION 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +87,21 @@ bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
 bool lc_core_set_input_target(LcCore *core, const char *peer_id);
 bool lc_core_send_input(LcCore *core, const LcInputEvent *event);
 bool lc_core_reset_input(LcCore *core);
+
+/*
+ * Arrangement (all geometry in logical points: macOS points, or pixels at
+ * 100 % scale). A placement is the offset of the peer's desktop in this
+ * device's desktop space; the core snaps it so the two desktops touch,
+ * reports it as "placement_changed" (save it and pass it back in the
+ * "placements" config key next time) and syncs the mirrored placement to the
+ * peer. The most recent edit on either side wins.
+ */
+/* displays_json: [{"x":0,"y":0,"width":1512,"height":982,"scale":2}, …] */
+bool lc_core_set_local_displays(LcCore *core, const char *displays_json);
+/* offset_json: {"x":1512,"y":40}, or NULL to remove the placement. */
+bool lc_core_set_placement(LcCore *core, const char *peer_id, const char *offset_json);
+/* side: "left", "right", "top" or "bottom". */
+bool lc_core_place_beside(LcCore *core, const char *peer_id, const char *side);
 
 enum {
     LC_INPUT_MOUSE_MOVE = 1,

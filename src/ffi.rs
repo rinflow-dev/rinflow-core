@@ -1,3 +1,4 @@
+use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -10,12 +11,10 @@ pub struct LcCore {
     thread: CoreThread,
 }
 
-/// Version 3 adds several sessions at once, `lc_core_disconnect_peer` and
-/// `lc_core_set_input_target`. Version 2 calls keep their meaning, applied
-/// to the input target.
+/// Version 4 adds the arrangement: display descriptions and placements.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    3
+    4
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -144,6 +143,92 @@ pub unsafe extern "C" fn lc_core_set_input_target(
             }
         };
         core.thread.send(Command::SetInputTarget(target)).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// `displays_json`: a JSON array of `{"x","y","width","height","scale"}` in
+/// logical points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_local_displays(
+    core: *mut LcCore,
+    displays_json: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let Some(json) = (unsafe { string_argument(displays_json) }) else {
+            return false;
+        };
+        let Ok(displays) = serde_json::from_str::<Vec<Display>>(&json) else {
+            return false;
+        };
+        core.thread
+            .send(Command::SetLocalDisplays(displays))
+            .is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// `offset_json`: `{"x":…,"y":…}` to place the peer near that offset, or
+/// null to remove its placement.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_placement(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    offset_json: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        let offset = if offset_json.is_null() {
+            None
+        } else {
+            let Some(json) = (unsafe { string_argument(offset_json) }) else {
+                return false;
+            };
+            match serde_json::from_str::<Offset>(&json) {
+                Ok(offset) => Some(offset),
+                Err(_) => return false,
+            }
+        };
+        core.thread
+            .send(Command::SetPlacement { peer_id, offset })
+            .is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// `side`: "left", "right", "top" or "bottom".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_place_beside(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    side: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let (Some(peer_id), Some(side)) = (unsafe { string_argument(peer_id) }, unsafe {
+            string_argument(side)
+        }) else {
+            return false;
+        };
+        let Ok(side) = serde_json::from_value::<Side>(serde_json::Value::String(side)) else {
+            return false;
+        };
+        core.thread
+            .send(Command::PlaceBeside { peer_id, side })
+            .is_ok()
     }))
     .unwrap_or(false)
 }

@@ -1,3 +1,4 @@
+use crate::layout::{Display, MAX_DISPLAYS, Offset, validate_displays};
 use crate::model::{LcInputEvent, MAX_INPUT_BATCH_SIZE, WireMessage};
 use std::io;
 
@@ -11,6 +12,8 @@ const MESSAGE_INPUT_BATCH: u8 = 2;
 const MESSAGE_INPUT_RESET: u8 = 3;
 const MESSAGE_PING: u8 = 4;
 const MESSAGE_PONG: u8 = 5;
+const MESSAGE_SCREEN_INFO: u8 = 6;
+const MESSAGE_PLACEMENT: u8 = 7;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
     let message_type = match message {
@@ -19,6 +22,8 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::InputReset { .. } => MESSAGE_INPUT_RESET,
         WireMessage::Ping { .. } => MESSAGE_PING,
         WireMessage::Pong { .. } => MESSAGE_PONG,
+        WireMessage::ScreenInfo { .. } => MESSAGE_SCREEN_INFO,
+        WireMessage::Placement { .. } => MESSAGE_PLACEMENT,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -65,6 +70,33 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         }
         WireMessage::Ping { sequence } | WireMessage::Pong { sequence } => {
             encoder.u64(*sequence);
+        }
+        WireMessage::ScreenInfo { displays } => {
+            validate_displays(displays).map_err(invalid_data)?;
+            encoder.u16(displays.len() as u16);
+            for display in displays {
+                for value in [
+                    display.x,
+                    display.y,
+                    display.width,
+                    display.height,
+                    display.scale,
+                ] {
+                    encoder.f64(value);
+                }
+            }
+        }
+        WireMessage::Placement { offset, updated_ms } => {
+            match offset {
+                Some(offset) if offset.is_valid() => {
+                    encoder.u8(1);
+                    encoder.f64(offset.x);
+                    encoder.f64(offset.y);
+                }
+                Some(_) => return Err(invalid_data("placement offset must be finite")),
+                None => encoder.u8(0),
+            }
+            encoder.u64(*updated_ms);
         }
     }
     Ok(encoder.bytes)
@@ -145,6 +177,44 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
         MESSAGE_PONG => WireMessage::Pong {
             sequence: decoder.u64()?,
         },
+        MESSAGE_SCREEN_INFO => {
+            let count = decoder.u16()? as usize;
+            if count > MAX_DISPLAYS {
+                return Err(invalid_data("too many displays"));
+            }
+            let mut displays = Vec::with_capacity(count);
+            for _ in 0..count {
+                displays.push(Display {
+                    x: decoder.f64()?,
+                    y: decoder.f64()?,
+                    width: decoder.f64()?,
+                    height: decoder.f64()?,
+                    scale: decoder.f64()?,
+                });
+            }
+            validate_displays(&displays).map_err(invalid_data)?;
+            WireMessage::ScreenInfo { displays }
+        }
+        MESSAGE_PLACEMENT => {
+            let offset = match decoder.u8()? {
+                0 => None,
+                1 => {
+                    let offset = Offset {
+                        x: decoder.f64()?,
+                        y: decoder.f64()?,
+                    };
+                    if !offset.is_valid() {
+                        return Err(invalid_data("placement offset must be finite"));
+                    }
+                    Some(offset)
+                }
+                _ => return Err(invalid_data("invalid placement flag")),
+            };
+            WireMessage::Placement {
+                offset,
+                updated_ms: decoder.u64()?,
+            }
+        }
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;

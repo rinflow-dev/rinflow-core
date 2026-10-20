@@ -1,6 +1,7 @@
 mod api;
 mod ffi;
 mod input;
+pub mod layout;
 mod model;
 mod protocol;
 mod remap;
@@ -15,7 +16,7 @@ pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
-    LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_INPUT_SCROLL, LcInputEvent,
+    LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_INPUT_SCROLL, LcInputEvent, PlacementRecord,
 };
 
 #[cfg(test)]
@@ -23,6 +24,8 @@ mod tests {
     use super::input::{
         OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
     };
+    use super::layout::{Display, Offset, Side};
+    use super::model::PlacementRecord;
     use super::model::{
         Announcement, CoreConfig, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
         LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL,
@@ -39,10 +42,13 @@ mod tests {
 
     #[test]
     fn announcement_negotiates_only_overlapping_protocol_versions() {
-        let mut announcement = Announcement::from_config(&CoreConfig {
-            device_id: "one".to_owned(),
-            ..CoreConfig::default()
-        });
+        let mut announcement = Announcement::from_config(
+            &CoreConfig {
+                device_id: "one".to_owned(),
+                ..CoreConfig::default()
+            },
+            &[],
+        );
         assert!(announcement.is_compatible());
         assert_eq!(
             announcement.negotiated_version(),
@@ -328,6 +334,7 @@ mod tests {
 
     #[test]
     fn two_cores_discover_connect_and_exchange_input() {
+        let _network = network_test();
         let discovery_port = free_udp_port();
         let first_port = free_tcp_port();
         let second_port = free_tcp_port();
@@ -467,6 +474,7 @@ mod tests {
     /// one-second keepalive. Without this a key release could lag behind.
     #[test]
     fn single_input_event_is_delivered_promptly() {
+        let _network = network_test();
         let discovery_port = free_udp_port();
         let (first_events_tx, first_events_rx) = mpsc::channel();
         let (second_events_tx, second_events_rx) = mpsc::channel();
@@ -536,6 +544,17 @@ mod tests {
         second.stop_and_join();
     }
 
+    /// Tests that start real cores run one at a time. Two cores of one test
+    /// share a discovery port on the same machine; with several tests doing
+    /// that at once, loopback multicast occasionally drops announcements,
+    /// which a real network with one core per machine does not see.
+    fn network_test() -> std::sync::MutexGuard<'static, ()> {
+        static NETWORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        NETWORK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct TestCore {
         thread: CoreThread,
         events: Receiver<String>,
@@ -544,16 +563,26 @@ mod tests {
     }
 
     fn test_core(device_id: &str, discovery_port: u16) -> TestCore {
+        test_core_with(device_id, discovery_port, |_| {})
+    }
+
+    fn test_core_with(
+        device_id: &str,
+        discovery_port: u16,
+        customize: impl FnOnce(&mut CoreConfig),
+    ) -> TestCore {
         let (events_tx, events) = mpsc::channel();
         let (input_tx, input) = mpsc::channel();
         let port = free_tcp_port();
+        let mut config = CoreConfig {
+            device_id: device_id.to_owned(),
+            control_port: port,
+            discovery_port,
+            ..CoreConfig::default()
+        };
+        customize(&mut config);
         let thread = CoreThread::spawn(
-            CoreConfig {
-                device_id: device_id.to_owned(),
-                control_port: port,
-                discovery_port,
-                ..CoreConfig::default()
-            },
+            config,
             EventSink::new(
                 move |event| {
                     let _ = events_tx.send(event);
@@ -627,6 +656,7 @@ mod tests {
 
     #[test]
     fn sessions_with_several_peers_stay_open_and_input_follows_the_target() {
+        let _network = network_test();
         let discovery_port = free_udp_port();
         let mut a = test_core("multi-a", discovery_port);
         let mut b = test_core("multi-b", discovery_port);
@@ -660,8 +690,11 @@ mod tests {
         a.thread
             .send(Command::DisconnectPeer("multi-c".into()))
             .unwrap();
+        // C sees an orderly close, not a failure.
         wait_for_event(&c.events, Duration::from_secs(3), |event| {
-            event["event"] == "disconnected" && event["peer_id"] == "multi-a"
+            event["event"] == "disconnected"
+                && event["peer_id"] == "multi-a"
+                && event["reason"] == "peer closed the connection"
         });
         a.thread.send(Command::SendInput(motion(3.0))).unwrap();
         assert_eq!(received(&b, Duration::from_millis(400)), vec![3.0]);
@@ -674,6 +707,7 @@ mod tests {
 
     #[test]
     fn an_unidentified_connection_does_not_replace_a_session() {
+        let _network = network_test();
         let discovery_port = free_udp_port();
         let mut a = test_core("stranger-a", discovery_port);
         let mut b = test_core("stranger-b", discovery_port);
@@ -699,6 +733,7 @@ mod tests {
 
     #[test]
     fn peers_dialing_each_other_at_once_keep_exactly_one_session() {
+        let _network = network_test();
         let discovery_port = free_udp_port();
         let mut a = test_core("dial-a", discovery_port);
         let mut b = test_core("dial-b", discovery_port);
@@ -724,24 +759,214 @@ mod tests {
         b.thread.stop_and_join();
     }
 
+    #[track_caller]
     fn wait_for_event(
         receiver: &Receiver<String>,
         timeout: Duration,
         predicate: impl Fn(&Value) -> bool,
-    ) {
+    ) -> Value {
         let deadline = Instant::now() + timeout;
         let mut observed = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let message = receiver.recv_timeout(remaining).unwrap_or_else(|_| {
-                panic!("expected core event before timeout; observed: {observed:?}")
-            });
+            let message = match receiver.recv_timeout(remaining) {
+                Ok(message) => message,
+                Err(_) => panic!("expected core event before timeout; observed: {observed:?}"),
+            };
             let event: Value = serde_json::from_str(&message).expect("valid event JSON");
             if predicate(&event) {
-                return;
+                return event;
             }
             observed.push(event);
         }
+    }
+
+    fn display(width: f64, height: f64) -> Display {
+        Display {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            scale: 2.0,
+        }
+    }
+
+    #[track_caller]
+    fn wait_for_placement(core: &TestCore, peer_id: &str, source: &str) -> Value {
+        wait_for_event(&core.events, Duration::from_secs(4), |event| {
+            event["event"] == "placement_changed"
+                && event["peer_id"] == peer_id
+                && event["source"] == source
+        })
+    }
+
+    #[test]
+    fn screen_info_and_placement_round_trip() {
+        for message in [
+            WireMessage::ScreenInfo {
+                displays: vec![display(1512.0, 982.0), display(1920.0, 1080.0)],
+            },
+            WireMessage::ScreenInfo { displays: vec![] },
+            WireMessage::Placement {
+                offset: Some(Offset {
+                    x: 1440.0,
+                    y: -40.5,
+                }),
+                updated_ms: 1_792_000_000_000,
+            },
+            WireMessage::Placement {
+                offset: None,
+                updated_ms: 7,
+            },
+        ] {
+            let bytes = encode_message(&message).expect("encode");
+            assert_eq!(decode_message(&bytes).expect("decode"), message);
+        }
+        assert!(
+            encode_message(&WireMessage::ScreenInfo {
+                displays: vec![display(0.0, 10.0)],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn placements_sync_mirrored_and_the_newer_edit_wins() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let pc = [display(1440.0, 900.0)];
+        let mac = [display(1512.0, 982.0)];
+        // The Mac remembers an old placement of the PC from an earlier session.
+        let mut a = test_core_with("place-pc", discovery_port, |config| {
+            config.displays = pc.to_vec();
+        });
+        let mut b = test_core_with("place-mac", discovery_port, |config| {
+            config.displays = mac.to_vec();
+            config.placements = vec![PlacementRecord {
+                peer_id: "place-pc".to_owned(),
+                offset: Some(Offset { x: 0.0, y: 982.0 }),
+                updated_ms: 1,
+            }];
+        });
+        wait_for_peers(&a, &["place-mac"]);
+        // Placing before connecting: stored here, synced once connected.
+        a.thread
+            .send(Command::PlaceBeside {
+                peer_id: "place-mac".to_owned(),
+                side: Side::Right,
+            })
+            .unwrap();
+        let local = wait_for_placement(&a, "place-mac", "local");
+        assert_eq!(local["offset"]["x"], 1440.0);
+
+        a.thread.send(Command::Connect("place-mac".into())).unwrap();
+        wait_connected(&a, "place-mac");
+        // The PC's newer placement replaces the Mac's old one, mirrored.
+        let synced = wait_for_placement(&b, "place-pc", "peer");
+        assert_eq!(synced["offset"]["x"], -1440.0);
+        assert_eq!(
+            synced["offset"]["y"],
+            -local["offset"]["y"].as_f64().unwrap()
+        );
+        // ...and the Mac's stale placement did not overwrite the PC's.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            events_named(&a, "placement_changed")
+                .iter()
+                .all(|event| event["source"] != "peer")
+        );
+
+        // Moving it from the Mac side: the PC follows.
+        b.thread
+            .send(Command::PlaceBeside {
+                peer_id: "place-pc".to_owned(),
+                side: Side::Bottom,
+            })
+            .unwrap();
+        let moved = wait_for_placement(&b, "place-pc", "local");
+        assert_eq!(moved["offset"]["y"], 982.0);
+        let followed = wait_for_placement(&a, "place-mac", "peer");
+        assert_eq!(followed["offset"]["y"], -982.0);
+
+        // Removing is synced too.
+        a.thread
+            .send(Command::SetPlacement {
+                peer_id: "place-mac".to_owned(),
+                offset: None,
+            })
+            .unwrap();
+        let removed = wait_for_placement(&b, "place-pc", "peer");
+        assert!(removed["offset"].is_null());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn displays_reach_peers_and_placements_follow_display_changes() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with("screens-a", discovery_port, |config| {
+            config.displays = vec![
+                display(1440.0, 900.0),
+                Display {
+                    x: 1440.0,
+                    ..display(1920.0, 1080.0)
+                },
+            ];
+        });
+        let mut b = test_core_with("screens-b", discovery_port, |config| {
+            config.displays = vec![display(1512.0, 982.0)];
+        });
+        // Discovery already carries the displays.
+        let described = wait_for_event(&a.events, Duration::from_secs(8), |event| {
+            event["event"] == "peer_displays" && event["peer_id"] == "screens-b"
+        });
+        assert_eq!(described["displays"][0]["width"], 1512.0);
+
+        a.thread
+            .send(Command::PlaceBeside {
+                peer_id: "screens-b".to_owned(),
+                side: Side::Right,
+            })
+            .unwrap();
+        let placed = wait_for_placement(&a, "screens-b", "local");
+        assert_eq!(placed["offset"]["x"], 3360.0);
+
+        // The second monitor is unplugged: the placement moves to the
+        // remaining display's edge.
+        a.thread
+            .send(Command::SetLocalDisplays(vec![display(1440.0, 900.0)]))
+            .unwrap();
+        let moved = wait_for_placement(&a, "screens-b", "local");
+        assert_eq!(moved["offset"]["x"], 1440.0);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_saved_placement_is_refitted_once_the_peer_is_seen() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        // Saved next to a second monitor that was unplugged while this
+        // device was off.
+        let mut a = test_core_with("saved-a", discovery_port, |config| {
+            config.displays = vec![display(1440.0, 900.0)];
+            config.placements = vec![PlacementRecord {
+                peer_id: "saved-b".to_owned(),
+                offset: Some(Offset { x: 3360.0, y: 0.0 }),
+                updated_ms: 1,
+            }];
+        });
+        let mut b = test_core_with("saved-b", discovery_port, |config| {
+            config.displays = vec![display(1512.0, 982.0)];
+        });
+        let refitted = wait_for_placement(&a, "saved-b", "local");
+        assert_eq!(refitted["offset"]["x"], 1440.0);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
     }
 
     fn free_tcp_port() -> u16 {

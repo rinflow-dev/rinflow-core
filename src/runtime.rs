@@ -1,7 +1,8 @@
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
+use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
     Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
-    WireMessage, negotiate_protocol,
+    PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::remap::ShortcutRemap;
 use crate::transport::{
@@ -64,6 +65,19 @@ pub enum Command {
     /// Releases everything the input target holds and tells it control ended.
     ResetInput,
     InputReady,
+    /// This device's displays changed (logical points, see `layout.rs`).
+    SetLocalDisplays(Vec<Display>),
+    /// Places a peer at the given offset after snapping it to a valid spot,
+    /// or removes its placement. Synced to the peer.
+    SetPlacement {
+        peer_id: String,
+        offset: Option<Offset>,
+    },
+    /// Places a peer beside the outermost edge on one side.
+    PlaceBeside {
+        peer_id: String,
+        side: Side,
+    },
     Stop,
 }
 
@@ -192,7 +206,6 @@ async fn run(
         Ipv4Addr::BROADCAST,
         config.discovery_port,
     ));
-    let announcement = serde_json::to_vec(&Announcement::from_config(&config)).unwrap_or_default();
     let (connection_events_tx, mut connection_events_rx) = mpsc::unbounded_channel();
     let mut announce_timer = tokio::time::interval(Duration::from_secs(2));
     let mut maintenance_timer = tokio::time::interval(Duration::from_secs(1));
@@ -207,6 +220,16 @@ async fn run(
         input_target: None,
         next_connection_id: 1,
         ping_sequence: 0,
+        announcement: serde_json::to_vec(&Announcement::from_config(&config, &config.displays))
+            .unwrap_or_default(),
+        local_displays: config.displays.clone(),
+        placements: config
+            .placements
+            .iter()
+            .map(|record| (record.peer_id.clone(), record.clone()))
+            .collect(),
+        peer_displays: HashMap::new(),
+        pending_disconnects: Vec::new(),
     };
 
     sink.emit_value(json!({
@@ -224,6 +247,9 @@ async fn run(
                     Some(Command::Disconnect) => state.disconnect_target(),
                     Some(Command::DisconnectPeer(peer_id)) => state.disconnect_peer(&peer_id),
                     Some(Command::InputReady) => state.platform_input(platform_input.drain()),
+                    Some(Command::SetLocalDisplays(displays)) => state.set_local_displays(displays),
+                    Some(Command::SetPlacement { peer_id, offset }) => state.set_placement(&peer_id, offset),
+                    Some(Command::PlaceBeside { peer_id, side }) => state.place_beside(&peer_id, side),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -247,6 +273,7 @@ async fn run(
                 }
             }
             _ = announce_timer.tick() => {
+                let announcement = state.announcement.clone();
                 let _ = udp.send_to(&announcement, multicast).await;
                 // Broadcast is a compatibility fallback for networks or VPN setups that
                 // suppress multicast. Receivers deduplicate announcements by device ID.
@@ -294,6 +321,31 @@ struct Runtime<'a> {
     input_target: Option<String>,
     next_connection_id: u64,
     ping_sequence: u64,
+    /// The discovery datagram; rebuilt when the displays change.
+    announcement: Vec<u8>,
+    local_displays: Vec<Display>,
+    /// By peer ID, in this device's space.
+    placements: HashMap<String, PlacementRecord>,
+    /// Latest displays each peer described, in its own space.
+    peer_displays: HashMap<String, Vec<Display>>,
+    pending_disconnects: Vec<PendingDisconnect>,
+}
+
+/// How long a disconnect may be held back while a duplicate connection that
+/// could be the same peer finishes its handshake.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(1);
+
+struct PendingDisconnect {
+    peer_id: String,
+    reason: String,
+    deadline: Instant,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Runtime<'_> {
@@ -463,7 +515,10 @@ impl Runtime<'_> {
         let Ok(message) = serde_json::from_slice::<Announcement>(data) else {
             return;
         };
-        if !message.is_compatible() || message.device_id == self.config.device_id {
+        if !message.is_compatible()
+            || message.device_id == self.config.device_id
+            || validate_displays(&message.displays).is_err()
+        {
             return;
         }
         let peer = Peer {
@@ -473,15 +528,253 @@ impl Runtime<'_> {
             address: source.ip().to_string(),
             port: message.control_port,
             capabilities: message.capabilities,
+            displays: message.displays.clone(),
             socket_address: SocketAddr::new(source.ip(), message.control_port),
             last_seen: Instant::now(),
         };
         let is_new = !self.peers.contains_key(&message.device_id);
-        self.peers.insert(message.device_id, peer.clone());
+        self.peers.insert(message.device_id.clone(), peer.clone());
         if is_new {
             self.sink
                 .emit_value(json!({ "event": "peer_up", "peer": peer }));
         }
+        if !message.displays.is_empty() {
+            self.update_peer_displays(&message.device_id, message.displays);
+        }
+    }
+
+    // ---- Arrangement ----------------------------------------------------
+
+    /// Records a peer's displays and reports a change.
+    fn update_peer_displays(&mut self, peer_id: &str, displays: Vec<Display>) {
+        if self.peer_displays.get(peer_id) == Some(&displays) {
+            return;
+        }
+        self.sink.emit_value(json!({
+            "event": "peer_displays",
+            "peer_id": peer_id,
+            "displays": displays
+        }));
+        self.peer_displays.insert(peer_id.to_owned(), displays);
+        // A saved placement is checked once the peer's real size is known
+        // (this device's displays may also have changed while it was off).
+        self.refit_placement(peer_id);
+    }
+
+    /// Moves a placement that no longer fits, because displays on either side
+    /// changed, to the nearest spot where the two desktops touch. Waits until
+    /// the peer has described its displays: judging by the default size could
+    /// move a placement that is actually fine.
+    fn refit_placement(&mut self, peer_id: &str) {
+        if self.local_displays.is_empty() || !self.peer_displays.contains_key(peer_id) {
+            return;
+        }
+        let Some(offset) = self
+            .placements
+            .get(peer_id)
+            .and_then(|record| record.offset)
+        else {
+            return;
+        };
+        let peer = self.peer_layout(peer_id);
+        let obstacles = self.obstacles(peer_id);
+        if layout::is_valid_placement(&self.local_displays, &peer, offset, &obstacles) {
+            return;
+        }
+        if let Some(snapped) = layout::snap(&self.local_displays, &peer, offset, &obstacles) {
+            self.store_local_placement(peer_id, Some(snapped));
+        }
+    }
+
+    fn set_local_displays(&mut self, displays: Vec<Display>) {
+        if let Err(error) = validate_displays(&displays) {
+            self.sink.emit_error(format!("invalid displays: {error}"));
+            return;
+        }
+        if displays == self.local_displays {
+            return;
+        }
+        self.local_displays = displays;
+        self.announcement = serde_json::to_vec(&Announcement::from_config(
+            self.config,
+            &self.local_displays,
+        ))
+        .unwrap_or_default();
+        let info = WireMessage::ScreenInfo {
+            displays: self.local_displays.clone(),
+        };
+        for session in self
+            .sessions
+            .values()
+            .filter(|session| session.established())
+        {
+            let _ = session.connection.send_control(info.clone());
+        }
+        // A monitor was unplugged or resized: move placements that no longer
+        // touch this desktop to the nearest spot that does.
+        let placed: Vec<String> = self
+            .placements
+            .values()
+            .filter(|record| record.offset.is_some())
+            .map(|record| record.peer_id.clone())
+            .collect();
+        for peer_id in placed {
+            self.refit_placement(&peer_id);
+        }
+    }
+
+    /// The peer's displays, or a default display until it describes them.
+    fn peer_layout(&self, peer_id: &str) -> Vec<Display> {
+        layout::peer_or_default(
+            self.peer_displays
+                .get(peer_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Displays of every other placed peer, in this device's space.
+    fn obstacles(&self, except: &str) -> Vec<Display> {
+        self.placements
+            .values()
+            .filter(|record| record.peer_id != except)
+            .filter_map(|record| {
+                record
+                    .offset
+                    .map(|offset| layout::placed(&self.peer_layout(&record.peer_id), offset))
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn set_placement(&mut self, peer_id: &str, proposed: Option<Offset>) {
+        let offset = match proposed {
+            None => None,
+            Some(proposed) => {
+                if self.local_displays.is_empty() {
+                    self.sink
+                        .emit_error("cannot place a peer before the local displays are known");
+                    return;
+                }
+                if !proposed.is_valid() {
+                    self.sink.emit_error("placement offset must be finite");
+                    return;
+                }
+                let peer = self.peer_layout(peer_id);
+                let obstacles = self.obstacles(peer_id);
+                match layout::snap(&self.local_displays, &peer, proposed, &obstacles) {
+                    Some(snapped) => Some(snapped),
+                    None => {
+                        self.sink.emit_error(format!("no room to place {peer_id}"));
+                        return;
+                    }
+                }
+            }
+        };
+        self.store_local_placement(peer_id, offset);
+    }
+
+    fn place_beside(&mut self, peer_id: &str, side: Side) {
+        if self.local_displays.is_empty() {
+            self.sink
+                .emit_error("cannot place a peer before the local displays are known");
+            return;
+        }
+        let peer = self.peer_layout(peer_id);
+        let obstacles = self.obstacles(peer_id);
+        match layout::place_beside(&self.local_displays, &peer, side, &obstacles) {
+            Some(offset) => self.store_local_placement(peer_id, Some(offset)),
+            None => self
+                .sink
+                .emit_error(format!("no room to place {peer_id} on that side")),
+        }
+    }
+
+    /// A placement decided on this device. Its timestamp is later than the
+    /// record it replaces even within the same millisecond: the user acted on
+    /// what they saw, so their edit must win over it on both sides.
+    fn store_local_placement(&mut self, peer_id: &str, offset: Option<Offset>) {
+        let seen = self
+            .placements
+            .get(peer_id)
+            .map_or(0, |record| record.updated_ms);
+        let updated_ms = now_ms().max(seen + 1);
+        self.store_placement(peer_id, offset, updated_ms, "local");
+    }
+
+    /// Saves a placement, tells the shell, and syncs it to the peer when the
+    /// change was made here.
+    fn store_placement(
+        &mut self,
+        peer_id: &str,
+        offset: Option<Offset>,
+        updated_ms: u64,
+        source: &str,
+    ) {
+        let record = PlacementRecord {
+            peer_id: peer_id.to_owned(),
+            offset,
+            updated_ms,
+        };
+        self.placements.insert(peer_id.to_owned(), record.clone());
+        self.sink.emit_value(json!({
+            "event": "placement_changed",
+            "peer_id": peer_id,
+            "offset": offset,
+            "updated_ms": updated_ms,
+            "source": source
+        }));
+        if source == "local" {
+            self.send_placement(peer_id);
+        }
+    }
+
+    fn send_placement(&self, peer_id: &str) {
+        let (Some(record), Some(id)) = (
+            self.placements.get(peer_id),
+            self.established_session(peer_id),
+        ) else {
+            return;
+        };
+        let _ = self.sessions[&id]
+            .connection
+            .send_control(WireMessage::Placement {
+                offset: record.offset,
+                updated_ms: record.updated_ms,
+            });
+    }
+
+    /// The peer placed this device in its space. Seen from here that is the
+    /// mirrored offset; the more recent edit of the two sides wins.
+    fn remote_placement(&mut self, peer_id: &str, offset: Option<Offset>, updated_ms: u64) {
+        if let Some(record) = self.placements.get(peer_id) {
+            // An exact tie (both sides edited in the same millisecond) goes
+            // to the lower device ID, so both sides settle on the same edit.
+            let theirs_wins = updated_ms > record.updated_ms
+                || (updated_ms == record.updated_ms
+                    && peer_id < self.config.device_id.as_str()
+                    && record.offset != offset.map(Offset::mirrored));
+            if !theirs_wins {
+                return;
+            }
+        }
+        let mirrored = offset.map(Offset::mirrored);
+        // The peer computed it against our displays as it last knew them; if
+        // they changed since, fit it again (and that newer fit syncs back).
+        if let Some(mirrored) = mirrored
+            && !self.local_displays.is_empty()
+        {
+            let peer = self.peer_layout(peer_id);
+            let obstacles = self.obstacles(peer_id);
+            if !layout::is_valid_placement(&self.local_displays, &peer, mirrored, &obstacles)
+                && let Some(snapped) =
+                    layout::snap(&self.local_displays, &peer, mirrored, &obstacles)
+            {
+                self.store_local_placement(peer_id, Some(snapped));
+                return;
+            }
+        }
+        self.store_placement(peer_id, mirrored, updated_ms, "peer");
     }
 
     fn connection_event(&mut self, event: ConnectionEvent) {
@@ -613,6 +906,16 @@ impl Runtime<'_> {
                     .send_control(WireMessage::Pong { sequence });
             }
             WireMessage::Pong { .. } => session.last_seen = Instant::now(),
+            WireMessage::ScreenInfo { displays } => {
+                if let Some(peer_id) = session.peer_id().map(str::to_owned) {
+                    self.update_peer_displays(&peer_id, displays);
+                }
+            }
+            WireMessage::Placement { offset, updated_ms } => {
+                if let Some(peer_id) = session.peer_id().map(str::to_owned) {
+                    self.remote_placement(&peer_id, offset, updated_ms);
+                }
+            }
         }
     }
 
@@ -689,6 +992,17 @@ impl Runtime<'_> {
             "protocol_version": protocol_version,
             "capabilities": hello.capabilities
         }));
+
+        // Describe our displays, then offer our placement of the peer. The
+        // peer does the same; whichever placement is newer wins on both sides.
+        if let Some(session) = self.sessions.get(&id) {
+            let _ = session.connection.send_control(WireMessage::ScreenInfo {
+                displays: self.local_displays.clone(),
+            });
+        }
+        self.send_placement(&hello.device_id);
+        // A disconnect held back for this peer is moot now.
+        self.flush_disconnects(false);
     }
 
     fn peer_value(
@@ -730,11 +1044,48 @@ impl Runtime<'_> {
             peer_id.as_deref(),
         );
         if notify && let Some(peer_id) = peer_id {
-            self.sink.emit_value(json!({
-                "event": "disconnected",
-                "peer_id": peer_id,
-                "reason": reason
-            }));
+            self.notify_disconnected(peer_id, reason);
+        } else {
+            // A connection that might have been a held-back peer is gone.
+            self.flush_disconnects(false);
+        }
+    }
+
+    /// Reports a lost session, unless another connection may still turn out
+    /// to be the same peer: a duplicate that is still handshaking (incoming
+    /// connections are anonymous until their `Hello`) replaces it without the
+    /// shell ever seeing it go away. Held back at most [`DISCONNECT_GRACE`].
+    fn notify_disconnected(&mut self, peer_id: String, reason: &str) {
+        self.pending_disconnects.push(PendingDisconnect {
+            peer_id,
+            reason: reason.to_owned(),
+            deadline: Instant::now() + DISCONNECT_GRACE,
+        });
+        self.flush_disconnects(false);
+    }
+
+    /// Emits held-back disconnects that are now certain and drops the ones a
+    /// replacement session made moot. `all` emits everything still pending.
+    fn flush_disconnects(&mut self, all: bool) {
+        let pending = std::mem::take(&mut self.pending_disconnects);
+        for entry in pending {
+            if self.established_session(&entry.peer_id).is_some() {
+                continue;
+            }
+            let may_reconnect = self.sessions.values().any(|session| {
+                session
+                    .peer_id()
+                    .is_none_or(|peer_id| peer_id == entry.peer_id)
+            });
+            if all || !may_reconnect || Instant::now() >= entry.deadline {
+                self.sink.emit_value(json!({
+                    "event": "disconnected",
+                    "peer_id": entry.peer_id,
+                    "reason": entry.reason
+                }));
+            } else {
+                self.pending_disconnects.push(entry);
+            }
         }
     }
 
@@ -743,9 +1094,11 @@ impl Runtime<'_> {
         for id in ids {
             self.close_session(id, reason, true);
         }
+        self.flush_disconnects(true);
     }
 
     fn maintenance(&mut self) {
+        self.flush_disconnects(false);
         let expired: Vec<String> = self
             .peers
             .iter()

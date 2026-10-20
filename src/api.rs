@@ -1,3 +1,4 @@
+use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
 
@@ -44,6 +45,28 @@ impl Core {
     pub fn set_input_target(&self, peer_id: Option<&str>) -> Result<(), String> {
         self.thread
             .send(Command::SetInputTarget(peer_id.map(str::to_owned)))
+    }
+
+    /// Describes this device's displays (logical points). Peers receive them
+    /// at once, and placements that no longer touch the desktop are moved.
+    pub fn set_local_displays(&self, displays: Vec<Display>) -> Result<(), String> {
+        self.thread.send(Command::SetLocalDisplays(displays))
+    }
+
+    /// Places a peer near `offset` (snapped to a valid spot), or removes its
+    /// placement with `None`. Reported as `placement_changed` and synced.
+    pub fn set_placement(&self, peer_id: &str, offset: Option<Offset>) -> Result<(), String> {
+        self.thread.send(Command::SetPlacement {
+            peer_id: peer_id.to_owned(),
+            offset,
+        })
+    }
+
+    pub fn place_beside(&self, peer_id: &str, side: Side) -> Result<(), String> {
+        self.thread.send(Command::PlaceBeside {
+            peer_id: peer_id.to_owned(),
+            side,
+        })
     }
 
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {

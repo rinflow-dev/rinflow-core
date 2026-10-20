@@ -1,9 +1,11 @@
+use crate::layout::{Display, Offset, validate_displays};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-pub const PROTOCOL_MIN_VERSION: u16 = 2;
-pub const PROTOCOL_MAX_VERSION: u16 = 2;
+/// Version 3 adds display descriptions and synchronised placements.
+pub const PROTOCOL_MIN_VERSION: u16 = 3;
+pub const PROTOCOL_MAX_VERSION: u16 = 3;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 42_420;
 pub const DEFAULT_CONTROL_PORT: u16 = 42_421;
 pub const DISCOVERY_GROUP: [u8; 4] = [239, 255, 42, 99];
@@ -71,6 +73,21 @@ pub struct CoreConfig {
     /// Translate Command and Control shortcuts when a controlling peer uses
     /// the other platform convention (see `remap.rs`).
     pub shortcut_remap: bool,
+    /// This device's displays in logical points (see `layout.rs`).
+    pub displays: Vec<Display>,
+    /// Placements saved by the shell from earlier `placement_changed` events.
+    pub placements: Vec<PlacementRecord>,
+}
+
+/// Where a peer sits in this device's space. `offset: None` records that the
+/// placement was removed, so the removal also wins over older placements.
+/// `updated_ms` (Unix time) decides which side's edit wins when the two
+/// devices sync: the more recent one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlacementRecord {
+    pub peer_id: String,
+    pub offset: Option<Offset>,
+    pub updated_ms: u64,
 }
 
 impl Default for CoreConfig {
@@ -83,6 +100,8 @@ impl Default for CoreConfig {
             discovery_port: DEFAULT_DISCOVERY_PORT,
             capabilities: LOCAL_CAPABILITIES,
             shortcut_remap: true,
+            displays: Vec::new(),
+            placements: Vec::new(),
         }
     }
 }
@@ -107,11 +126,19 @@ impl CoreConfig {
         if self.control_port == 0 || self.discovery_port == 0 {
             return Err("ports must be non-zero".to_owned());
         }
+        validate_displays(&self.displays).map_err(str::to_owned)?;
+        if self
+            .placements
+            .iter()
+            .any(|record| record.offset.is_some_and(|offset| !offset.is_valid()))
+        {
+            return Err("placement offsets must be finite".to_owned());
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Announcement {
     pub product: String,
     pub min_protocol_version: u16,
@@ -122,10 +149,13 @@ pub struct Announcement {
     #[serde(default = "unknown_platform")]
     pub platform: String,
     pub control_port: u16,
+    /// Lets devices that have not connected yet draw this one to scale.
+    #[serde(default)]
+    pub displays: Vec<Display>,
 }
 
 impl Announcement {
-    pub fn from_config(config: &CoreConfig) -> Self {
+    pub fn from_config(config: &CoreConfig, displays: &[Display]) -> Self {
         Self {
             product: "linkcursor".to_owned(),
             min_protocol_version: PROTOCOL_MIN_VERSION,
@@ -135,6 +165,7 @@ impl Announcement {
             device_name: config.device_name.clone(),
             platform: config.platform.clone(),
             control_port: config.control_port,
+            displays: displays.to_vec(),
         }
     }
 
@@ -163,6 +194,8 @@ pub struct Peer {
     pub address: String,
     pub port: u16,
     pub capabilities: u64,
+    /// As last described by the peer, in its own logical space.
+    pub displays: Vec<Display>,
     #[serde(skip)]
     pub socket_address: SocketAddr,
     #[serde(skip)]
@@ -289,6 +322,15 @@ pub enum WireMessage {
     },
     Pong {
         sequence: u64,
+    },
+    /// The sender's displays; sent after the handshake and when they change.
+    ScreenInfo {
+        displays: Vec<Display>,
+    },
+    /// Where the receiver sits in the sender's space (`None`: not placed).
+    Placement {
+        offset: Option<Offset>,
+        updated_ms: u64,
     },
 }
 
