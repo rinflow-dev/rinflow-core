@@ -8,7 +8,7 @@ use crate::remap::ShortcutRemap;
 use crate::transport::{
     ActiveConnection, ConnectionEvent, connect_in_background, spawn_connection,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -230,6 +230,7 @@ async fn run(
             .collect(),
         peer_displays: HashMap::new(),
         pending_disconnects: Vec::new(),
+        portals: Vec::new(),
     };
 
     sink.emit_value(json!({
@@ -238,6 +239,7 @@ async fn run(
         "control_port": config.control_port,
         "discovery_port": config.discovery_port
     }));
+    state.publish_portals();
 
     loop {
         tokio::select! {
@@ -329,6 +331,8 @@ struct Runtime<'a> {
     /// Latest displays each peer described, in its own space.
     peer_displays: HashMap<String, Vec<Display>>,
     pending_disconnects: Vec<PendingDisconnect>,
+    /// The portals last reported in `portals_changed`.
+    portals: Vec<Value>,
 }
 
 /// How long a disconnect may be held back while a duplicate connection that
@@ -559,6 +563,43 @@ impl Runtime<'_> {
         // A saved placement is checked once the peer's real size is known
         // (this device's displays may also have changed while it was off).
         self.refit_placement(peer_id);
+        self.publish_portals();
+    }
+
+    /// Reports where the pointer crosses into each placed peer, whenever that
+    /// changes: the segments of this device's display edges that touch a
+    /// peer's displays, in this device's space. Shells decide edge crossings
+    /// with these instead of computing the geometry themselves.
+    fn publish_portals(&mut self) {
+        let mut placed: Vec<(&String, Offset)> = self
+            .placements
+            .values()
+            .filter_map(|record| record.offset.map(|offset| (&record.peer_id, offset)))
+            .collect();
+        placed.sort_by(|a, b| a.0.cmp(b.0));
+        let mut portals = Vec::new();
+        for (peer_id, offset) in placed {
+            let peer = self.peer_layout(peer_id);
+            for portal in layout::portals(&self.local_displays, &peer, offset) {
+                portals.push(json!({
+                    "peer_id": peer_id,
+                    "side": portal.side,
+                    "local_display": portal.local_display,
+                    "peer_display": portal.peer_display,
+                    "line": portal.line,
+                    "from": portal.from,
+                    "to": portal.to
+                }));
+            }
+        }
+        if portals == self.portals {
+            return;
+        }
+        self.sink.emit_value(json!({
+            "event": "portals_changed",
+            "portals": portals
+        }));
+        self.portals = portals;
     }
 
     /// Moves a placement that no longer fits, because displays on either side
@@ -621,6 +662,7 @@ impl Runtime<'_> {
         for peer_id in placed {
             self.refit_placement(&peer_id);
         }
+        self.publish_portals();
     }
 
     /// The peer's displays, or a default display until it describes them.
@@ -727,6 +769,7 @@ impl Runtime<'_> {
         if source == "local" {
             self.send_placement(peer_id);
         }
+        self.publish_portals();
     }
 
     fn send_placement(&self, peer_id: &str) {

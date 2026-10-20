@@ -9,7 +9,8 @@
  *    lc_core_set_input_target. Session events carry "peer_id".
  * 4: the arrangement: lc_core_set_local_displays, lc_core_set_placement,
  *    lc_core_place_beside, config keys "displays" and "placements", events
- *    "peer_displays" and "placement_changed". Wire protocol version 3.
+ *    "peer_displays", "placement_changed" and "portals_changed". Wire
+ *    protocol version 3.
  */
 #define LC_CORE_ABI_VERSION 4
 
@@ -31,6 +32,9 @@ typedef struct LcCore LcCore;
  *   top of the content, positive scroll_x toward the left (macOS signs).
  *   LC_INPUT_FLAG_PRECISE_SCROLL marks trackpad or smooth-wheel input;
  *   without it the values come from a notched wheel at 10 points per line.
+ * - A move with LC_INPUT_FLAG_ABSOLUTE_POSITION places the pointer at x / y,
+ *   in the receiver's logical space (where it enters the peer); its deltas
+ *   are ignored and it is never merged with other motion.
  * - Leave sequence at zero; the core assigns it.
  *
  * Received keys are already translated between Command and Control when the

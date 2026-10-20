@@ -1,6 +1,7 @@
 use crate::model::{
-    LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
-    LC_INPUT_MOUSE_BUTTON_UP, LcInputEvent, MAX_INPUT_BATCH_SIZE, WireMessage,
+    LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP,
+    LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP, LcInputEvent, MAX_INPUT_BATCH_SIZE,
+    WireMessage,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -230,7 +231,10 @@ fn take_sequence(state: &mut OutboundState) -> u64 {
 }
 
 fn coalesce(previous: &mut LcInputEvent, next: &LcInputEvent) -> bool {
-    if previous.is_motion() && next.is_motion() {
+    // An absolute move places the pointer (for example where it enters the
+    // peer); merged with relative motion its position would be lost.
+    let absolute = |event: &LcInputEvent| event.flags & LC_INPUT_FLAG_ABSOLUTE_POSITION != 0;
+    if previous.is_motion() && next.is_motion() && !absolute(previous) && !absolute(next) {
         previous.flags = next.flags;
         previous.modifiers = next.modifiers;
         previous.buttons = next.buttons;

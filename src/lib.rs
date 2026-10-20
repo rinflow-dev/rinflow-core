@@ -27,10 +27,11 @@ mod tests {
     use super::layout::{Display, Offset, Side};
     use super::model::PlacementRecord;
     use super::model::{
-        Announcement, CoreConfig, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
-        LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL,
-        LC_MODIFIER_LEFT_COMMAND, LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LcInputEvent,
-        PROTOCOL_MAX_VERSION, WireMessage,
+        Announcement, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_KEY_DOWN,
+        LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE,
+        LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL, LC_MODIFIER_LEFT_COMMAND,
+        LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LcInputEvent, PROTOCOL_MAX_VERSION,
+        WireMessage,
     };
     use super::protocol::{decode_message, encode_message};
     use super::remap::ShortcutRemap;
@@ -170,6 +171,37 @@ mod tests {
         assert_eq!(events[0].delta_x, 6.0);
         assert_eq!(events[1].kind, LC_INPUT_KEY_DOWN);
         assert_eq!(events[0].sequence + 1, events[1].sequence);
+    }
+
+    #[test]
+    fn absolute_moves_are_not_merged_with_relative_motion() {
+        let queue = OutboundInputQueue::new();
+        let relative = LcInputEvent {
+            kind: LC_INPUT_MOUSE_MOVE,
+            delta_x: 3.0,
+            ..LcInputEvent::default()
+        };
+        queue.push(relative).expect("motion before");
+        let arrival = LcInputEvent {
+            kind: LC_INPUT_MOUSE_MOVE,
+            flags: LC_INPUT_FLAG_ABSOLUTE_POSITION,
+            x: 1440.0,
+            y: 300.0,
+            ..LcInputEvent::default()
+        };
+        assert_eq!(queue.push(arrival).expect("arrival"), PushOutcome::Queued);
+        assert_eq!(
+            queue.push(relative).expect("motion after"),
+            PushOutcome::Queued
+        );
+
+        let Some(WireMessage::InputBatch { events, .. }) = queue.pop_message() else {
+            panic!("expected input batch")
+        };
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].flags, LC_INPUT_FLAG_ABSOLUTE_POSITION);
+        assert_eq!((events[1].x, events[1].y), (1440.0, 300.0));
+        assert_eq!(events[2].delta_x, 3.0);
     }
 
     #[test]
@@ -932,6 +964,14 @@ mod tests {
             .unwrap();
         let placed = wait_for_placement(&a, "screens-b", "local");
         assert_eq!(placed["offset"]["x"], 3360.0);
+        // Shells get the crossing segment without computing it.
+        let portals = wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "portals_changed"
+        });
+        assert_eq!(portals["portals"][0]["peer_id"], "screens-b");
+        assert_eq!(portals["portals"][0]["side"], "right");
+        assert_eq!(portals["portals"][0]["local_display"], 1);
+        assert_eq!(portals["portals"][0]["line"], 3360.0);
 
         // The second monitor is unplugged: the placement moves to the
         // remaining display's edge.
