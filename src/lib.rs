@@ -1,6 +1,7 @@
 mod api;
 mod clipboard;
 mod ffi;
+mod files;
 mod input;
 pub mod layout;
 mod model;
@@ -18,6 +19,7 @@ pub use clipboard::{
     MIME_TEXT,
 };
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
+pub use files::MIME_URI_LIST;
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -34,6 +36,7 @@ mod tests {
         self, CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardAssembler, ClipboardFormat,
         MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT,
     };
+    use super::files::{self as transfer_files, FileWriter, MIME_URI_LIST, Manifest};
     use super::input::{
         OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
     };
@@ -51,6 +54,7 @@ mod tests {
     use super::runtime::{Command, CoreThread, EventSink};
     use serde_json::Value;
     use std::net::{TcpListener, UdpSocket};
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, Instant};
 
@@ -78,7 +82,9 @@ mod tests {
                 ClipboardFormat {
                     mime: MIME_PNG.to_owned(),
                     // Several chunks' worth, to cross chunk boundaries.
-                    data: (0..CLIPBOARD_CHUNK_SIZE * 2 + 17).map(|i| i as u8).collect(),
+                    data: (0..CLIPBOARD_CHUNK_SIZE * 2 + 17)
+                        .map(|i| i as u8)
+                        .collect(),
                 },
             ],
         };
@@ -133,7 +139,11 @@ mod tests {
         let encoded = text_clipboard("abc").encode();
         let mut assembler = ClipboardAssembler::default();
         // A transfer must start at its beginning.
-        assert!(assembler.push(1, encoded.len() as u32, 2, &encoded[2..]).is_err());
+        assert!(
+            assembler
+                .push(1, encoded.len() as u32, 2, &encoded[2..])
+                .is_err()
+        );
         // A newer transfer replaces one in progress.
         assert_eq!(assembler.push(2, 100, 0, &[0; 10]).unwrap(), None);
         assert_eq!(
@@ -143,6 +153,122 @@ mod tests {
                 .unwrap(),
             encoded
         );
+    }
+
+    #[test]
+    fn manifest_paths_are_cleaned_or_refused() {
+        let clean = |path: &str| {
+            transfer_files::sanitize(path).map(|p| p.to_string_lossy().replace('\\', "/"))
+        };
+        assert_eq!(clean("报告/第一章.pdf").as_deref(), Some("报告/第一章.pdf"));
+        assert_eq!(clean("a<b>:c").as_deref(), None); // ':' never: drive letters, streams
+        assert_eq!(clean("a<b>|c?.txt").as_deref(), Some("a_b__c_.txt"));
+        assert_eq!(clean("CON.txt").as_deref(), Some("_CON.txt"));
+        assert_eq!(clean("com1").as_deref(), Some("_com1"));
+        assert_eq!(clean("trailing. . ").as_deref(), Some("trailing"));
+        assert_eq!(clean("back\\slash").as_deref(), None); // backslash refused
+        assert_eq!(clean("tab\there").as_deref(), Some("tabhere")); // control characters go
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a//b",
+            "./a",
+            "C:/x",
+            "...",
+            "a/ /b",
+        ] {
+            assert_eq!(clean(bad), None, "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn uri_lists_round_trip_and_ignore_foreign_urls() {
+        let paths = vec![
+            PathBuf::from("/tmp/a b/报告#1.pdf"),
+            PathBuf::from("/tmp/c%d"),
+        ];
+        let list = transfer_files::uri_list(&paths);
+        if cfg!(unix) {
+            assert_eq!(transfer_files::parse_uri_list(&list), paths);
+        }
+        let mixed =
+            b"# comment\r\nhttps://example.com/x\r\nfile://server/share/x\r\nfile:///tmp/ok\r\n";
+        let parsed = transfer_files::parse_uri_list(mixed);
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn manifests_must_add_up() {
+        let manifest = |total| Manifest {
+            transfer: 1,
+            total_size: total,
+            entries: vec![
+                transfer_files::Entry {
+                    path: "d".into(),
+                    size: 0,
+                    dir: true,
+                },
+                transfer_files::Entry {
+                    path: "d/f".into(),
+                    size: 5,
+                    dir: false,
+                },
+            ],
+        };
+        assert!(manifest(5).validate().is_ok());
+        assert!(manifest(6).validate().is_err());
+    }
+
+    #[test]
+    fn unfinished_files_leave_nothing_behind() {
+        let dir = temp_dir("partial");
+        let target = dir.join("x.bin");
+        {
+            let mut writer = FileWriter::create(target.clone(), 10, 1).unwrap();
+            assert!(!writer.write(0, b"12345").unwrap());
+            assert!(writer.write(3, b"zz").is_err(), "out of order");
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let mut writer = FileWriter::create(target.clone(), 3, 2).unwrap();
+        assert!(writer.write(0, b"abc").unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+        // The same name again gets a number.
+        assert_eq!(
+            transfer_files::unique_child(&dir, "x.bin"),
+            dir.join("x (1).bin")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn data_link_and_file_messages_round_trip() {
+        for message in [
+            WireMessage::DataInvite { token: 42 },
+            WireMessage::DataHello {
+                device_id: "dev".into(),
+                token: 7,
+            },
+            WireMessage::FileRequest {
+                transfer: 3,
+                entry: 9,
+                offset: 1 << 40,
+            },
+            WireMessage::FileChunk {
+                transfer: 3,
+                entry: 9,
+                offset: 5,
+                data: vec![1, 2, 3],
+            },
+            WireMessage::FileCancel {
+                transfer: 3,
+                reason: "文件已变化".into(),
+            },
+        ] {
+            let bytes = encode_message(&message).unwrap();
+            assert_eq!(decode_message(&bytes).unwrap(), message);
+        }
     }
 
     #[test]
@@ -1002,6 +1128,234 @@ mod tests {
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "linkcursor-test-{name}-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos() ^ (name.len() as u128 * 7919)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn uri_clipboard(paths: &[PathBuf]) -> Clipboard {
+        Clipboard {
+            formats: vec![
+                ClipboardFormat {
+                    mime: MIME_URI_LIST.to_owned(),
+                    data: transfer_files::uri_list(paths),
+                },
+                ClipboardFormat {
+                    mime: MIME_TEXT.to_owned(),
+                    data: b"names".to_vec(),
+                },
+            ],
+        }
+    }
+
+    /// Two cores with clipboard and files, B receiving into its own folder.
+    fn file_cores(name: &str, limit: u64) -> (TestCore, TestCore, PathBuf, PathBuf) {
+        let discovery_port = free_udp_port();
+        let source = temp_dir(&format!("{name}-src"));
+        let downloads = temp_dir(&format!("{name}-dst"));
+        let a = test_core_with(&format!("{name}-a"), discovery_port, |config| {
+            config.clipboard = true;
+            config.files = true;
+            config.download_directory =
+                Some(temp_dir(&format!("{name}-a-dst")).to_string_lossy().into());
+        });
+        let dst = downloads.to_string_lossy().into_owned();
+        let b = test_core_with(&format!("{name}-b"), discovery_port, move |config| {
+            config.clipboard = true;
+            config.files = true;
+            config.download_directory = Some(dst);
+            config.max_auto_receive_bytes = limit;
+        });
+        wait_for_peers(&a, &[&format!("{name}-b")]);
+        a.thread
+            .send(Command::Connect(format!("{name}-b")))
+            .unwrap();
+        wait_connected(&a, &format!("{name}-b"));
+        wait_connected(&b, &format!("{name}-a"));
+        (a, b, source, downloads)
+    }
+
+    fn pattern(length: usize, seed: u8) -> Vec<u8> {
+        (0..length)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn copied_files_and_folders_arrive_complete_without_overwriting() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores("files", u64::MAX);
+        let report = source.join("报告");
+        std::fs::create_dir_all(report.join("img")).unwrap();
+        std::fs::write(report.join("a.txt"), pattern(100_000, 1)).unwrap();
+        std::fs::write(report.join("empty.txt"), b"").unwrap();
+        std::fs::write(report.join("img").join("b.bin"), pattern(300_001, 2)).unwrap();
+        std::fs::write(source.join("note.txt"), b"hello").unwrap();
+        // Something called note.txt is already there: it must survive.
+        std::fs::write(downloads.join("note.txt"), b"keep me").unwrap();
+
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[
+                report.clone(),
+                source.join("note.txt"),
+            ])))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+
+        let done = wait_for_event(&b.events, Duration::from_secs(10), |event| {
+            event["event"] == "files_received" || event["event"] == "files_failed"
+        });
+        assert_eq!(done["event"], "files_received", "{done}");
+        let got = |path: &Path| std::fs::read(path).unwrap();
+        assert_eq!(got(&downloads.join("报告/a.txt")), pattern(100_000, 1));
+        assert_eq!(got(&downloads.join("报告/empty.txt")), b"");
+        assert_eq!(got(&downloads.join("报告/img/b.bin")), pattern(300_001, 2));
+        assert_eq!(got(&downloads.join("note (1).txt")), b"hello");
+        assert_eq!(got(&downloads.join("note.txt")), b"keep me");
+        // No partial file is left anywhere.
+        let leftovers: Vec<_> = walk(&downloads)
+            .into_iter()
+            .filter(|path| path.to_string_lossy().ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // The clipboard that follows lists the received top-level paths.
+        let clipboard = wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "clipboard"
+        });
+        let clipboard =
+            Clipboard::from_json(&serde_json::json!({ "formats": clipboard["formats"] })).unwrap();
+        assert_eq!(clipboard.formats[0].mime, MIME_URI_LIST);
+        let pasted = transfer_files::parse_uri_list(&clipboard.formats[0].data);
+        assert_eq!(
+            pasted,
+            vec![downloads.join("报告"), downloads.join("note (1).txt")]
+        );
+        assert_eq!(clipboard.formats[1].data, b"names");
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    #[test]
+    fn large_transfers_wait_for_acceptance_and_changed_files_are_refused() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores("offer", 10);
+        let file = source.join("big.bin");
+        std::fs::write(&file, pattern(50_000, 3)).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(std::slice::from_ref(
+                &file,
+            ))))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_offered"
+        });
+        assert_eq!(offered["total_size"], 50_000);
+        assert_eq!(offered["count"], 1);
+        let transfer = offered["transfer"].as_u64().unwrap() as u32;
+        b.thread.send(Command::AcceptFiles(transfer)).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_received"
+        });
+        assert_eq!(
+            std::fs::read(downloads.join("big.bin")).unwrap(),
+            pattern(50_000, 3)
+        );
+
+        // A new copy whose file then changes before it is accepted.
+        let other = source.join("other.bin");
+        std::fs::write(&other, pattern(40_000, 4)).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(std::slice::from_ref(
+                &other,
+            ))))
+            .unwrap();
+        a.thread.send(Command::ResetInput).unwrap();
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_offered"
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&other, pattern(40_001, 5)).unwrap();
+        b.thread
+            .send(Command::AcceptFiles(
+                offered["transfer"].as_u64().unwrap() as u32
+            ))
+            .unwrap();
+        let failed = wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_failed" || event["event"] == "files_received"
+        });
+        assert_eq!(failed["event"], "files_failed", "{failed}");
+        assert!(!downloads.join("other.bin").exists());
+        assert!(
+            walk(&downloads)
+                .iter()
+                .all(|p| !p.to_string_lossy().ends_with(".partial"))
+        );
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    #[test]
+    fn input_keeps_flowing_during_a_large_transfer() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores("flow", u64::MAX);
+        let file = source.join("large.bin");
+        std::fs::write(&file, pattern(8 * 1024 * 1024, 6)).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[file])))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(0.5))).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_progress"
+        });
+        // While the file streams, every motion still arrives promptly.
+        for delta in 1..=5 {
+            let sent = Instant::now();
+            a.thread
+                .send(Command::SendInput(motion(delta as f64)))
+                .unwrap();
+            let deltas = received(&b, Duration::from_millis(300));
+            assert!(
+                deltas.contains(&(delta as f64)),
+                "motion {delta} late: {deltas:?}"
+            );
+            assert!(sent.elapsed() < Duration::from_millis(400));
+        }
+        wait_for_event(&b.events, Duration::from_secs(20), |event| {
+            event["event"] == "files_received"
+        });
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walk(&path));
+            }
+            found.push(path);
+        }
+        found
     }
 
     fn wait_for_event(

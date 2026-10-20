@@ -16,10 +16,19 @@ pub const CAPABILITY_INPUT_V2: u64 = 1 << 0;
 pub const CAPABILITY_RELATIVE_POINTER: u64 = 1 << 1;
 pub const CAPABILITY_HIGH_RESOLUTION_SCROLL: u64 = 1 << 3;
 pub const CAPABILITY_HID_KEYBOARD: u64 = 1 << 4;
-/// Exchanges clipboards (`ClipboardChunk`); advertised when the shell enables
-/// `CoreConfig::clipboard`. Never sent to a peer without it: an older peer
-/// closes the connection on a message type it does not know.
-pub const CAPABILITY_CLIPBOARD: u64 = 1 << 5;
+/// Receives copied files over the data link (`FileRequest` / `FileChunk`);
+/// advertised when the shell enables `CoreConfig::files`.
+pub const CAPABILITY_FILES: u64 = 1 << 6;
+/// Exchanges clipboards (`ClipboardChunk` on the data link); advertised when
+/// the shell enables `CoreConfig::clipboard`. Bit 5 meant an earlier
+/// clipboard on the control connection and is retired. Data-link messages go
+/// only to peers sharing one of these bits: an older peer closes the
+/// connection on a message type it does not know.
+pub const CAPABILITY_CLIPBOARD: u64 = 1 << 7;
+/// Features carried by the data link (see `transport.rs`).
+pub const DATA_LINK_CAPABILITIES: u64 = CAPABILITY_CLIPBOARD | CAPABILITY_FILES;
+/// Files up to this size in all are received without asking.
+pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
@@ -81,6 +90,13 @@ pub struct CoreConfig {
     /// The shell reads and writes the system clipboard: `lc_core_set_clipboard`
     /// and the `clipboard` event (see `clipboard.rs`). Off by default.
     pub clipboard: bool,
+    /// The shell reports copied files (`text/uri-list`) and takes received
+    /// ones (see `files.rs`). Needs `clipboard` and `download_directory`.
+    pub files: bool,
+    /// Where received files go, e.g. `~/Downloads/LinkCursor`.
+    pub download_directory: Option<String>,
+    /// Larger transfers wait for `lc_core_accept_files`.
+    pub max_auto_receive_bytes: u64,
     /// This device's displays in logical points (see `layout.rs`).
     pub displays: Vec<Display>,
     /// Placements saved by the shell from earlier `placement_changed` events.
@@ -109,6 +125,9 @@ impl Default for CoreConfig {
             capabilities: LOCAL_CAPABILITIES,
             shortcut_remap: false,
             clipboard: false,
+            files: false,
+            download_directory: None,
+            max_auto_receive_bytes: DEFAULT_MAX_AUTO_RECEIVE_BYTES,
             displays: Vec::new(),
             placements: Vec::new(),
         }
@@ -118,14 +137,20 @@ impl Default for CoreConfig {
 impl CoreConfig {
     /// What this device announces and offers in `Hello`.
     pub fn advertised_capabilities(&self) -> u64 {
+        let mut capabilities = self.capabilities;
         if self.clipboard {
-            self.capabilities | CAPABILITY_CLIPBOARD
-        } else {
-            self.capabilities
+            capabilities |= CAPABILITY_CLIPBOARD;
         }
+        if self.files {
+            capabilities |= CAPABILITY_FILES;
+        }
+        capabilities
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.files && (!self.clipboard || self.download_directory.is_none()) {
+            return Err("files needs clipboard and download_directory".to_owned());
+        }
         if self.device_id.trim().is_empty() {
             return Err("device_id must not be empty".to_owned());
         }
@@ -352,12 +377,40 @@ pub enum WireMessage {
     },
     /// Part of the sender's clipboard (see `clipboard.rs`): bytes
     /// `offset..offset + data.len()` of transfer `id`, `total` bytes long.
-    /// Only sent to peers with `CAPABILITY_CLIPBOARD`.
+    /// Data link only.
     ClipboardChunk {
         id: u32,
         total: u32,
         offset: u32,
         data: Vec<u8>,
+    },
+    /// Control connection, from the side that accepted it: open the data
+    /// link with this token. Only to peers sharing a data-link capability.
+    DataInvite {
+        token: u64,
+    },
+    /// First frame of a data link, from the side that dialed it.
+    DataHello {
+        device_id: String,
+        token: u64,
+    },
+    /// Data link: send entry `entry` of transfer `transfer` from `offset`.
+    FileRequest {
+        transfer: u32,
+        entry: u32,
+        offset: u64,
+    },
+    /// Data link: bytes of a requested entry.
+    FileChunk {
+        transfer: u32,
+        entry: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Data link, either way: the transfer stops (`reason` for people).
+    FileCancel {
+        transfer: u32,
+        reason: String,
     },
 }
 

@@ -12,11 +12,12 @@ pub struct LcCore {
     thread: CoreThread,
 }
 
-/// Version 5 adds the clipboard: `lc_core_set_clipboard`, the `clipboard`
-/// config key and the `clipboard` event.
+/// Version 6 moves clipboards to a data link and adds files:
+/// `lc_core_accept_files`, `lc_core_cancel_files`, config keys `files`,
+/// `download_directory`, `max_auto_receive_bytes` and the `files_*` events.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    5
+    6
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -257,6 +258,30 @@ pub unsafe extern "C" fn lc_core_set_clipboard(
             return false;
         };
         core.thread.send(Command::SetClipboard(clipboard)).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// Receives the transfer announced by `files_offered`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_accept_files(core: *mut LcCore, transfer: u32) -> bool {
+    send_command(core, Command::AcceptFiles(transfer))
+}
+
+/// Stops receiving a transfer (offered or under way).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_cancel_files(core: *mut LcCore, transfer: u32) -> bool {
+    send_command(core, Command::CancelFiles(transfer))
+}
+
+fn send_command(core: *mut LcCore, command: Command) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        // SAFETY: a non-null pointer came from lc_core_create.
+        let core = unsafe { &*core };
+        core.thread.send(command).is_ok()
     }))
     .unwrap_or(false)
 }

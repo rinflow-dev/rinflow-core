@@ -76,6 +76,16 @@ impl Core {
         self.thread.send(Command::SetClipboard(clipboard))
     }
 
+    /// Receives the transfer announced by `files_offered`.
+    pub fn accept_files(&self, transfer: u32) -> Result<(), String> {
+        self.thread.send(Command::AcceptFiles(transfer))
+    }
+
+    /// Stops receiving a transfer (offered or under way).
+    pub fn cancel_files(&self, transfer: u32) -> Result<(), String> {
+        self.thread.send(Command::CancelFiles(transfer))
+    }
+
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {
         self.thread.send(Command::SendInput(event))
     }
