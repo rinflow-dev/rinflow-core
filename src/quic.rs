@@ -1,10 +1,10 @@
 //! The QUIC endpoints of a core.
 //!
 //! Two UDP sockets, each its own endpoint, so the network can queue them
-//! apart (see `qos.rs`): control on the control port (the TCP port's number,
-//! over UDP), interactive; bulk on a port of the system's choosing, for data
-//! links, which a session's `DataInvite` names. Both accept connections and
-//! dial with this device's certificate (see `secure.rs`).
+//! apart (see `qos.rs`): control on the control port, interactive; bulk on a
+//! port of the system's choosing, for data links, which a session's
+//! `DataInvite` names. Both accept connections and dial with this device's
+//! certificate (see `secure.rs`).
 
 use crate::qos::{Qos, TrafficClass};
 use crate::secure::Identity;

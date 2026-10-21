@@ -17,10 +17,12 @@
  *    lc_core_accept_files, lc_core_cancel_files, config keys "files",
  *    "download_directory", "max_auto_receive_bytes", events "files_offered",
  *    "files_progress", "files_received", "files_failed".
- * 7: QUIC with TLS 1.3 and pairing: config keys "identity_path",
- *    "trusted_peers", "require_pairing"; lc_core_accept_pairing,
- *    lc_core_reject_pairing, lc_core_unpair, lc_core_set_require_pairing;
- *    events "pairing_requested", "paired", "pairing_ended", "unpaired".
+ * 7: only QUIC with TLS 1.3 (no TCP), and pairing: config keys
+ *    "identity_path", "trusted_peers", "require_pairing";
+ *    lc_core_accept_pairing, lc_core_reject_pairing, lc_core_unpair,
+ *    lc_core_set_require_pairing; events "pairing_requested", "paired",
+ *    "pairing_ended", "unpaired". Wire protocol version 4, which does not
+ *    talk to version 3: every device needs this core.
  */
 #define LC_CORE_ABI_VERSION 7
 
@@ -172,9 +174,11 @@ bool lc_core_accept_files(LcCore *core, uint32_t transfer);
 bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
 
 /*
- * Security (version 7). Peers with QUIC connect over UDP (the control port's
- * number) with TLS 1.3; both sides show a self-signed certificate, known by
- * its SHA-256 fingerprint. Older peers connect over plain TCP, unencrypted.
+ * Security (version 7). Every connection is QUIC over UDP with TLS 1.3: the
+ * control port for sessions, and a second UDP port the system picks for
+ * clipboards and files. Both sides show a self-signed certificate, known by
+ * its SHA-256 fingerprint. If the identity or the control port cannot be
+ * set up, the core reports "error" and "stopped".
  *
  * Config:
  *   "identity_path": file for this device's key and certificate (PEM),
@@ -182,7 +186,7 @@ bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
  *       this device. The fingerprint is in "started": {"fingerprint":…}.
  *   "trusted_peers": [{"peer_id":…,"fingerprint":…}], saved from "paired".
  *   "require_pairing": only paired peers may connect; unknown ones pair
- *       first, unencrypted ones are refused.
+ *       first.
  *
  * Pairing: both devices show the same six digits; each user compares them.
  *   {"event":"pairing_requested","peer_id":…,"name":…,"platform":…,
@@ -191,9 +195,10 @@ bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
  *   {"event":"paired","peer_id":…,"fingerprint":…}   save it
  *   {"event":"pairing_ended","peer_id":…,"reason":…}  declined, timed out
  *       or the connection ended: close the dialog
+ * The side that was declined reports "pairing declined on the other device".
  * A paired peer whose certificate changed is refused ("disconnected" with
  * the reason "the device's identity changed").
- * "connected" carries "encrypted", "paired" and the peer's "fingerprint".
+ * "connected" carries "paired" and the peer's "fingerprint".
  */
 bool lc_core_accept_pairing(LcCore *core, const char *peer_id);
 bool lc_core_reject_pairing(LcCore *core, const char *peer_id);

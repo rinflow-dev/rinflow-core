@@ -6,41 +6,37 @@
 
 ---
 
-## 0. 传输：控制连接 + 数据连接（已实现，ABI 6）
+## 0. 传输：控制连接 + 数据连接（已实现，ABI 6；ABI 7 起只走 QUIC）
 
-每对设备之间有**两条 TCP 连接**，用同一个端口：
+每对设备之间有**两条 QUIC 连接**（TLS 1.3 加密），各走一个 UDP 端口：
 
-| 连接 | 承载 | 要求 |
-| --- | --- | --- |
-| 控制连接（原有） | `Hello`、`Ping/Pong`、`InputBatch`、`InputReset`、`ScreenInfo`、`Placement`、`DataInvite` | 低延迟，只放小消息 |
-| 数据连接（新增） | `ClipboardChunk`、`FileRequest`、`FileChunk`、`FileCancel` | 大块数据，绝不挡在输入前面 |
+| 连接 | 端口 | 承载 | 要求 |
+| --- | --- | --- | --- |
+| 控制连接 | 控制端口（UDP 42421） | `Hello`、`Ping/Pong`、`InputBatch`、`InputReset`、`ScreenInfo`、`Placement`、`DataInvite`、配对消息 | 低延迟，只放小消息 |
+| 数据连接 | 系统分配的另一个 UDP 端口（“批量端点”） | `ClipboardChunk`、`FileRequest`、`FileChunk`、`FileCancel` | 大块数据，绝不挡在输入前面 |
 
-**为什么不能共用一条连接**：程序里给输入排优先级，只决定谁先交给操作系统。写入在系统发送缓冲区收下数据时就返回，而系统会把这个缓冲区自动调到几 MB；大数据会一直灌进去，之后的鼠标事件只能排在这几 MB 后面（TCP 严格按顺序送达）。在 20–50 Mbps 的 Wi-Fi 上就是 0.6–1.6 秒的卡顿，而且贯穿整个文件传输。所以按流量性质分成两条连接，并且**每条连接的系统发送缓冲都限制在 128 KiB**（局域网带宽仍然跑得满）。
+**为什么不能共用一条连接**：一条连接里的数据严格按顺序送达，大数据先进了发送队列，之后的鼠标事件就只能排在后面。在 20–50 Mbps 的 Wi-Fi 上就是 0.6–1.6 秒的卡顿，而且贯穿整个文件传输（ABI 6 用 TCP 时实测过）。所以按流量性质分成两条连接。两条连接各用一个 UDP 套接字而不是同一条连接里的两个流，是因为系统的网络优先级只能按套接字设置（见下）。
 
 **建立过程**（外壳不用关心）：
 
-1. 控制连接握手完成后，**接受连接的一方**生成随机令牌，在控制连接上发 `DataInvite { token }`。只发给与本机共享 `CAPABILITY_CLIPBOARD` 或 `CAPABILITY_FILES` 的对端。
-2. **发起连接的一方**向同一地址、同一端口再连一次，第一帧发 `DataHello { device_id, token }`。
-3. 接受方按第一帧认出这是数据连接，用令牌把它挂到对应的会话上；令牌不对就关闭。所以局域网里别的设备连不上来。
+1. 控制连接握手完成后，**接受连接的一方**生成随机令牌，在控制连接上发 `DataInvite { token, port }`，`port` 是它的批量端点。只发给与本机共享 `CAPABILITY_CLIPBOARD` 或 `CAPABILITY_FILES` 的对端。
+2. **发起连接的一方**向对方同一 IP 的这个端口建立 QUIC 连接，第一帧发 `DataHello { device_id, token }`。
+3. 接受方只在批量端点上接受 `DataHello`，用令牌把它挂到对应的会话上，并核对两条连接的证书指纹相同；令牌或证书不对就关闭。所以局域网里别的设备连不上来。
 4. 控制连接断开时数据连接一起关闭；数据连接单独断开时，接受方每 5 秒重新邀请一次。
-
-**QUIC（ABI 7 起）**：双方都支持 `CAPABILITY_QUIC` 时，两条连接都是 TLS 1.3 加密的 QUIC 连接，各走一个 UDP 套接字，好让系统按套接字分别打优先级：控制连接用控制端口（42421），数据连接用系统分配的另一个端口，由 `DataInvite { token, port }` 告诉对方。发起方向这个端口建立数据连接；接受方另外核对两条连接的证书指纹相同，令牌之外再多一道保险。旧版对端仍走上面的 TCP 做法（`DataInvite` 不带 `port`）。
 
 数据连接上的发送顺序：小消息（`FileRequest`/`FileCancel`）→ 剪贴板 → 文件。文件按网络实际发送的速度读取（队列只有 4 块），不会一次读进内存。
 
-**网络优先级**（`src/qos.rs`，外壳不用做任何事）：两条连接分开以后，在 Wi-Fi 上还会在网卡和路由器的队列里互相挤。所以核心库给每条连接标上流量类型：控制连接是"交互"，数据连接是"批量"。Wi-Fi（WMM）按这个类型分别排队，优先发送交互流量，批量流量让路。
+**网络优先级**（`src/qos.rs`，外壳不用做任何事）：两条连接分开以后，在 Wi-Fi 上还会在网卡和路由器的队列里互相挤。所以核心库给两个 UDP 套接字标上流量类型：控制端点是"交互"，批量端点是"批量"。Wi-Fi（WMM）按这个类型分别排队，优先发送交互流量，批量流量让路。
 
-| 平台 | 控制连接（交互） | 数据连接（批量） |
+| 平台 | 控制端点（交互） | 批量端点（批量） |
 | --- | --- | --- |
-| macOS / iOS | `SO_NET_SERVICE_TYPE = NET_SERVICE_TYPE_VO` | `NET_SERVICE_TYPE_BK`（系统还会给它用让路的拥塞控制） |
+| macOS / iOS | `SO_NET_SERVICE_TYPE = NET_SERVICE_TYPE_VO` | `NET_SERVICE_TYPE_BK` |
 | Windows | qWAVE `QOSAddSocketToFlow`，`QOSTrafficTypeVoice` | `QOSTrafficTypeBackground` |
 | Linux / Android | `IP_TOS` = DSCP EF(46)，`SO_PRIORITY` 6 | DSCP CS1(8)，`SO_PRIORITY` 1 |
 
-- 被接受的连接先当控制连接标记，收到 `DataHello` 后改标为批量。
-- 标记失败（例如 Windows 不给 127.0.0.1 上的连接设优先级，报 1168）只在 stderr 打一行 `linkcursor-core: no network priority for a connection: …`，连接照常工作。
-- QUIC：macOS 和 Linux 在套接字上设一次就覆盖所有对端。Windows 的 qWAVE 对未连接的 UDP 套接字要按目标地址加入流，所以每认识一个对端就加一次（`Qos::add_destination`，必须带 `QOS_NON_ADAPTIVE_FLOW`，否则报 50）。连接本机自己的 IP 时同样报 1168（`… for a QUIC peer: …`），可以忽略。
-- 优先级只管**发送方**：Mac 发给 Windows 的输入，要由 Mac 那边的核心库标记。**两端都要用新版核心库**才完整生效。路由器转发时是否照顾这个标记，取决于它是否开启 WMM（一般默认开启）。
-
+- macOS 和 Linux 在套接字上设一次就覆盖所有对端。Windows 的 qWAVE 对未连接的 UDP 套接字要按目标地址加入流，所以每认识一个对端就加一次（`Qos::add_destination`，必须带 `QOS_NON_ADAPTIVE_FLOW`，否则报 50）。
+- 标记失败（例如 Windows 不给本机自己的地址设优先级，报 1168）只在 stderr 打一行 `linkcursor-core: no network priority for a peer: …`，连接照常工作。
+- 优先级只管**发送方**：Mac 发给 Windows 的输入，要由 Mac 那边的核心库标记。路由器转发时是否照顾这个标记，取决于它是否开启 WMM（一般默认开启）。
 **写盘不占核心线程**：接收文件时，收到的数据块交给单独的 `linkcursor-files` 线程按顺序写入。之前写盘和输入处理在同一个线程里，大文件收尾时（刷盘、改名、杀毒软件扫描）会卡住输入。在本机用 300 MB 文件实测，传输期间鼠标事件最长间隔从 349 ms 降到 10–53 ms。写入出错或被取消时，等 `.partial` 文件删除后才发 `files_failed`。
 
 能力位：`CAPABILITY_CLIPBOARD = 1 << 7`，`CAPABILITY_FILES = 1 << 6`。**第 5 位作废**：它曾表示"剪贴板走控制连接"（`512cb34`），新旧两种实现互相不发剪贴板，也就不会因为未知消息互相断开。
@@ -293,7 +289,7 @@ macOS app 没有开沙盒（需要辅助功能权限），核心库可以直接�
 | 点 | 无界鼠标 | 我们 |
 | --- | --- | --- |
 | 小内容即时推送，大内容先通知再拉 | ✓ | 剪贴板目前在交接时整体推送（≤8 MiB）；大内容的"先通知再拉"放进第 2 部分第 3 条和文件传输 |
-| 大数据另走通道 | 另开一条 TCP 连接，另一个端口 15101 | 另开数据连接，但用同一个端口（第一帧区分，令牌绑定会话），不用多开防火墙端口；发送缓冲压到 128 KiB |
+| 大数据另走通道 | 另开一条 TCP 连接，另一个端口 15101 | 另开一条 QUIC 数据连接，走另一个 UDP 端口（由 `DataInvite` 告知，令牌和证书绑定会话），两个端口分别设网络优先级 |
 | 防回声 | 1 秒时间间隔（内容去重有 bug） | 每个对端的内容摘要 ✓ |
 | 文件落地 | `.partial` + 原子改名 + 长度核对 ✓ | 照做 |
 | 文件名 | 只取文件名 | 支持文件夹，所以要完整清洗相对路径 |

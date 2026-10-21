@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-/// Version 3 adds display descriptions and synchronised placements.
-pub const PROTOCOL_MIN_VERSION: u16 = 3;
-pub const PROTOCOL_MAX_VERSION: u16 = 3;
+/// Version 3 added display descriptions and synchronised placements.
+/// Version 4 runs only over QUIC with TLS 1.3 (no more plain TCP), pairs
+/// devices (`PairRequest` / `PairAccept`), and `DataInvite` names the port
+/// of the data link. It does not talk to version 3.
+pub const PROTOCOL_MIN_VERSION: u16 = 4;
+pub const PROTOCOL_MAX_VERSION: u16 = 4;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 42_420;
 pub const DEFAULT_CONTROL_PORT: u16 = 42_421;
 pub const DISCOVERY_GROUP: [u8; 4] = [239, 255, 42, 99];
@@ -30,18 +33,13 @@ pub const DATA_LINK_CAPABILITIES: u64 = CAPABILITY_CLIPBOARD | CAPABILITY_FILES;
 /// Gives control back when told to (`ControlRevoke`). Sent only to peers
 /// with this bit, for the same reason as the data-link messages.
 pub const CAPABILITY_CONTROL_REVOKE: u64 = 1 << 8;
-/// Takes connections over QUIC with TLS 1.3 on the control port (UDP), and
-/// pairs (`PairRequest`/`PairAccept`/`PairReject`). Peers without it are
-/// reached over plain TCP, unencrypted (see `transport.rs`).
-pub const CAPABILITY_QUIC: u64 = 1 << 9;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
     | CAPABILITY_HID_KEYBOARD
-    | CAPABILITY_CONTROL_REVOKE
-    | CAPABILITY_QUIC;
+    | CAPABILITY_CONTROL_REVOKE;
 
 pub const LC_INPUT_MOUSE_MOVE: u32 = 1;
 pub const LC_INPUT_MOUSE_BUTTON_DOWN: u32 = 2;
@@ -116,8 +114,7 @@ pub struct CoreConfig {
     pub identity_path: Option<String>,
     /// Peers the user paired, saved by the shell from `paired` events.
     pub trusted_peers: Vec<TrustedPeer>,
-    /// Only paired peers may connect: others are asked to pair first, and
-    /// peers without QUIC (unencrypted) are refused.
+    /// Only paired peers may connect: others are asked to pair first.
     pub require_pairing: bool,
 }
 
@@ -228,21 +225,18 @@ pub struct Announcement {
     /// Lets devices that have not connected yet draw this one to scale.
     #[serde(default)]
     pub displays: Vec<Display>,
-    /// SHA-256 of this device's certificate, with `CAPABILITY_QUIC`. Only a
-    /// hint (anyone can announce anything): connections check the
-    /// certificate itself.
+    /// SHA-256 of this device's certificate. Only a hint (anyone can
+    /// announce anything): connections check the certificate itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
 
 impl Announcement {
-    /// `capabilities` as this device offers them (without QUIC if its
-    /// endpoints could not be opened).
     pub fn from_config(
         config: &CoreConfig,
         displays: &[Display],
         capabilities: u64,
-        fingerprint: Option<&str>,
+        fingerprint: &str,
     ) -> Self {
         Self {
             product: "linkcursor".to_owned(),
@@ -254,7 +248,7 @@ impl Announcement {
             platform: config.platform.clone(),
             control_port: config.control_port,
             displays: displays.to_vec(),
-            fingerprint: fingerprint.map(str::to_owned),
+            fingerprint: Some(fingerprint.to_owned()),
         }
     }
 
@@ -285,7 +279,7 @@ pub struct Peer {
     pub capabilities: u64,
     /// As last described by the peer, in its own logical space.
     pub displays: Vec<Display>,
-    /// The certificate fingerprint it announces (QUIC peers), unverified.
+    /// The certificate fingerprint it announces, unverified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(skip)]
@@ -434,12 +428,11 @@ pub enum WireMessage {
         data: Vec<u8>,
     },
     /// Control connection, from the side that accepted it: open the data
-    /// link with this token. Only to peers sharing a data-link capability.
-    /// Over QUIC, `port` is the inviting side's bulk endpoint (UDP); over
-    /// TCP the data link goes to the control port.
+    /// link to `port` (the inviting side's bulk endpoint, UDP) with this
+    /// token. Only to peers sharing a data-link capability.
     DataInvite {
         token: u64,
-        port: Option<u16>,
+        port: u16,
     },
     /// First frame of a data link, from the side that dialed it.
     DataHello {
@@ -470,15 +463,14 @@ pub enum WireMessage {
     ControlRevoke {
         handoff: bool,
     },
-    /// QUIC only, after `Hello`: the sender does not know the receiver's
-    /// certificate and asks to pair. Both users compare the code their
-    /// devices show and accept.
+    /// After `Hello`: the sender does not know the receiver's certificate
+    /// and asks to pair. Both users compare the code their devices show and
+    /// accept.
     PairRequest,
     /// The sender's user accepted pairing (or the sender already trusts the
-    /// receiver). Paired once both sides have sent it.
+    /// receiver). Paired once both sides have sent it. A user who declines
+    /// closes the connection with `CloseCode::PairingDeclined` instead.
     PairAccept,
-    /// The sender's user declined; the connection closes.
-    PairReject,
 }
 
 impl WireMessage {

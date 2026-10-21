@@ -1,7 +1,10 @@
+//! Connections to peers: QUIC with TLS 1.3 (see `quic.rs` and `secure.rs`).
+//! Each connection carries one bidirectional stream of length-prefixed
+//! frames (see `protocol.rs`), opened by the side that dialed.
+
 use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
-use crate::qos::{Qos, TrafficClass};
 use crate::remap::ShortcutRemap;
 use crate::secure;
 use std::collections::VecDeque;
@@ -10,7 +13,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -22,8 +24,8 @@ pub const PEER_CLOSED: &str = "peer closed the connection";
 /// `disconnected` reason when the peer's user declined pairing.
 pub const PAIRING_DECLINED_BY_PEER: &str = "pairing declined on the other device";
 
-/// Why this side closes a QUIC connection, sent as the application error
-/// code of its CONNECTION_CLOSE frame. A message queued just before closing
+/// Why this side closes a connection, sent as the application error code of
+/// its QUIC CONNECTION_CLOSE frame. A message queued just before closing
 /// would be dropped with the connection; the close frame always arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseCode {
@@ -43,31 +45,26 @@ impl CloseCode {
     }
 }
 
-/// How long dialing (TCP connect, or the QUIC handshake) may take.
+/// How long dialing (the QUIC handshake) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// What a connection runs over.
-pub enum Link {
-    /// Plain TCP: devices whose core predates QUIC. Neither encrypted nor
-    /// authenticated.
-    Tcp(TcpStream),
-    /// The one bidirectional stream of a QUIC connection, encrypted with
-    /// TLS 1.3; the peer's certificate is known.
-    Quic(QuicStream),
-}
-
-pub struct QuicStream {
+/// A QUIC connection and its one bidirectional stream, encrypted with
+/// TLS 1.3; the peer's certificate is known.
+pub struct Link {
     pub connection: quinn::Connection,
     pub send: quinn::SendStream,
     pub recv: quinn::RecvStream,
 }
 
 impl Link {
-    pub fn remote(&self) -> Option<SocketAddr> {
-        match self {
-            Link::Tcp(stream) => stream.peer_addr().ok(),
-            Link::Quic(stream) => Some(stream.connection.remote_address()),
-        }
+    pub fn remote(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Link({})", self.remote())
     }
 }
 
@@ -91,8 +88,8 @@ pub enum ConnectionEvent {
         token: u64,
         result: Result<Link, String>,
     },
-    /// A QUIC connection that came in and opened its stream; `bulk` when it
-    /// came to the bulk endpoint (a data link).
+    /// A connection that came in and opened its stream; `bulk` when it came
+    /// to the bulk endpoint (a data link).
     Accepted {
         link: Link,
         bulk: bool,
@@ -105,56 +102,26 @@ pub enum ConnectionEvent {
     },
 }
 
-impl std::fmt::Debug for Link {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Link::Tcp(stream) => write!(formatter, "Tcp({:?})", stream.peer_addr().ok()),
-            Link::Quic(stream) => write!(formatter, "Quic({})", stream.connection.remote_address()),
-        }
-    }
-}
-
-/// Bytes the system may hold for a connection before a write waits. Small on
-/// purpose: what sits in the socket buffer is sent in order whatever this
-/// side's priorities are, so a few megabytes of file data there would hold
-/// input up for a second on Wi-Fi. 128 KiB still fills a LAN.
-const SEND_BUFFER_SIZE: usize = 128 * 1024;
-
 pub struct ActiveConnection {
     pub peer_id: Option<String>,
-    /// Where the connection goes; a data link is dialed to the same place.
-    pub remote: Option<SocketAddr>,
+    /// Where the connection goes; a data link is dialed to the same address.
+    pub remote: SocketAddr,
     pub protocol_version: Option<u16>,
     pub capabilities: u64,
     /// Applied to input received from this peer; set once its platform is known.
     pub shortcut_remap: ShortcutRemap,
-    /// SHA-256 of the certificate the peer presented; `None` over plain TCP,
-    /// which is neither encrypted nor authenticated.
-    pub fingerprint: Option<String>,
+    /// SHA-256 of the certificate the peer presented (64 hex digits).
+    pub fingerprint: String,
     control: mpsc::Sender<WireMessage>,
     input: OutboundInputQueue,
     bulk: BulkQueue,
     files: mpsc::Sender<WireMessage>,
-    qos: Option<Qos>,
-    quic: Option<quinn::Connection>,
+    connection: quinn::Connection,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
 
 impl ActiveConnection {
-    /// What the connection carries, for the network's queues (see `qos.rs`).
-    /// An accepted TCP connection turns out to be a data link only once its
-    /// `DataHello` arrives. QUIC connections have their endpoint's class.
-    pub fn set_traffic_class(&self, class: TrafficClass) {
-        if let Some(qos) = &self.qos {
-            qos.set(class);
-        }
-    }
-
-    pub fn is_quic(&self) -> bool {
-        self.quic.is_some()
-    }
-
     pub fn send_control(&self, message: WireMessage) -> Result<(), &'static str> {
         self.control
             .try_send(message)
@@ -186,13 +153,10 @@ impl ActiveConnection {
         self.files.clone()
     }
 
-    /// Closes a QUIC connection now, telling the peer why. The connection
-    /// is still to be aborted; its close then changes nothing. No effect
-    /// over TCP, whose peer only sees the connection end.
+    /// Closes the connection now, telling the peer why. The connection is
+    /// still to be aborted; its close then changes nothing.
     pub fn close_with(&self, code: CloseCode) {
-        if let Some(connection) = &self.quic {
-            connection.close((code as u32).into(), b"");
-        }
+        self.connection.close((code as u32).into(), b"");
     }
 
     pub fn abort(self) {
@@ -232,13 +196,17 @@ impl BulkQueue {
     }
 }
 
+/// Starts reading and writing `link`; `hello` is the first frame sent.
 pub fn spawn_connection(
     connection_id: u64,
     link: Link,
     hello: WireMessage,
     events: mpsc::UnboundedSender<ConnectionEvent>,
-    class: TrafficClass,
-) -> io::Result<ActiveConnection> {
+) -> Result<ActiveConnection, String> {
+    // Both sides must show a certificate (see `secure.rs`), so this only
+    // fails if the handshake somehow let one through without.
+    let fingerprint =
+        secure::peer_fingerprint(&link.connection).ok_or("the peer showed no certificate")?;
     let remote = link.remote();
     let (control_tx, control_rx) = mpsc::channel(64);
     let input = OutboundInputQueue::new();
@@ -250,37 +218,8 @@ pub fn spawn_connection(
         bulk: bulk.clone(),
         files: files_rx,
     };
-
-    let (qos, quic, fingerprint, read_task, write_task) = match link {
-        Link::Tcp(stream) => {
-            stream.set_nodelay(true)?;
-            socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER_SIZE)?;
-            let qos = Qos::new(&stream);
-            qos.set(class);
-            let (reader, writer) = stream.into_split();
-            let (read_task, write_task) =
-                spawn_loops(connection_id, reader, writer, queues, hello, events);
-            (Some(qos), None, None, read_task, write_task)
-        }
-        Link::Quic(stream) => {
-            let fingerprint = secure::peer_fingerprint(&stream.connection);
-            let (read_task, write_task) = spawn_loops(
-                connection_id,
-                stream.recv,
-                stream.send,
-                queues,
-                hello,
-                events,
-            );
-            (
-                None,
-                Some(stream.connection),
-                fingerprint,
-                read_task,
-                write_task,
-            )
-        }
-    };
+    let (read_task, write_task) =
+        spawn_loops(connection_id, link.recv, link.send, queues, hello, events);
 
     Ok(ActiveConnection {
         peer_id: None,
@@ -293,8 +232,7 @@ pub fn spawn_connection(
         input,
         bulk,
         files: files_tx,
-        qos,
-        quic,
+        connection: link.connection,
         read_task,
         write_task,
     })
@@ -350,8 +288,8 @@ where
     (read_task, write_task)
 }
 
-/// The peer closed its QUIC connection (as `ActiveConnection::abort` does):
-/// the `disconnected` reason for the code it closed with.
+/// The peer closed the connection (as `ActiveConnection::abort` does): the
+/// `disconnected` reason for the code it closed with.
 fn closed_by_peer(error: &io::Error) -> Option<&'static str> {
     let inner = error.get_ref()?;
     let lost = inner
@@ -472,41 +410,32 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-/// Dials `address`: QUIC through `endpoint` when given, else plain TCP.
-async fn dial(endpoint: Option<quinn::Endpoint>, address: SocketAddr) -> Result<Link, String> {
-    match endpoint {
-        Some(endpoint) => {
-            let connecting = endpoint
-                .connect(address, secure::SERVER_NAME)
-                .map_err(|error| error.to_string())?;
-            let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-                .await
-                .map_err(|_| "connection timed out".to_owned())?
-                .map_err(|error| error.to_string())?;
-            // The stream reaches the peer with its first frame (our hello).
-            let (send, recv) = connection
-                .open_bi()
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Link::Quic(QuicStream {
-                connection,
-                send,
-                recv,
-            }))
-        }
-        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-            .await
-            .map_err(|_| "connection timed out".to_owned())
-            .and_then(|result| result.map_err(|error| error.to_string()))
-            .map(Link::Tcp),
-    }
+/// Dials `address` through `endpoint` and opens the connection's stream.
+async fn dial(endpoint: quinn::Endpoint, address: SocketAddr) -> Result<Link, String> {
+    let connecting = endpoint
+        .connect(address, secure::SERVER_NAME)
+        .map_err(|error| error.to_string())?;
+    let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| "connection timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    // The stream reaches the peer with its first frame (our hello).
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Link {
+        connection,
+        send,
+        recv,
+    })
 }
 
 /// Dials the data link for session `session` (see `DataInvite`).
 pub fn connect_data_in_background(
     session: u64,
     token: u64,
-    endpoint: Option<quinn::Endpoint>,
+    endpoint: quinn::Endpoint,
     address: SocketAddr,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) {
@@ -522,7 +451,7 @@ pub fn connect_data_in_background(
 
 pub fn connect_in_background(
     peer_id: String,
-    endpoint: Option<quinn::Endpoint>,
+    endpoint: quinn::Endpoint,
     address: SocketAddr,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) {
@@ -532,7 +461,7 @@ pub fn connect_in_background(
     });
 }
 
-/// Completes a QUIC connection that arrived at an endpoint and waits for the
+/// Completes a connection that arrived at an endpoint and waits for the
 /// stream its dialer opens, then hands both to the runtime.
 pub fn accept_in_background(
     incoming: quinn::Incoming,
@@ -543,11 +472,11 @@ pub fn accept_in_background(
         let accepted = async {
             let connection = incoming.await.ok()?;
             let (send, recv) = connection.accept_bi().await.ok()?;
-            Some(Link::Quic(QuicStream {
+            Some(Link {
                 connection,
                 send,
                 recv,
-            }))
+            })
         };
         if let Ok(Some(link)) = tokio::time::timeout(CONNECT_TIMEOUT * 2, accepted).await {
             let _ = events.send(ConnectionEvent::Accepted { link, bulk });

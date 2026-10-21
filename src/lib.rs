@@ -44,7 +44,6 @@ mod tests {
         OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
     };
     use super::layout::{Display, Offset, Side};
-    use super::model::{self, PlacementRecord, TrustedPeer};
     use super::model::{
         Announcement, CAPABILITY_CONTROL_REVOKE, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION,
         LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP,
@@ -52,12 +51,13 @@ mod tests {
         LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES, LcInputEvent,
         PROTOCOL_MAX_VERSION, WireMessage,
     };
+    use super::model::{PlacementRecord, TrustedPeer};
     use super::protocol::{decode_message, encode_message};
     use super::remap::ShortcutRemap;
     use super::runtime::trust as runtime_reason;
     use super::runtime::{Command, CoreThread, EventSink};
     use serde_json::Value;
-    use std::net::{TcpListener, UdpSocket};
+    use std::net::UdpSocket;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver};
     use std::time::{Duration, Instant};
@@ -259,15 +259,10 @@ mod tests {
         for message in [
             WireMessage::DataInvite {
                 token: 42,
-                port: None,
-            },
-            WireMessage::DataInvite {
-                token: 42,
-                port: Some(50_123),
+                port: 50_123,
             },
             WireMessage::PairRequest,
             WireMessage::PairAccept,
-            WireMessage::PairReject,
             WireMessage::DataHello {
                 device_id: "dev".into(),
                 token: 7,
@@ -311,17 +306,41 @@ mod tests {
             device_id: "one".to_owned(),
             ..CoreConfig::default()
         };
+        let fingerprint = "ab".repeat(32);
         let mut announcement =
-            Announcement::from_config(&config, &[], config.advertised_capabilities(), None);
+            Announcement::from_config(&config, &[], config.advertised_capabilities(), &fingerprint);
         assert!(announcement.is_compatible());
         assert_eq!(
             announcement.negotiated_version(),
             Some(PROTOCOL_MAX_VERSION)
         );
         assert_eq!(announcement.platform, "unknown");
+        assert_eq!(
+            announcement.fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
         announcement.min_protocol_version = PROTOCOL_MAX_VERSION + 1;
         announcement.max_protocol_version = PROTOCOL_MAX_VERSION + 1;
         assert!(!announcement.is_compatible());
+        // Version 3 ran over plain TCP; this core speaks only QUIC.
+        announcement.min_protocol_version = 3;
+        announcement.max_protocol_version = 3;
+        assert!(!announcement.is_compatible());
+    }
+
+    #[test]
+    fn data_invites_need_a_port() {
+        let bytes = encode_message(&WireMessage::DataInvite {
+            token: 1,
+            port: 42_500,
+        })
+        .unwrap();
+        // Without the port (as protocol 3 sent it), or with port 0.
+        assert!(decode_message(&bytes[..bytes.len() - 2]).is_err());
+        let mut zero = bytes.clone();
+        let length = zero.len();
+        zero[length - 2..].fill(0);
+        assert!(decode_message(&zero).is_err());
     }
 
     #[test]
@@ -646,8 +665,8 @@ mod tests {
     fn two_cores_discover_connect_and_exchange_input() {
         let _network = network_test();
         let discovery_port = free_udp_port();
-        let first_port = free_tcp_port();
-        let second_port = free_tcp_port();
+        let first_port = free_udp_port();
+        let second_port = free_udp_port();
 
         let (first_events_tx, first_events_rx) = mpsc::channel();
         let (second_events_tx, second_events_rx) = mpsc::channel();
@@ -795,7 +814,7 @@ mod tests {
         let mut first = CoreThread::spawn(
             CoreConfig {
                 device_id: "latency-first".to_owned(),
-                control_port: free_tcp_port(),
+                control_port: free_udp_port(),
                 discovery_port,
                 ..CoreConfig::default()
             },
@@ -810,7 +829,7 @@ mod tests {
         let mut second = CoreThread::spawn(
             CoreConfig {
                 device_id: "latency-second".to_owned(),
-                control_port: free_tcp_port(),
+                control_port: free_udp_port(),
                 discovery_port,
                 ..CoreConfig::default()
             },
@@ -886,7 +905,7 @@ mod tests {
     ) -> TestCore {
         let (events_tx, events) = mpsc::channel();
         let (input_tx, input) = mpsc::channel();
-        let port = free_tcp_port();
+        let port = free_udp_port();
         let mut config = CoreConfig {
             device_id: device_id.to_owned(),
             control_port: port,
@@ -1032,7 +1051,7 @@ mod tests {
         wait_connected(&b, "stranger-a");
 
         // Something on the network connects to B and never says hello.
-        let _stranger = std::net::TcpStream::connect(("127.0.0.1", b.port)).expect("connect to B");
+        let _stranger = QuicStranger::connect(b.port);
         std::thread::sleep(Duration::from_millis(200));
 
         a.thread.send(Command::SendInput(motion(5.0))).unwrap();
@@ -1042,6 +1061,41 @@ mod tests {
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();
+    }
+
+    /// A device that completes the QUIC handshake with a certificate of its
+    /// own and opens a stream, then sends half a frame and nothing more.
+    struct QuicStranger {
+        _endpoints: crate::quic::QuicEndpoints,
+        _connection: quinn::Connection,
+        _send: quinn::SendStream,
+        // Last: the endpoints need it while they are dropped.
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl QuicStranger {
+        fn connect(port: u16) -> Self {
+            let runtime = tokio::runtime::Runtime::new().expect("stranger runtime");
+            let (endpoints, connection, send) = runtime.block_on(async {
+                let identity = crate::secure::Identity::load_or_create(None, "stranger").unwrap();
+                let endpoints = crate::quic::QuicEndpoints::bind(0, &identity).unwrap();
+                let connection = endpoints
+                    .control
+                    .connect(([127, 0, 0, 1], port).into(), crate::secure::SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .expect("connect to the core");
+                let (mut send, _recv) = connection.open_bi().await.unwrap();
+                send.write_all(&[0, 0]).await.unwrap();
+                (endpoints, connection, send)
+            });
+            Self {
+                _endpoints: endpoints,
+                _connection: connection,
+                _send: send,
+                _runtime: runtime,
+            }
+        }
     }
 
     #[test]
@@ -1221,7 +1275,6 @@ mod tests {
         a.thread.send(Command::Connect("quic-b".into())).unwrap();
 
         let on_a = wait_connected_event(&a, "quic-b");
-        assert_eq!(on_a["encrypted"], true);
         assert_eq!(on_a["paired"], false);
         assert_eq!(on_a["fingerprint"], b_fingerprint.as_str());
         let on_b = wait_connected_event(&b, "quic-a");
@@ -1341,13 +1394,13 @@ mod tests {
         assert_eq!(ended["peer_id"], "decline-b");
         // The side that was declined is told so, not just that the
         // connection closed.
-        assert_eq!(ended["reason"], runtime_reason::PAIRING_REJECTED_BY_PEER);
+        assert_eq!(ended["reason"], crate::transport::PAIRING_DECLINED_BY_PEER);
         let disconnected = wait_for_event(&a.events, Duration::from_secs(4), |event| {
             event["event"] == "disconnected" && event["peer_id"] == "decline-b"
         });
         assert_eq!(
             disconnected["reason"],
-            runtime_reason::PAIRING_REJECTED_BY_PEER
+            crate::transport::PAIRING_DECLINED_BY_PEER
         );
         assert!(events_named(&a, "paired").is_empty());
 
@@ -1425,29 +1478,25 @@ mod tests {
     }
 
     #[test]
-    fn older_peers_connect_over_tcp_unless_pairing_is_required() {
+    fn requiring_pairing_ends_sessions_with_unpaired_peers() {
         let _network = network_test();
         let discovery_port = free_udp_port();
-        let older = |config: &mut CoreConfig| config.capabilities &= !model::CAPABILITY_QUIC;
-        let mut a = test_core("legacy-a", discovery_port);
-        let mut b = test_core_with("legacy-b", discovery_port, older);
-        wait_for_peers(&a, &["legacy-b"]);
-        a.thread.send(Command::Connect("legacy-b".into())).unwrap();
-        let connected = wait_connected_event(&a, "legacy-b");
-        assert_eq!(connected["encrypted"], false);
-        a.thread.send(Command::SendInput(motion(3.0))).unwrap();
-        assert_eq!(received(&b, Duration::from_millis(400)), vec![3.0]);
+        let mut a = test_core("strict-a", discovery_port);
+        let mut b = test_core("strict-b", discovery_port);
+        wait_for_peers(&a, &["strict-b"]);
+        a.thread.send(Command::Connect("strict-b".into())).unwrap();
+        wait_connected(&a, "strict-b");
 
-        // Requiring pairing ends the unencrypted session and refuses new ones.
         a.thread.send(Command::SetRequirePairing(true)).unwrap();
-        wait_for_event(&a.events, Duration::from_secs(3), |event| {
-            event["event"] == "disconnected" && event["peer_id"] == "legacy-b"
+        let ended = wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "strict-b"
         });
-        a.thread.send(Command::Connect("legacy-b".into())).unwrap();
-        let refused = wait_for_event(&a.events, Duration::from_secs(3), |event| {
-            event["event"] == "disconnected" && event["peer_id"] == "legacy-b"
+        assert_eq!(ended["reason"], runtime_reason::PAIRING_REQUIRED);
+        // Connecting again asks to pair.
+        a.thread.send(Command::Connect("strict-b".into())).unwrap();
+        wait_for_event(&a.events, Duration::from_secs(6), |event| {
+            event["event"] == "pairing_requested" && event["peer_id"] == "strict-b"
         });
-        assert_eq!(refused["reason"], runtime_reason::UNENCRYPTED_REFUSED);
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();
@@ -2123,14 +2172,6 @@ mod tests {
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();
-    }
-
-    fn free_tcp_port() -> u16 {
-        TcpListener::bind(("127.0.0.1", 0))
-            .expect("bind temporary TCP port")
-            .local_addr()
-            .expect("temporary TCP address")
-            .port()
     }
 
     fn free_udp_port() -> u16 {

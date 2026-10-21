@@ -4,17 +4,15 @@
 //! connection, so bulk data never waits in front of input in one stream,
 //! and the network can queue it apart (see `qos.rs`). The side that
 //! accepted the session sends `DataInvite { token, port }`; the side that
-//! dialed it connects again and opens with `DataHello { device_id, token }`,
-//! which binds the new connection to the session. Over QUIC the data link
-//! goes to the inviting side's bulk endpoint (`port`) and must show the same
-//! certificate as the session; over TCP it goes to the control port. When
-//! the data link drops, the accepting side invites again from `maintenance`.
+//! dialed it connects to the inviting side's bulk endpoint (`port`) and opens
+//! with `DataHello { device_id, token }`, which binds the new connection to
+//! the session. It must show the same certificate as the session. When the
+//! data link drops, the accepting side invites again from `maintenance`.
 
 use super::{Runtime, random_u64};
 use crate::clipboard::{self, Clipboard, ClipboardFormat};
 use crate::files::{self, FILE_CHUNK_SIZE, FileWriter, MIME_FILES, MIME_URI_LIST, Manifest, Offer};
 use crate::model::{CAPABILITY_CLIPBOARD, DATA_LINK_CAPABILITIES, WireMessage};
-use crate::qos::TrafficClass;
 use crate::transport::{
     ActiveConnection, ConnectionEvent, Link, connect_data_in_background, spawn_connection,
 };
@@ -174,11 +172,7 @@ impl Runtime<'_> {
         {
             return;
         }
-        // Over QUIC, to the bulk endpoint; an older peer gets no port.
-        let port = match &self.quic {
-            Some(quic) if session.connection.is_quic() => Some(quic.bulk_port),
-            _ => None,
-        };
+        let port = self.quic.bulk_port;
         let token = random_u64();
         let session = self.sessions.get_mut(&id).expect("checked above");
         session.data_token = Some(token);
@@ -209,7 +203,7 @@ impl Runtime<'_> {
     }
 
     /// `DataInvite` on the control connection of session `id`: dial back.
-    pub(super) fn data_invited(&mut self, id: u64, token: u64, port: Option<u16>) {
+    pub(super) fn data_invited(&mut self, id: u64, token: u64, port: u16) {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -219,21 +213,16 @@ impl Runtime<'_> {
         {
             return;
         }
-        let Some(remote) = session.connection.remote else {
-            return;
-        };
-        // An encrypted session keeps its data encrypted too: QUIC to the
-        // peer's bulk endpoint, never plain TCP.
-        let (endpoint, address) = match (session.connection.is_quic(), &self.quic, port) {
-            (true, Some(quic), Some(port)) => {
-                let address = SocketAddr::new(remote.ip(), port);
-                quic.note_peer(address, true);
-                (Some(quic.dialer(true)), address)
-            }
-            (true, _, _) => return,
-            (false, _, _) => (None, remote),
-        };
-        connect_data_in_background(id, token, endpoint, address, self.connection_events.clone());
+        // The peer's bulk endpoint, at the address the session goes to.
+        let address = SocketAddr::new(session.connection.remote.ip(), port);
+        self.quic.note_peer(address, true);
+        connect_data_in_background(
+            id,
+            token,
+            self.quic.dialer(true),
+            address,
+            self.connection_events.clone(),
+        );
     }
 
     pub(super) fn data_connected(&mut self, session: u64, token: u64, link: Link) {
@@ -249,13 +238,7 @@ impl Runtime<'_> {
             device_id: self.config.device_id.clone(),
             token,
         };
-        match spawn_connection(
-            id,
-            link,
-            hello,
-            self.connection_events.clone(),
-            TrafficClass::Bulk,
-        ) {
+        match spawn_connection(id, link, hello, self.connection_events.clone()) {
             Ok(connection) => {
                 self.next_connection_id += 1;
                 self.data_links.insert(
@@ -288,15 +271,14 @@ impl Runtime<'_> {
             self.close_session(id, "unknown data link", false);
             return;
         };
-        // The same certificate as the session (and the same transport): the
-        // token alone would let anyone who saw it take the data link over.
+        // The same certificate as the session: the token alone would let
+        // anyone who saw it take the data link over.
         let matches = self
             .sessions
             .get(&id)
             .zip(self.sessions.get(&owner))
             .is_some_and(|(pending, owner)| {
                 pending.connection.fingerprint == owner.connection.fingerprint
-                    && pending.bulk_endpoint == owner.connection.is_quic()
             });
         if !matches {
             self.close_session(id, "data link from another device", false);
@@ -305,8 +287,6 @@ impl Runtime<'_> {
         let Some(mut pending) = self.sessions.remove(&id) else {
             return;
         };
-        // Accepted as if it were a control connection: bulk from now on.
-        pending.connection.set_traffic_class(TrafficClass::Bulk);
         pending.connection.peer_id = Some(device_id);
         self.data_links.insert(
             id,

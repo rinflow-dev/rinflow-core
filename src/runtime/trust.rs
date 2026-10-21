@@ -1,7 +1,7 @@
 //! Who may use a connection: admission and pairing.
 //!
-//! Over QUIC every peer shows a certificate (see `secure.rs`), so after its
-//! `Hello` the runtime knows the peer's device ID and fingerprint:
+//! Every peer shows a certificate (see `secure.rs`), so after its `Hello`
+//! the runtime knows the peer's device ID and fingerprint:
 //!
 //! - **Paired** (the fingerprint the user paired for this device ID): let in.
 //! - **Paired, but another certificate**: refused. Something else is
@@ -9,8 +9,6 @@
 //! - **Unknown**: with `require_pairing`, the two devices pair first; without
 //!   it, let in (encrypted, but anyone on the network could be on the other
 //!   end).
-//! - **Plain TCP** (an older peer): let in only without `require_pairing`,
-//!   and never for a paired device ID (that would be a downgrade).
 //!
 //! Pairing: the side that wants it sends `PairRequest`. Both sides show the
 //! same six-digit code (`pairing_requested`, computed from both
@@ -29,11 +27,10 @@ use crate::transport::CloseCode;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-/// `disconnected` reasons.
-pub const UNENCRYPTED_REFUSED: &str = "unencrypted connection refused";
+/// `disconnected` reasons. The other side of a declined pairing reports
+/// `transport::PAIRING_DECLINED_BY_PEER`.
 pub const IDENTITY_CHANGED: &str = "the device's identity changed";
 pub const PAIRING_REJECTED: &str = "pairing declined";
-pub const PAIRING_REJECTED_BY_PEER: &str = crate::transport::PAIRING_DECLINED_BY_PEER;
 pub const PAIRING_TIMED_OUT: &str = "pairing timed out";
 pub const UNPAIRED: &str = "unpaired";
 pub const PAIRING_REQUIRED: &str = "pairing required";
@@ -66,22 +63,16 @@ impl Runtime<'_> {
         let Some(peer_id) = session.peer_id().map(str::to_owned) else {
             return;
         };
-        let fingerprint = session.connection.fingerprint.clone();
-        match (fingerprint, self.trusted.get(&peer_id)) {
-            (Some(fingerprint), Some(known)) if *known == fingerprint => self.admit(id),
-            (Some(_), Some(_)) => {
+        match self.trusted.get(&peer_id) {
+            Some(known) if *known == session.connection.fingerprint => self.admit(id),
+            Some(_) => {
                 self.sink.emit_error(format!(
                     "{peer_id} presented a different certificate than when it was paired; refused"
                 ));
                 self.close_session(id, IDENTITY_CHANGED, true);
             }
-            (None, Some(_)) => self.close_session(id, UNENCRYPTED_REFUSED, true),
-            (Some(_), None) if self.require_pairing => self.start_pairing(id, true),
-            (Some(_), None) => self.admit(id),
-            (None, None) if self.require_pairing => {
-                self.close_session(id, UNENCRYPTED_REFUSED, true)
-            }
-            (None, None) => self.admit(id),
+            None if self.require_pairing => self.start_pairing(id, true),
+            None => self.admit(id),
         }
     }
 
@@ -110,14 +101,10 @@ impl Runtime<'_> {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let (Some(peer_id), Some(theirs), Some(ours), true) = (
-            session.peer_id(),
-            session.connection.fingerprint.as_deref(),
-            self.fingerprint.as_deref(),
-            session.pairing.is_some(),
-        ) else {
+        let (Some(peer_id), true) = (session.peer_id(), session.pairing.is_some()) else {
             return;
         };
+        let theirs = &session.connection.fingerprint;
         let name = self
             .peers
             .get(peer_id)
@@ -133,7 +120,7 @@ impl Runtime<'_> {
             "peer_id": peer_id,
             "name": name,
             "platform": platform,
-            "code": secure::pairing_code(ours, theirs),
+            "code": secure::pairing_code(&self.fingerprint, theirs),
             "fingerprint": theirs
         }));
     }
@@ -143,12 +130,10 @@ impl Runtime<'_> {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let (Some(peer_id), Some(fingerprint)) =
-            (session.peer_id(), session.connection.fingerprint.as_deref())
-        else {
+        let Some(peer_id) = session.peer_id() else {
             return;
         };
-        if self.trusted.get(peer_id).map(String::as_str) == Some(fingerprint) {
+        if self.trusted.get(peer_id) == Some(&session.connection.fingerprint) {
             // Paired on this side already: the peer's user decides.
             let _ = session.connection.send_control(WireMessage::PairAccept);
             return;
@@ -192,9 +177,7 @@ impl Runtime<'_> {
             return;
         };
         if let Some(session) = self.sessions.get(&id) {
-            let _ = session.connection.send_control(WireMessage::PairReject);
-            // The message is likely dropped with the connection; the close
-            // frame carries the same news.
+            // The close frame tells the peer why (`PAIRING_REJECTED_BY_PEER`).
             session.connection.close_with(CloseCode::PairingDeclined);
         }
         self.close_session(id, PAIRING_REJECTED, true);
@@ -212,12 +195,10 @@ impl Runtime<'_> {
             return;
         }
         session.pairing = None;
-        let (Some(peer_id), Some(fingerprint)) = (
-            session.peer_id().map(str::to_owned),
-            session.connection.fingerprint.clone(),
-        ) else {
+        let Some(peer_id) = session.peer_id().map(str::to_owned) else {
             return;
         };
+        let fingerprint = session.connection.fingerprint.clone();
         let waiting = !session.established();
         self.trusted.insert(peer_id.clone(), fingerprint.clone());
         self.sink.emit_value(json!({
@@ -256,8 +237,7 @@ impl Runtime<'_> {
                 let paired = session
                     .peer_id()
                     .and_then(|peer_id| self.trusted.get(peer_id));
-                paired.is_none()
-                    || paired.map(String::as_str) != session.connection.fingerprint.as_deref()
+                paired != Some(&session.connection.fingerprint)
             })
             .map(|(id, _)| *id)
             .collect();

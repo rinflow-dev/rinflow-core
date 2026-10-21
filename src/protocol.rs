@@ -25,7 +25,6 @@ const MESSAGE_FILE_CANCEL: u8 = 13;
 const MESSAGE_CONTROL_REVOKE: u8 = 14;
 const MESSAGE_PAIR_REQUEST: u8 = 15;
 const MESSAGE_PAIR_ACCEPT: u8 = 16;
-const MESSAGE_PAIR_REJECT: u8 = 17;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -46,7 +45,6 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::ControlRevoke { .. } => MESSAGE_CONTROL_REVOKE,
         WireMessage::PairRequest => MESSAGE_PAIR_REQUEST,
         WireMessage::PairAccept => MESSAGE_PAIR_ACCEPT,
-        WireMessage::PairReject => MESSAGE_PAIR_REJECT,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -136,11 +134,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         }
         WireMessage::DataInvite { token, port } => {
             encoder.u64(*token);
-            // Older peers (TCP) never get a port: they would refuse the
-            // longer frame.
-            if let Some(port) = port {
-                encoder.u16(*port);
-            }
+            encoder.u16(*port);
         }
         WireMessage::DataHello { device_id, token } => {
             encoder.string(device_id)?;
@@ -177,7 +171,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.bytes.extend_from_slice(reason.as_bytes());
         }
         WireMessage::ControlRevoke { handoff } => encoder.u8(u8::from(*handoff)),
-        WireMessage::PairRequest | WireMessage::PairAccept | WireMessage::PairReject => {}
+        WireMessage::PairRequest | WireMessage::PairAccept => {}
     }
     Ok(encoder.bytes)
 }
@@ -310,11 +304,10 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
         }
         MESSAGE_DATA_INVITE => {
             let token = decoder.u64()?;
-            let port = if decoder.remaining() > 0 {
-                Some(decoder.u16()?).filter(|port| *port != 0)
-            } else {
-                None
-            };
+            let port = decoder.u16()?;
+            if port == 0 {
+                return Err(invalid_data("data link port must not be zero"));
+            }
             WireMessage::DataInvite { token, port }
         }
         MESSAGE_DATA_HELLO => WireMessage::DataHello {
@@ -360,7 +353,6 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
         },
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,
-        MESSAGE_PAIR_REJECT => WireMessage::PairReject,
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;
@@ -453,10 +445,6 @@ struct Decoder<'a> {
 impl<'a> Decoder<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
     }
 
     fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
