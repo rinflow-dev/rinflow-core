@@ -99,6 +99,15 @@ bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
 bool lc_core_set_input_target(LcCore *core, const char *peer_id);
 bool lc_core_send_input(LcCore *core, const LcInputEvent *event);
 bool lc_core_reset_input(LcCore *core);
+/* Lets peers drive this device (the default), or stops them: a peer that
+ * drives it, or starts to, is told to give control back (control_revoked on
+ * its side) and none of its input is played. This device can still drive
+ * peers. Added within version 6.
+ *
+ * Every connected peer's round trip is reported about once a second:
+ *   {"event":"latency","peer_id":…,"ms":…}
+ */
+bool lc_core_set_remote_control_allowed(LcCore *core, bool allowed);
 
 /*
  * Arrangement (all geometry in logical points: macOS points, or pixels at

@@ -90,6 +90,8 @@ pub enum Command {
     AcceptFiles(u32),
     /// Stop receiving this transfer.
     CancelFiles(u32),
+    /// Lets peers drive this device (the default), or stops them.
+    SetRemoteControlAllowed(bool),
     Stop,
 }
 
@@ -247,6 +249,7 @@ async fn run(
         next_clipboard_id: 0,
         controlling: None,
         input_suspended: false,
+        remote_control_allowed: true,
         data_links: HashMap::new(),
         offer: None,
         next_transfer: 0,
@@ -277,6 +280,7 @@ async fn run(
                     Some(Command::SetClipboard(clipboard)) => state.set_clipboard(clipboard),
                     Some(Command::AcceptFiles(transfer)) => state.accept_files(transfer),
                     Some(Command::CancelFiles(transfer)) => state.cancel_files(transfer),
+                    Some(Command::SetRemoteControlAllowed(allowed)) => state.set_remote_control_allowed(allowed),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -327,6 +331,9 @@ struct Session {
     revoked: bool,
     /// Last sign of life: creation, handshake or pong.
     last_seen: Instant,
+    /// The ping awaiting its pong, and when it was sent: the round trip is
+    /// reported as `latency`.
+    ping: Option<(u64, Instant)>,
     /// The clipboard last exchanged with this peer, either way.
     clipboard_synced: Option<u64>,
     clipboard_in: ClipboardAssembler,
@@ -381,6 +388,9 @@ struct Runtime<'a> {
     /// input is dropped until it acknowledges with a reset or a new target,
     /// so a capture that has not ended yet cannot take control again.
     input_suspended: bool,
+    /// Peers may drive this device. When not, a peer that drives it or
+    /// starts to is told to give control back (`ControlRevoke`).
+    remote_control_allowed: bool,
     /// Data links by connection ID.
     data_links: HashMap<u64, DataLink>,
     /// Files on this device's clipboard.
@@ -565,6 +575,16 @@ impl Runtime<'_> {
         }
     }
 
+    fn set_remote_control_allowed(&mut self, allowed: bool) {
+        if self.remote_control_allowed == allowed {
+            return;
+        }
+        self.remote_control_allowed = allowed;
+        if !allowed {
+            self.revoke_controllers(None, None, "remote control turned off");
+        }
+    }
+
     /// Stops every peer that drives this device, except session `keep`: what
     /// it holds here is released, and a peer that understands it is told to
     /// give control back. Its input is ignored until that reset arrives.
@@ -666,6 +686,7 @@ impl Runtime<'_> {
                         remote_input: RemoteInputState::default(),
                         revoked: false,
                         last_seen: Instant::now(),
+                        ping: None,
                         clipboard_synced: None,
                         clipboard_in: ClipboardAssembler::default(),
                         clipboard_pending: false,
@@ -1104,7 +1125,19 @@ impl Runtime<'_> {
                     .connection
                     .send_control(WireMessage::Pong { sequence });
             }
-            WireMessage::Pong { .. } => session.last_seen = Instant::now(),
+            WireMessage::Pong { sequence } => {
+                session.last_seen = Instant::now();
+                if let Some((sent, at)) = session.ping
+                    && sent == sequence
+                {
+                    session.ping = None;
+                    self.sink.emit_value(json!({
+                        "event": "latency",
+                        "peer_id": session.peer_id(),
+                        "ms": at.elapsed().as_secs_f64() * 1000.0
+                    }));
+                }
+            }
             WireMessage::ScreenInfo { displays } => {
                 if let Some(peer_id) = session.peer_id().map(str::to_owned) {
                     self.update_peer_displays(&peer_id, displays);
@@ -1160,6 +1193,17 @@ impl Runtime<'_> {
         }
         if session.revoked {
             // Sent before the peer heard that it lost control.
+            return;
+        }
+        if !self.remote_control_allowed {
+            // Nothing is played: the peer is told to give control back, and
+            // its input is ignored until its reset confirms it did.
+            if session.connection.capabilities & CAPABILITY_CONTROL_REVOKE != 0 {
+                let _ = session
+                    .connection
+                    .send_control(WireMessage::ControlRevoke { handoff: false });
+            }
+            session.revoked = true;
             return;
         }
         if !session.remote_input.is_controlling() {
@@ -1384,7 +1428,7 @@ impl Runtime<'_> {
 
         self.ping_sequence = self.ping_sequence.wrapping_add(1);
         let mut stale = Vec::new();
-        for (id, session) in &self.sessions {
+        for (id, session) in &mut self.sessions {
             if session.last_seen.elapsed() > SESSION_TIMEOUT {
                 stale.push((
                     *id,
@@ -1395,6 +1439,9 @@ impl Runtime<'_> {
                     },
                 ));
             } else if session.established() {
+                // A ping still unanswered is forgotten: the round trip is
+                // measured from the newest one.
+                session.ping = Some((self.ping_sequence, Instant::now()));
                 let _ = session.connection.send_control(WireMessage::Ping {
                     sequence: self.ping_sequence,
                 });

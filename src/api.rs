@@ -86,6 +86,14 @@ impl Core {
         self.thread.send(Command::CancelFiles(transfer))
     }
 
+    /// Lets peers drive this device (the default), or stops them: a peer
+    /// that drives it, or starts to, is told to give control back and none
+    /// of its input is played. This device can still drive peers.
+    pub fn set_remote_control_allowed(&self, allowed: bool) -> Result<(), String> {
+        self.thread
+            .send(Command::SetRemoteControlAllowed(allowed))
+    }
+
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {
         self.thread.send(Command::SendInput(event))
     }

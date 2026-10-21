@@ -274,6 +274,13 @@ pub unsafe extern "C" fn lc_core_cancel_files(core: *mut LcCore, transfer: u32) 
     send_command(core, Command::CancelFiles(transfer))
 }
 
+/// Lets peers drive this device (the default), or stops them. Added within
+/// version 6 (nothing else changed).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_remote_control_allowed(core: *mut LcCore, allowed: bool) -> bool {
+    send_command(core, Command::SetRemoteControlAllowed(allowed))
+}
+
 fn send_command(core: *mut LcCore, command: Command) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
         if core.is_null() {

@@ -1180,6 +1180,69 @@ mod tests {
     }
 
     #[test]
+    fn a_device_that_refuses_remote_control_sends_its_controller_back() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("refuse-a", discovery_port);
+        let mut b = test_core("refuse-b", discovery_port);
+        wait_for_peers(&b, &["refuse-a"]);
+        b.thread.send(Command::Connect("refuse-a".into())).unwrap();
+        wait_connected(&b, "refuse-a");
+        wait_connected(&a, "refuse-b");
+
+        // B drives A; then A stops allowing it.
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![1.0]);
+        a.thread
+            .send(Command::SetRemoteControlAllowed(false))
+            .unwrap();
+        wait_revoked(&b, "refuse-a", "revoked");
+        wait_control_ended(&a, "refuse-b");
+
+        // B's shell gives control back and pushes in again: sent back again,
+        // and nothing is played.
+        b.thread.send(Command::ResetInput).unwrap();
+        b.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        wait_revoked(&b, "refuse-a", "revoked");
+        assert!(received(&a, Duration::from_millis(300)).is_empty());
+        assert!(events_named(&a, "remote_control_started").is_empty());
+
+        // Allowed again: B drives A.
+        a.thread
+            .send(Command::SetRemoteControlAllowed(true))
+            .unwrap();
+        b.thread.send(Command::ResetInput).unwrap();
+        b.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![3.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn connected_peers_report_their_round_trip() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("rtt-a", discovery_port);
+        let mut b = test_core("rtt-b", discovery_port);
+        wait_for_peers(&a, &["rtt-b"]);
+        a.thread.send(Command::Connect("rtt-b".into())).unwrap();
+        wait_connected(&a, "rtt-b");
+
+        // Pings go out every second; both sides time their own.
+        for (core, peer) in [(&a, "rtt-b"), (&b, "rtt-a")] {
+            let event = wait_for_event(&core.events, Duration::from_secs(4), |event| {
+                event["event"] == "latency" && event["peer_id"] == peer
+            });
+            let ms = event["ms"].as_f64().expect("latency in ms");
+            assert!((0.0..1000.0).contains(&ms), "round trip {ms} ms");
+        }
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
     fn driving_another_peer_stops_whoever_drives_this_device() {
         let _network = network_test();
         let discovery_port = free_udp_port();
