@@ -12,13 +12,18 @@ use super::{Runtime, random_u64};
 use crate::clipboard::{self, Clipboard, ClipboardFormat};
 use crate::files::{self, FILE_CHUNK_SIZE, FileWriter, MIME_FILES, MIME_URI_LIST, Manifest, Offer};
 use crate::model::{CAPABILITY_CLIPBOARD, DATA_LINK_CAPABILITIES, WireMessage};
-use crate::transport::{ActiveConnection, connect_data_in_background, spawn_connection};
+use crate::qos::TrafficClass;
+use crate::transport::{
+    ActiveConnection, ConnectionEvent, connect_data_in_background, spawn_connection,
+};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// How often the accepting side invites again while a data link is missing.
@@ -40,13 +45,109 @@ pub(super) struct Download {
     /// Destination of each entry, and the top-level ones for the clipboard.
     targets: Vec<PathBuf>,
     tops: Vec<PathBuf>,
-    /// The entry being received.
+    /// The entry being received, and its bytes received so far.
     entry: usize,
-    writer: Option<FileWriter>,
+    entry_received: u64,
+    /// Writes the files; started with the first file that has content.
+    disk: Option<DiskWriter>,
+    /// Every entry is queued to `disk`: done once it reports them written.
+    finishing: bool,
     received: u64,
     last_progress: Instant,
     /// What else came with the files (their names as text, usually).
     rest: Clipboard,
+}
+
+/// Writes a download's files on a thread of its own. This runtime also
+/// handles input, so a slow disk, the final flush of a large file, or an
+/// antivirus scanning each finished file must never hold it up: received
+/// chunks are only queued here, in order.
+struct DiskWriter {
+    id: u64,
+    jobs: std::sync::mpsc::Sender<DiskJob>,
+    aborted: Arc<AtomicBool>,
+}
+
+enum DiskJob {
+    Create {
+        target: PathBuf,
+        size: u64,
+        salt: u64,
+    },
+    Write {
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Everything is queued: report once it is written.
+    Done,
+}
+
+impl DiskWriter {
+    fn spawn(events: mpsc::UnboundedSender<ConnectionEvent>) -> std::io::Result<Self> {
+        let id = random_u64();
+        let (jobs, queue) = std::sync::mpsc::channel::<DiskJob>();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let stop = aborted.clone();
+        std::thread::Builder::new()
+            .name("linkcursor-files".to_owned())
+            .spawn(move || {
+                // Dropped unfinished (cancelled, failed), it removes its
+                // partial file.
+                let mut file: Option<FileWriter> = None;
+                let outcome = loop {
+                    // The queue closes when the download is dropped.
+                    let Ok(job) = queue.recv() else {
+                        break Err("stopped".to_owned());
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        break Err("stopped".to_owned());
+                    }
+                    let result = match job {
+                        DiskJob::Create { target, size, salt } => {
+                            match FileWriter::create(target, size, salt) {
+                                Ok(mut writer) if size == 0 => writer.finish(),
+                                Ok(writer) => {
+                                    file = Some(writer);
+                                    Ok(())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        DiskJob::Write { offset, data } => {
+                            match file.as_mut().map(|writer| writer.write(offset, &data)) {
+                                Some(Ok(true)) => {
+                                    file = None;
+                                    Ok(())
+                                }
+                                Some(Ok(false)) => Ok(()),
+                                Some(Err(reason)) => Err(reason),
+                                None => Err("no file to write to".to_owned()),
+                            }
+                        }
+                        DiskJob::Done => break Ok(()),
+                    };
+                    if let Err(reason) = result {
+                        break Err(reason);
+                    }
+                };
+                // Always reported, and only once nothing partial is left.
+                drop(file);
+                let _ = events.send(ConnectionEvent::FilesWritten {
+                    writer: id,
+                    outcome,
+                });
+            })?;
+        Ok(Self { id, jobs, aborted })
+    }
+
+    fn send(&self, job: DiskJob) {
+        let _ = self.jobs.send(job);
+    }
+
+    /// Stops at the next job; the file being written is removed.
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Runtime<'_> {
@@ -129,7 +230,13 @@ impl Runtime<'_> {
             device_id: self.config.device_id.clone(),
             token,
         };
-        match spawn_connection(id, stream, hello, self.connection_events.clone()) {
+        match spawn_connection(
+            id,
+            stream,
+            hello,
+            self.connection_events.clone(),
+            TrafficClass::Bulk,
+        ) {
             Ok(connection) => {
                 self.next_connection_id += 1;
                 self.data_links.insert(
@@ -165,6 +272,8 @@ impl Runtime<'_> {
         let Some(mut pending) = self.sessions.remove(&id) else {
             return;
         };
+        // Accepted as if it were a control connection: bulk from now on.
+        pending.connection.set_traffic_class(TrafficClass::Bulk);
         pending.connection.peer_id = Some(device_id);
         self.data_links.insert(
             id,
@@ -235,7 +344,7 @@ impl Runtime<'_> {
                 entry,
                 offset,
                 data,
-            } => self.file_chunk(session, transfer, entry as usize, offset, &data),
+            } => self.file_chunk(session, transfer, entry as usize, offset, data),
             WireMessage::FileCancel { transfer, reason } => {
                 if self
                     .download
@@ -529,7 +638,9 @@ impl Runtime<'_> {
             targets,
             tops,
             entry: 0,
-            writer: None,
+            entry_received: 0,
+            disk: None,
+            finishing: false,
             received: 0,
             last_progress: Instant::now(),
             rest,
@@ -572,16 +683,24 @@ impl Runtime<'_> {
         }
     }
 
-    /// Creates folders and empty files, and asks for the next file with
-    /// content; finishes when none is left.
+    /// Creates folders, queues files to the disk writer and asks for the next
+    /// file with content; once none is left, waits for the disk writer.
     fn advance_download(&mut self) {
+        let events = self.connection_events.clone();
         loop {
             let Some(download) = self.download.as_mut() else {
                 return;
             };
             let index = download.entry;
             let Some(entry) = download.manifest.entries.get(index).cloned() else {
-                return self.finish_download();
+                download.finishing = true;
+                match &download.disk {
+                    // Done once it reports everything written (`files_written`).
+                    Some(disk) => disk.send(DiskJob::Done),
+                    // Only folders: nothing to wait for.
+                    None => self.finish_download(),
+                }
+                return;
             };
             let target = download.targets[index].clone();
             if entry.dir {
@@ -591,18 +710,24 @@ impl Runtime<'_> {
                 download.entry += 1;
                 continue;
             }
-            let mut writer = match FileWriter::create(target, entry.size, random_u64()) {
-                Ok(writer) => writer,
-                Err(error) => return self.fail_download(&error.to_string(), true),
-            };
-            if entry.size == 0 {
-                if let Err(error) = writer.finish() {
-                    return self.fail_download(&error, true);
+            if download.disk.is_none() {
+                match DiskWriter::spawn(events.clone()) {
+                    Ok(disk) => download.disk = Some(disk),
+                    Err(error) => return self.fail_download(&error.to_string(), true),
                 }
+            }
+            if let Some(disk) = &download.disk {
+                disk.send(DiskJob::Create {
+                    target,
+                    size: entry.size,
+                    salt: random_u64(),
+                });
+            }
+            download.entry_received = 0;
+            if entry.size == 0 {
                 download.entry += 1;
                 continue;
             }
-            download.writer = Some(writer);
             let request = WireMessage::FileRequest {
                 transfer: download.manifest.transfer,
                 entry: index as u32,
@@ -619,7 +744,14 @@ impl Runtime<'_> {
         }
     }
 
-    fn file_chunk(&mut self, session: u64, transfer: u32, entry: usize, offset: u64, data: &[u8]) {
+    fn file_chunk(
+        &mut self,
+        session: u64,
+        transfer: u32,
+        entry: usize,
+        offset: u64,
+        data: Vec<u8>,
+    ) {
         let Some(download) = self.download.as_mut() else {
             return;
         };
@@ -631,28 +763,62 @@ impl Runtime<'_> {
         {
             return;
         }
-        let Some(writer) = download.writer.as_mut() else {
+        let size = download
+            .manifest
+            .entries
+            .get(entry)
+            .map_or(0, |entry| entry.size);
+        let length = data.len() as u64;
+        if offset != download.entry_received {
+            return self.fail_download("file chunk out of order", true);
+        }
+        if download.entry_received + length > size {
+            return self.fail_download("file larger than announced", true);
+        }
+        let Some(disk) = &download.disk else {
             return;
         };
-        match writer.write(offset, data) {
-            Ok(done) => {
-                download.received += data.len() as u64;
-                if download.last_progress.elapsed() >= PROGRESS_INTERVAL || done {
-                    download.last_progress = Instant::now();
-                    self.sink.emit_value(json!({
-                        "event": "files_progress",
-                        "transfer": transfer,
-                        "received": download.received,
-                        "total": download.manifest.total_size
-                    }));
-                }
-                if done {
-                    download.writer = None;
-                    download.entry += 1;
-                    self.advance_download();
-                }
-            }
-            Err(reason) => self.fail_download(&reason, true),
+        // Written on the disk writer's thread; the writer checks again.
+        disk.send(DiskJob::Write { offset, data });
+        download.entry_received += length;
+        download.received += length;
+        let done = download.entry_received == size;
+        if download.last_progress.elapsed() >= PROGRESS_INTERVAL || done {
+            download.last_progress = Instant::now();
+            self.sink.emit_value(json!({
+                "event": "files_progress",
+                "transfer": transfer,
+                "received": download.received,
+                "total": download.manifest.total_size
+            }));
+        }
+        if done {
+            download.entry += 1;
+            self.advance_download();
+        }
+    }
+
+    /// The disk writer `writer` stopped: everything written, failed, or
+    /// stopped by a failed download that waits for it to clean up.
+    pub(super) fn files_written(&mut self, writer: u64, outcome: Result<(), String>) {
+        if let Some(index) = self
+            .download_failures
+            .iter()
+            .position(|(id, _)| *id == writer)
+        {
+            let (_, event) = self.download_failures.remove(index);
+            return self.sink.emit_value(event);
+        }
+        let Some(download) = &self.download else {
+            return;
+        };
+        if download.disk.as_ref().map(|disk| disk.id) != Some(writer) {
+            return;
+        }
+        match outcome {
+            Ok(()) if download.finishing => self.finish_download(),
+            Ok(()) => {}
+            Err(reason) => self.end_download(&reason, true, true),
         }
     }
 
@@ -686,6 +852,11 @@ impl Runtime<'_> {
     /// Stops the transfer being received; its partial file is removed.
     /// `tell_peer` sends `FileCancel` so the sender stops too.
     pub(super) fn fail_download(&mut self, reason: &str, tell_peer: bool) {
+        self.end_download(reason, tell_peer, false);
+    }
+
+    /// `writer_stopped`: the disk writer itself failed and has cleaned up.
+    fn end_download(&mut self, reason: &str, tell_peer: bool, writer_stopped: bool) {
         let Some(download) = self.download.take() else {
             return;
         };
@@ -696,11 +867,20 @@ impl Runtime<'_> {
                 reason: reason.to_owned(),
             });
         }
-        self.sink.emit_value(json!({
+        let failed = json!({
             "event": "files_failed",
             "peer_id": download.peer_id,
             "transfer": transfer,
             "reason": reason
-        }));
+        });
+        match &download.disk {
+            // Reported once the writer stopped and removed its partial file
+            // (`files_written`); dropping the download closes its queue.
+            Some(disk) if !writer_stopped => {
+                disk.abort();
+                self.download_failures.push((disk.id, failed));
+            }
+            _ => self.sink.emit_value(failed),
+        }
     }
 }

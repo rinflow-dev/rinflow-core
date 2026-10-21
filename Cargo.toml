@@ -19,6 +19,17 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22.4"
 
+# Network priority per connection (qos.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_QoS",
+    "Win32_Networking_WinSock",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 

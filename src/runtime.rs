@@ -8,6 +8,7 @@ use crate::model::{
     Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
     PlacementRecord, WireMessage, negotiate_protocol,
 };
+use crate::qos::TrafficClass;
 use crate::remap::ShortcutRemap;
 use crate::transport::{
     ActiveConnection, ConnectionEvent, connect_in_background, spawn_connection,
@@ -249,6 +250,7 @@ async fn run(
         offer: None,
         next_transfer: 0,
         download: None,
+        download_failures: Vec::new(),
         uploads: HashMap::new(),
     };
 
@@ -378,6 +380,9 @@ struct Runtime<'a> {
     next_transfer: u32,
     /// Files being received.
     download: Option<Download>,
+    /// `files_failed` events of stopped downloads, by disk writer: sent once
+    /// that writer has removed its partial file.
+    download_failures: Vec<(u64, Value)>,
     /// File uploads in progress, by data link.
     uploads: HashMap<u64, tokio::task::JoinHandle<()>>,
 }
@@ -559,11 +564,13 @@ impl Runtime<'_> {
 
     fn start_session(&mut self, stream: TcpStream, peer_id: Option<String>) {
         let id = self.next_connection_id;
+        // Accepted ones may turn out to be data links (see `attach_data_link`).
         match spawn_connection(
             id,
             stream,
             WireMessage::hello(self.config),
             self.connection_events.clone(),
+            TrafficClass::Interactive,
         ) {
             Ok(mut connection) => {
                 self.next_connection_id += 1;
@@ -934,6 +941,9 @@ impl Runtime<'_> {
                 Ok(stream) => self.data_connected(session, token, stream),
                 Err(error) => self.sink.emit_error(format!("data link failed: {error}")),
             },
+            ConnectionEvent::FilesWritten { writer, outcome } => {
+                self.files_written(writer, outcome);
+            }
             ConnectionEvent::Closed {
                 connection_id,
                 reason,

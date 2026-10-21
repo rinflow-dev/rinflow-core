@@ -1,6 +1,7 @@
 use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
+use crate::qos::{Qos, TrafficClass};
 use crate::remap::ShortcutRemap;
 use std::collections::VecDeque;
 use std::io;
@@ -37,6 +38,12 @@ pub enum ConnectionEvent {
         token: u64,
         result: Result<TcpStream, String>,
     },
+    /// The disk writer of a download (see `runtime/data.rs`) wrote every
+    /// file queued to it, or failed.
+    FilesWritten {
+        writer: u64,
+        outcome: Result<(), String>,
+    },
 }
 
 /// Bytes the system may hold for a connection before a write waits. Small on
@@ -57,11 +64,19 @@ pub struct ActiveConnection {
     input: OutboundInputQueue,
     bulk: BulkQueue,
     files: mpsc::Sender<WireMessage>,
+    qos: Qos,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
 
 impl ActiveConnection {
+    /// What the connection carries, for the network's queues (see `qos.rs`).
+    /// An accepted connection turns out to be a data link only once its
+    /// `DataHello` arrives.
+    pub fn set_traffic_class(&self, class: TrafficClass) {
+        self.qos.set(class);
+    }
+
     pub fn send_control(&self, message: WireMessage) -> Result<(), &'static str> {
         self.control
             .try_send(message)
@@ -132,9 +147,12 @@ pub fn spawn_connection(
     stream: TcpStream,
     hello: WireMessage,
     events: mpsc::UnboundedSender<ConnectionEvent>,
+    class: TrafficClass,
 ) -> io::Result<ActiveConnection> {
     stream.set_nodelay(true)?;
     socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER_SIZE)?;
+    let qos = Qos::new(&stream);
+    qos.set(class);
     let remote = stream.peer_addr().ok();
     let (reader, writer) = stream.into_split();
     let (control_tx, control_rx) = mpsc::channel(64);
@@ -178,6 +196,7 @@ pub fn spawn_connection(
         input,
         bulk,
         files: files_tx,
+        qos,
         read_task,
         write_task,
     })

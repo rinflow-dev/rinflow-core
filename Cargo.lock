@@ -97,10 +97,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "jni",
+ "libc",
  "serde",
  "serde_json",
  "socket2",
  "tokio",
+ "windows-sys",
 ]
 
 [[package]]

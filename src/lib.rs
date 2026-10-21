@@ -6,6 +6,7 @@ mod input;
 pub mod layout;
 mod model;
 mod protocol;
+mod qos;
 mod remap;
 mod runtime;
 mod transport;

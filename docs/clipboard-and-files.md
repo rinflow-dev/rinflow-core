@@ -26,6 +26,20 @@
 
 数据连接上的发送顺序：小消息（`FileRequest`/`FileCancel`）→ 剪贴板 → 文件。文件按网络实际发送的速度读取（队列只有 4 块），不会一次读进内存。
 
+**网络优先级**（`src/qos.rs`，外壳不用做任何事）：两条连接分开以后，在 Wi-Fi 上还会在网卡和路由器的队列里互相挤。所以核心库给每条连接标上流量类型：控制连接是"交互"，数据连接是"批量"。Wi-Fi（WMM）按这个类型分别排队，优先发送交互流量，批量流量让路。
+
+| 平台 | 控制连接（交互） | 数据连接（批量） |
+| --- | --- | --- |
+| macOS / iOS | `SO_NET_SERVICE_TYPE = NET_SERVICE_TYPE_VO` | `NET_SERVICE_TYPE_BK`（系统还会给它用让路的拥塞控制） |
+| Windows | qWAVE `QOSAddSocketToFlow`，`QOSTrafficTypeVoice` | `QOSTrafficTypeBackground` |
+| Linux / Android | `IP_TOS` = DSCP EF(46)，`SO_PRIORITY` 6 | DSCP CS1(8)，`SO_PRIORITY` 1 |
+
+- 被接受的连接先当控制连接标记，收到 `DataHello` 后改标为批量。
+- 标记失败（例如 Windows 不给 127.0.0.1 上的连接设优先级，报 1168）只在 stderr 打一行 `linkcursor-core: no network priority for a connection: …`，连接照常工作。
+- 优先级只管**发送方**：Mac 发给 Windows 的输入，要由 Mac 那边的核心库标记。**两端都要用新版核心库**才完整生效。路由器转发时是否照顾这个标记，取决于它是否开启 WMM（一般默认开启）。
+
+**写盘不占核心线程**：接收文件时，收到的数据块交给单独的 `linkcursor-files` 线程按顺序写入。之前写盘和输入处理在同一个线程里，大文件收尾时（刷盘、改名、杀毒软件扫描）会卡住输入。在本机用 300 MB 文件实测，传输期间鼠标事件最长间隔从 349 ms 降到 10–53 ms。写入出错或被取消时，等 `.partial` 文件删除后才发 `files_failed`。
+
 能力位：`CAPABILITY_CLIPBOARD = 1 << 7`，`CAPABILITY_FILES = 1 << 6`。**第 5 位作废**：它曾表示"剪贴板走控制连接"（`512cb34`），新旧两种实现互相不发剪贴板，也就不会因为未知消息互相断开。
 
 ---
