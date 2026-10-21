@@ -3,13 +3,14 @@ use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
 use crate::qos::{Qos, TrafficClass};
 use crate::remap::ShortcutRemap;
+use crate::secure;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -17,6 +18,58 @@ use tokio::task::JoinHandle;
 /// told to disconnect, or dropped a duplicate connection): an orderly end,
 /// unlike the `read failed: …` / `write failed: …` reasons.
 pub const PEER_CLOSED: &str = "peer closed the connection";
+
+/// `disconnected` reason when the peer's user declined pairing.
+pub const PAIRING_DECLINED_BY_PEER: &str = "pairing declined on the other device";
+
+/// Why this side closes a QUIC connection, sent as the application error
+/// code of its CONNECTION_CLOSE frame. A message queued just before closing
+/// would be dropped with the connection; the close frame always arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseCode {
+    /// An orderly close: the peer reports [`PEER_CLOSED`].
+    Closed = 0,
+    /// The user declined pairing: [`PAIRING_DECLINED_BY_PEER`].
+    PairingDeclined = 1,
+}
+
+impl CloseCode {
+    /// The `disconnected` reason for a close the peer sent with `code`.
+    fn reason(code: u64) -> &'static str {
+        match code {
+            1 => PAIRING_DECLINED_BY_PEER,
+            _ => PEER_CLOSED,
+        }
+    }
+}
+
+/// How long dialing (TCP connect, or the QUIC handshake) may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// What a connection runs over.
+pub enum Link {
+    /// Plain TCP: devices whose core predates QUIC. Neither encrypted nor
+    /// authenticated.
+    Tcp(TcpStream),
+    /// The one bidirectional stream of a QUIC connection, encrypted with
+    /// TLS 1.3; the peer's certificate is known.
+    Quic(QuicStream),
+}
+
+pub struct QuicStream {
+    pub connection: quinn::Connection,
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+}
+
+impl Link {
+    pub fn remote(&self) -> Option<SocketAddr> {
+        match self {
+            Link::Tcp(stream) => stream.peer_addr().ok(),
+            Link::Quic(stream) => Some(stream.connection.remote_address()),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ConnectionEvent {
@@ -30,13 +83,19 @@ pub enum ConnectionEvent {
     },
     ConnectResult {
         peer_id: String,
-        result: Result<TcpStream, String>,
+        result: Result<Link, String>,
     },
     /// The data link a session asked for (see `DataInvite`).
     DataConnectResult {
         session: u64,
         token: u64,
-        result: Result<TcpStream, String>,
+        result: Result<Link, String>,
+    },
+    /// A QUIC connection that came in and opened its stream; `bulk` when it
+    /// came to the bulk endpoint (a data link).
+    Accepted {
+        link: Link,
+        bulk: bool,
     },
     /// The disk writer of a download (see `runtime/data.rs`) wrote every
     /// file queued to it, or failed.
@@ -44,6 +103,15 @@ pub enum ConnectionEvent {
         writer: u64,
         outcome: Result<(), String>,
     },
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Link::Tcp(stream) => write!(formatter, "Tcp({:?})", stream.peer_addr().ok()),
+            Link::Quic(stream) => write!(formatter, "Quic({})", stream.connection.remote_address()),
+        }
+    }
 }
 
 /// Bytes the system may hold for a connection before a write waits. Small on
@@ -60,21 +128,31 @@ pub struct ActiveConnection {
     pub capabilities: u64,
     /// Applied to input received from this peer; set once its platform is known.
     pub shortcut_remap: ShortcutRemap,
+    /// SHA-256 of the certificate the peer presented; `None` over plain TCP,
+    /// which is neither encrypted nor authenticated.
+    pub fingerprint: Option<String>,
     control: mpsc::Sender<WireMessage>,
     input: OutboundInputQueue,
     bulk: BulkQueue,
     files: mpsc::Sender<WireMessage>,
-    qos: Qos,
+    qos: Option<Qos>,
+    quic: Option<quinn::Connection>,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
 }
 
 impl ActiveConnection {
     /// What the connection carries, for the network's queues (see `qos.rs`).
-    /// An accepted connection turns out to be a data link only once its
-    /// `DataHello` arrives.
+    /// An accepted TCP connection turns out to be a data link only once its
+    /// `DataHello` arrives. QUIC connections have their endpoint's class.
     pub fn set_traffic_class(&self, class: TrafficClass) {
-        self.qos.set(class);
+        if let Some(qos) = &self.qos {
+            qos.set(class);
+        }
+    }
+
+    pub fn is_quic(&self) -> bool {
+        self.quic.is_some()
     }
 
     pub fn send_control(&self, message: WireMessage) -> Result<(), &'static str> {
@@ -108,9 +186,21 @@ impl ActiveConnection {
         self.files.clone()
     }
 
+    /// Closes a QUIC connection now, telling the peer why. The connection
+    /// is still to be aborted; its close then changes nothing. No effect
+    /// over TCP, whose peer only sees the connection end.
+    pub fn close_with(&self, code: CloseCode) {
+        if let Some(connection) = &self.quic {
+            connection.close((code as u32).into(), b"");
+        }
+    }
+
     pub fn abort(self) {
         self.read_task.abort();
         self.write_task.abort();
+        // The peer sees an orderly close (`PEER_CLOSED`), unless `close_with`
+        // gave another reason first.
+        self.close_with(CloseCode::Closed);
     }
 }
 
@@ -144,47 +234,53 @@ impl BulkQueue {
 
 pub fn spawn_connection(
     connection_id: u64,
-    stream: TcpStream,
+    link: Link,
     hello: WireMessage,
     events: mpsc::UnboundedSender<ConnectionEvent>,
     class: TrafficClass,
 ) -> io::Result<ActiveConnection> {
-    stream.set_nodelay(true)?;
-    socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER_SIZE)?;
-    let qos = Qos::new(&stream);
-    qos.set(class);
-    let remote = stream.peer_addr().ok();
-    let (reader, writer) = stream.into_split();
+    let remote = link.remote();
     let (control_tx, control_rx) = mpsc::channel(64);
     let input = OutboundInputQueue::new();
     let bulk = BulkQueue::default();
     let (files_tx, files_rx) = mpsc::channel(4);
+    let queues = Queues {
+        controls: control_rx,
+        input: input.clone(),
+        bulk: bulk.clone(),
+        files: files_rx,
+    };
 
-    let read_events = events.clone();
-    let read_task = tokio::spawn(async move {
-        let reason = match read_loop(connection_id, reader, read_events.clone()).await {
-            Ok(()) => PEER_CLOSED.to_owned(),
-            Err(error) => format!("read failed: {error}"),
-        };
-        let _ = read_events.send(ConnectionEvent::Closed {
-            connection_id,
-            reason,
-        });
-    });
-
-    let write_events = events;
-    let write_input = input.clone();
-    let write_bulk = bulk.clone();
-    let write_task = tokio::spawn(async move {
-        if let Err(error) =
-            write_loop(writer, control_rx, write_input, write_bulk, files_rx, hello).await
-        {
-            let _ = write_events.send(ConnectionEvent::Closed {
-                connection_id,
-                reason: format!("write failed: {error}"),
-            });
+    let (qos, quic, fingerprint, read_task, write_task) = match link {
+        Link::Tcp(stream) => {
+            stream.set_nodelay(true)?;
+            socket2::SockRef::from(&stream).set_send_buffer_size(SEND_BUFFER_SIZE)?;
+            let qos = Qos::new(&stream);
+            qos.set(class);
+            let (reader, writer) = stream.into_split();
+            let (read_task, write_task) =
+                spawn_loops(connection_id, reader, writer, queues, hello, events);
+            (Some(qos), None, None, read_task, write_task)
         }
-    });
+        Link::Quic(stream) => {
+            let fingerprint = secure::peer_fingerprint(&stream.connection);
+            let (read_task, write_task) = spawn_loops(
+                connection_id,
+                stream.recv,
+                stream.send,
+                queues,
+                hello,
+                events,
+            );
+            (
+                None,
+                Some(stream.connection),
+                fingerprint,
+                read_task,
+                write_task,
+            )
+        }
+    };
 
     Ok(ActiveConnection {
         peer_id: None,
@@ -192,19 +288,97 @@ pub fn spawn_connection(
         protocol_version: None,
         capabilities: 0,
         shortcut_remap: ShortcutRemap::None,
+        fingerprint,
         control: control_tx,
         input,
         bulk,
         files: files_tx,
         qos,
+        quic,
         read_task,
         write_task,
     })
 }
 
-async fn read_loop(
+/// What the write loop sends, in priority order.
+struct Queues {
+    controls: mpsc::Receiver<WireMessage>,
+    input: OutboundInputQueue,
+    bulk: BulkQueue,
+    files: mpsc::Receiver<WireMessage>,
+}
+
+fn spawn_loops<R, W>(
     connection_id: u64,
-    mut reader: OwnedReadHalf,
+    reader: R,
+    writer: W,
+    queues: Queues,
+    hello: WireMessage,
+    events: mpsc::UnboundedSender<ConnectionEvent>,
+) -> (JoinHandle<()>, JoinHandle<()>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let read_events = events.clone();
+    let read_task = tokio::spawn(async move {
+        let reason = match read_loop(connection_id, reader, read_events.clone()).await {
+            Ok(()) => PEER_CLOSED.to_owned(),
+            Err(error) => match closed_by_peer(&error) {
+                Some(reason) => reason.to_owned(),
+                None => format!("read failed: {error}"),
+            },
+        };
+        let _ = read_events.send(ConnectionEvent::Closed {
+            connection_id,
+            reason,
+        });
+    });
+
+    let write_task = tokio::spawn(async move {
+        if let Err(error) = write_loop(writer, queues, hello).await {
+            let reason = match closed_by_peer(&error) {
+                Some(reason) => reason.to_owned(),
+                None => format!("write failed: {error}"),
+            };
+            let _ = events.send(ConnectionEvent::Closed {
+                connection_id,
+                reason,
+            });
+        }
+    });
+    (read_task, write_task)
+}
+
+/// The peer closed its QUIC connection (as `ActiveConnection::abort` does):
+/// the `disconnected` reason for the code it closed with.
+fn closed_by_peer(error: &io::Error) -> Option<&'static str> {
+    let inner = error.get_ref()?;
+    let lost = inner
+        .downcast_ref::<quinn::ReadError>()
+        .and_then(|error| match error {
+            quinn::ReadError::ConnectionLost(lost) => Some(lost),
+            _ => None,
+        })
+        .or_else(|| {
+            inner
+                .downcast_ref::<quinn::WriteError>()
+                .and_then(|error| match error {
+                    quinn::WriteError::ConnectionLost(lost) => Some(lost),
+                    _ => None,
+                })
+        });
+    match lost? {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            Some(CloseCode::reason(close.error_code.into_inner()))
+        }
+        _ => None,
+    }
+}
+
+async fn read_loop<R: AsyncRead + Unpin>(
+    connection_id: u64,
+    mut reader: R,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) -> io::Result<()> {
     loop {
@@ -237,52 +411,52 @@ async fn read_loop(
     }
 }
 
-async fn write_loop(
-    mut writer: OwnedWriteHalf,
-    mut controls: mpsc::Receiver<WireMessage>,
-    input: OutboundInputQueue,
-    bulk: BulkQueue,
-    mut files: mpsc::Receiver<WireMessage>,
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut queues: Queues,
     hello: WireMessage,
 ) -> io::Result<()> {
     write_frame(&mut writer, &hello).await?;
     loop {
         // Check control between every input batch so keepalives and handshake
         // responses cannot be starved by a high-rate pointing device.
-        if let Ok(message) = controls.try_recv() {
+        if let Ok(message) = queues.controls.try_recv() {
             write_frame(&mut writer, &message).await?;
             continue;
         }
-        if let Some(message) = input.pop_message() {
+        if let Some(message) = queues.input.pop_message() {
             write_frame(&mut writer, &message).await?;
             continue;
         }
         // Bulk data only when nothing else waits, one frame at a time:
         // clipboards before files.
-        if let Some(message) = bulk.pop() {
+        if let Some(message) = queues.bulk.pop() {
             write_frame(&mut writer, &message).await?;
             continue;
         }
-        if let Ok(message) = files.try_recv() {
+        if let Ok(message) = queues.files.try_recv() {
             write_frame(&mut writer, &message).await?;
             continue;
         }
 
         tokio::select! {
             biased;
-            message = controls.recv() => {
+            message = queues.controls.recv() => {
                 let Some(message) = message else { break };
                 write_frame(&mut writer, &message).await?;
             }
-            _ = input.notified() => {}
-            _ = bulk.notified() => {}
-            Some(message) = files.recv() => write_frame(&mut writer, &message).await?,
+            _ = queues.input.notified() => {}
+            _ = queues.bulk.notified() => {}
+            Some(message) = queues.files.recv() => write_frame(&mut writer, &message).await?,
         }
     }
     writer.shutdown().await
 }
 
-async fn write_frame(writer: &mut OwnedWriteHalf, message: &WireMessage) -> io::Result<()> {
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &WireMessage,
+) -> io::Result<()> {
     let payload = encode_message(message)?;
     if payload.len() > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -290,26 +464,54 @@ async fn write_frame(writer: &mut OwnedWriteHalf, message: &WireMessage) -> io::
             "outgoing frame exceeds maximum size",
         ));
     }
-    writer.write_u32(payload.len() as u32).await?;
-    writer.write_all(&payload).await?;
+    // One write per frame: a QUIC stream sends each write as soon as it can.
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    writer.write_all(&frame).await?;
     writer.flush().await
+}
+
+/// Dials `address`: QUIC through `endpoint` when given, else plain TCP.
+async fn dial(endpoint: Option<quinn::Endpoint>, address: SocketAddr) -> Result<Link, String> {
+    match endpoint {
+        Some(endpoint) => {
+            let connecting = endpoint
+                .connect(address, secure::SERVER_NAME)
+                .map_err(|error| error.to_string())?;
+            let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                .await
+                .map_err(|_| "connection timed out".to_owned())?
+                .map_err(|error| error.to_string())?;
+            // The stream reaches the peer with its first frame (our hello).
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Link::Quic(QuicStream {
+                connection,
+                send,
+                recv,
+            }))
+        }
+        None => tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+            .await
+            .map_err(|_| "connection timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()))
+            .map(Link::Tcp),
+    }
 }
 
 /// Dials the data link for session `session` (see `DataInvite`).
 pub fn connect_data_in_background(
     session: u64,
     token: u64,
+    endpoint: Option<quinn::Endpoint>,
     address: SocketAddr,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) {
     tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            TcpStream::connect(address),
-        )
-        .await
-        .map_err(|_| "connection timed out".to_owned())
-        .and_then(|result| result.map_err(|error| error.to_string()));
+        let result = dial(endpoint, address).await;
         let _ = events.send(ConnectionEvent::DataConnectResult {
             session,
             token,
@@ -320,17 +522,35 @@ pub fn connect_data_in_background(
 
 pub fn connect_in_background(
     peer_id: String,
+    endpoint: Option<quinn::Endpoint>,
     address: SocketAddr,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) {
     tokio::spawn(async move {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            TcpStream::connect(address),
-        )
-        .await
-        .map_err(|_| "connection timed out".to_owned())
-        .and_then(|result| result.map_err(|error| error.to_string()));
+        let result = dial(endpoint, address).await;
         let _ = events.send(ConnectionEvent::ConnectResult { peer_id, result });
+    });
+}
+
+/// Completes a QUIC connection that arrived at an endpoint and waits for the
+/// stream its dialer opens, then hands both to the runtime.
+pub fn accept_in_background(
+    incoming: quinn::Incoming,
+    bulk: bool,
+    events: mpsc::UnboundedSender<ConnectionEvent>,
+) {
+    tokio::spawn(async move {
+        let accepted = async {
+            let connection = incoming.await.ok()?;
+            let (send, recv) = connection.accept_bi().await.ok()?;
+            Some(Link::Quic(QuicStream {
+                connection,
+                send,
+                recv,
+            }))
+        };
+        if let Ok(Some(link)) = tokio::time::timeout(CONNECT_TIMEOUT * 2, accepted).await {
+            let _ = events.send(ConnectionEvent::Accepted { link, bulk });
+        }
     });
 }

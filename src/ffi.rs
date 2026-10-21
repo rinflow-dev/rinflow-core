@@ -15,9 +15,13 @@ pub struct LcCore {
 /// Version 6 moves clipboards to a data link and adds files:
 /// `lc_core_accept_files`, `lc_core_cancel_files`, config keys `files`,
 /// `download_directory`, `max_auto_receive_bytes` and the `files_*` events.
+/// Version 7 adds QUIC with TLS and pairing: config keys `identity_path`,
+/// `trusted_peers`, `require_pairing`; `lc_core_accept_pairing`,
+/// `lc_core_reject_pairing`, `lc_core_unpair`, `lc_core_set_require_pairing`;
+/// events `pairing_requested`, `paired`, `pairing_ended`, `unpaired`.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    6
+    7
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -274,10 +278,46 @@ pub unsafe extern "C" fn lc_core_cancel_files(core: *mut LcCore, transfer: u32) 
     send_command(core, Command::CancelFiles(transfer))
 }
 
+/// Pairing: the user checked the code of `pairing_requested` and accepts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_accept_pairing(core: *mut LcCore, peer_id: *const c_char) -> bool {
+    match unsafe { string_argument(peer_id) } {
+        Some(peer_id) => send_command(core, Command::AcceptPairing(peer_id)),
+        None => false,
+    }
+}
+
+/// Pairing: the user declines; the connection closes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_reject_pairing(core: *mut LcCore, peer_id: *const c_char) -> bool {
+    match unsafe { string_argument(peer_id) } {
+        Some(peer_id) => send_command(core, Command::RejectPairing(peer_id)),
+        None => false,
+    }
+}
+
+/// Forgets a paired peer's certificate (`unpaired`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_unpair(core: *mut LcCore, peer_id: *const c_char) -> bool {
+    match unsafe { string_argument(peer_id) } {
+        Some(peer_id) => send_command(core, Command::Unpair(peer_id)),
+        None => false,
+    }
+}
+
+/// Only paired peers may connect (config key `require_pairing`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_require_pairing(core: *mut LcCore, required: bool) -> bool {
+    send_command(core, Command::SetRequirePairing(required))
+}
+
 /// Lets peers drive this device (the default), or stops them. Added within
 /// version 6 (nothing else changed).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lc_core_set_remote_control_allowed(core: *mut LcCore, allowed: bool) -> bool {
+pub unsafe extern "C" fn lc_core_set_remote_control_allowed(
+    core: *mut LcCore,
+    allowed: bool,
+) -> bool {
     send_command(core, Command::SetRemoteControlAllowed(allowed))
 }
 

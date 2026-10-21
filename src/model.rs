@@ -30,13 +30,18 @@ pub const DATA_LINK_CAPABILITIES: u64 = CAPABILITY_CLIPBOARD | CAPABILITY_FILES;
 /// Gives control back when told to (`ControlRevoke`). Sent only to peers
 /// with this bit, for the same reason as the data-link messages.
 pub const CAPABILITY_CONTROL_REVOKE: u64 = 1 << 8;
+/// Takes connections over QUIC with TLS 1.3 on the control port (UDP), and
+/// pairs (`PairRequest`/`PairAccept`/`PairReject`). Peers without it are
+/// reached over plain TCP, unencrypted (see `transport.rs`).
+pub const CAPABILITY_QUIC: u64 = 1 << 9;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
     | CAPABILITY_HID_KEYBOARD
-    | CAPABILITY_CONTROL_REVOKE;
+    | CAPABILITY_CONTROL_REVOKE
+    | CAPABILITY_QUIC;
 
 pub const LC_INPUT_MOUSE_MOVE: u32 = 1;
 pub const LC_INPUT_MOUSE_BUTTON_DOWN: u32 = 2;
@@ -105,6 +110,22 @@ pub struct CoreConfig {
     pub displays: Vec<Display>,
     /// Placements saved by the shell from earlier `placement_changed` events.
     pub placements: Vec<PlacementRecord>,
+    /// Where this device's key pair and certificate live (PEM), created on
+    /// first start. Without it the core makes a new identity every start,
+    /// so paired peers would no longer recognise it.
+    pub identity_path: Option<String>,
+    /// Peers the user paired, saved by the shell from `paired` events.
+    pub trusted_peers: Vec<TrustedPeer>,
+    /// Only paired peers may connect: others are asked to pair first, and
+    /// peers without QUIC (unencrypted) are refused.
+    pub require_pairing: bool,
+}
+
+/// A paired peer: its device ID and the fingerprint of its certificate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrustedPeer {
+    pub peer_id: String,
+    pub fingerprint: String,
 }
 
 /// Where a peer sits in this device's space. `offset: None` records that the
@@ -134,6 +155,9 @@ impl Default for CoreConfig {
             max_auto_receive_bytes: DEFAULT_MAX_AUTO_RECEIVE_BYTES,
             displays: Vec::new(),
             placements: Vec::new(),
+            identity_path: None,
+            trusted_peers: Vec::new(),
+            require_pairing: false,
         }
     }
 }
@@ -181,6 +205,11 @@ impl CoreConfig {
         {
             return Err("placement offsets must be finite".to_owned());
         }
+        if self.trusted_peers.iter().any(|peer| {
+            peer.fingerprint.len() != 64 || !peer.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Err("trusted peer fingerprints must be 64 hex digits".to_owned());
+        }
         Ok(())
     }
 }
@@ -199,20 +228,33 @@ pub struct Announcement {
     /// Lets devices that have not connected yet draw this one to scale.
     #[serde(default)]
     pub displays: Vec<Display>,
+    /// SHA-256 of this device's certificate, with `CAPABILITY_QUIC`. Only a
+    /// hint (anyone can announce anything): connections check the
+    /// certificate itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl Announcement {
-    pub fn from_config(config: &CoreConfig, displays: &[Display]) -> Self {
+    /// `capabilities` as this device offers them (without QUIC if its
+    /// endpoints could not be opened).
+    pub fn from_config(
+        config: &CoreConfig,
+        displays: &[Display],
+        capabilities: u64,
+        fingerprint: Option<&str>,
+    ) -> Self {
         Self {
             product: "linkcursor".to_owned(),
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: config.advertised_capabilities(),
+            capabilities,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             platform: config.platform.clone(),
             control_port: config.control_port,
             displays: displays.to_vec(),
+            fingerprint: fingerprint.map(str::to_owned),
         }
     }
 
@@ -243,6 +285,9 @@ pub struct Peer {
     pub capabilities: u64,
     /// As last described by the peer, in its own logical space.
     pub displays: Vec<Display>,
+    /// The certificate fingerprint it announces (QUIC peers), unverified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     #[serde(skip)]
     pub socket_address: SocketAddr,
     #[serde(skip)]
@@ -390,8 +435,11 @@ pub enum WireMessage {
     },
     /// Control connection, from the side that accepted it: open the data
     /// link with this token. Only to peers sharing a data-link capability.
+    /// Over QUIC, `port` is the inviting side's bulk endpoint (UDP); over
+    /// TCP the data link goes to the control port.
     DataInvite {
         token: u64,
+        port: Option<u16>,
     },
     /// First frame of a data link, from the side that dialed it.
     DataHello {
@@ -422,14 +470,23 @@ pub enum WireMessage {
     ControlRevoke {
         handoff: bool,
     },
+    /// QUIC only, after `Hello`: the sender does not know the receiver's
+    /// certificate and asks to pair. Both users compare the code their
+    /// devices show and accept.
+    PairRequest,
+    /// The sender's user accepted pairing (or the sender already trusts the
+    /// receiver). Paired once both sides have sent it.
+    PairAccept,
+    /// The sender's user declined; the connection closes.
+    PairReject,
 }
 
 impl WireMessage {
-    pub fn hello(config: &CoreConfig) -> Self {
+    pub fn hello(config: &CoreConfig, capabilities: u64) -> Self {
         Self::Hello {
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
-            capabilities: config.advertised_capabilities(),
+            capabilities,
             device_id: config.device_id.clone(),
             device_name: config.device_name.clone(),
             control_port: config.control_port,

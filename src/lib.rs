@@ -7,8 +7,10 @@ pub mod layout;
 mod model;
 mod protocol;
 mod qos;
+mod quic;
 mod remap;
 mod runtime;
+mod secure;
 mod transport;
 
 #[cfg(target_os = "android")]
@@ -28,7 +30,7 @@ pub use model::{
     LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL, LC_MODIFIER_LEFT_COMMAND, LC_MODIFIER_LEFT_CONTROL,
     LC_MODIFIER_LEFT_OPTION, LC_MODIFIER_LEFT_SHIFT, LC_MODIFIER_OPTION, LC_MODIFIER_RIGHT_COMMAND,
     LC_MODIFIER_RIGHT_CONTROL, LC_MODIFIER_RIGHT_OPTION, LC_MODIFIER_RIGHT_SHIFT,
-    LC_MODIFIER_SHIFT, LcInputEvent, PlacementRecord,
+    LC_MODIFIER_SHIFT, LcInputEvent, PlacementRecord, TrustedPeer,
 };
 
 #[cfg(test)]
@@ -42,7 +44,7 @@ mod tests {
         OutboundInputQueue, PlatformEntry, PlatformInputQueue, PushOutcome, RemoteInputState,
     };
     use super::layout::{Display, Offset, Side};
-    use super::model::PlacementRecord;
+    use super::model::{self, PlacementRecord, TrustedPeer};
     use super::model::{
         Announcement, CAPABILITY_CONTROL_REVOKE, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION,
         LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP,
@@ -52,6 +54,7 @@ mod tests {
     };
     use super::protocol::{decode_message, encode_message};
     use super::remap::ShortcutRemap;
+    use super::runtime::trust as runtime_reason;
     use super::runtime::{Command, CoreThread, EventSink};
     use serde_json::Value;
     use std::net::{TcpListener, UdpSocket};
@@ -254,7 +257,17 @@ mod tests {
     #[test]
     fn data_link_and_file_messages_round_trip() {
         for message in [
-            WireMessage::DataInvite { token: 42 },
+            WireMessage::DataInvite {
+                token: 42,
+                port: None,
+            },
+            WireMessage::DataInvite {
+                token: 42,
+                port: Some(50_123),
+            },
+            WireMessage::PairRequest,
+            WireMessage::PairAccept,
+            WireMessage::PairReject,
             WireMessage::DataHello {
                 device_id: "dev".into(),
                 token: 7,
@@ -294,13 +307,12 @@ mod tests {
 
     #[test]
     fn announcement_negotiates_only_overlapping_protocol_versions() {
-        let mut announcement = Announcement::from_config(
-            &CoreConfig {
-                device_id: "one".to_owned(),
-                ..CoreConfig::default()
-            },
-            &[],
-        );
+        let config = CoreConfig {
+            device_id: "one".to_owned(),
+            ..CoreConfig::default()
+        };
+        let mut announcement =
+            Announcement::from_config(&config, &[], config.advertised_capabilities(), None);
         assert!(announcement.is_compatible());
         assert_eq!(
             announcement.negotiated_version(),
@@ -1174,6 +1186,268 @@ mod tests {
         assert!(received(&a, Duration::from_millis(300)).is_empty());
         a.thread.send(Command::SendInput(motion(4.0))).unwrap();
         assert_eq!(received(&b, Duration::from_millis(400)), vec![4.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    /// This core's certificate fingerprint, from its `started` event (call
+    /// before anything else reads its events).
+    fn started_fingerprint(core: &TestCore) -> String {
+        let started = wait_for_event(&core.events, Duration::from_secs(3), |event| {
+            event["event"] == "started"
+        });
+        started["fingerprint"]
+            .as_str()
+            .expect("a QUIC identity")
+            .to_owned()
+    }
+
+    fn wait_connected_event(core: &TestCore, peer_id: &str) -> Value {
+        wait_for_event(&core.events, Duration::from_secs(6), |event| {
+            event["event"] == "connected" && event["peer"]["id"] == peer_id
+        })
+    }
+
+    #[test]
+    fn sessions_run_encrypted_over_quic_and_know_the_peer_certificate() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("quic-a", discovery_port);
+        let mut b = test_core("quic-b", discovery_port);
+        let a_fingerprint = started_fingerprint(&a);
+        let b_fingerprint = started_fingerprint(&b);
+        wait_for_peers(&a, &["quic-b"]);
+        a.thread.send(Command::Connect("quic-b".into())).unwrap();
+
+        let on_a = wait_connected_event(&a, "quic-b");
+        assert_eq!(on_a["encrypted"], true);
+        assert_eq!(on_a["paired"], false);
+        assert_eq!(on_a["fingerprint"], b_fingerprint.as_str());
+        let on_b = wait_connected_event(&b, "quic-a");
+        assert_eq!(on_b["fingerprint"], a_fingerprint.as_str());
+
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![1.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn devices_that_require_pairing_pair_by_comparing_codes() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let require = |config: &mut CoreConfig| config.require_pairing = true;
+        let mut a = test_core_with("pair-a", discovery_port, require);
+        let mut b = test_core_with("pair-b", discovery_port, require);
+        let a_fingerprint = started_fingerprint(&a);
+        let b_fingerprint = started_fingerprint(&b);
+        wait_for_peers(&a, &["pair-b"]);
+        a.thread.send(Command::Connect("pair-b".into())).unwrap();
+
+        // Both devices show the same code, each about the other.
+        let request = |event: &Value| event["event"] == "pairing_requested";
+        let on_a = wait_for_event(&a.events, Duration::from_secs(6), request);
+        let on_b = wait_for_event(&b.events, Duration::from_secs(6), request);
+        assert_eq!(on_a["peer_id"], "pair-b");
+        assert_eq!(on_b["peer_id"], "pair-a");
+        assert_eq!(on_a["code"], on_b["code"]);
+        assert_eq!(on_a["code"].as_str().unwrap().len(), 6);
+        assert_eq!(on_a["fingerprint"], b_fingerprint.as_str());
+
+        // Nothing flows before both users accepted.
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        b.thread
+            .send(Command::AcceptPairing("pair-a".into()))
+            .unwrap();
+        assert!(received(&b, Duration::from_millis(300)).is_empty());
+        assert!(events_named(&a, "connected").is_empty());
+
+        a.thread
+            .send(Command::AcceptPairing("pair-b".into()))
+            .unwrap();
+        let paired = wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "paired"
+        });
+        assert_eq!(paired["fingerprint"], b_fingerprint.as_str());
+        let connected = wait_connected_event(&a, "pair-b");
+        assert_eq!(connected["paired"], true);
+        let paired = wait_for_event(&b.events, Duration::from_secs(3), |event| {
+            event["event"] == "paired"
+        });
+        assert_eq!(paired["fingerprint"], a_fingerprint.as_str());
+        wait_connected_event(&b, "pair-a");
+
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![2.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_device_that_does_not_require_pairing_still_pairs_when_asked() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let require = |config: &mut CoreConfig| config.require_pairing = true;
+        let mut a = test_core_with("ask-a", discovery_port, require);
+        let mut b = test_core("ask-b", discovery_port);
+        wait_for_peers(&a, &["ask-b"]);
+        a.thread.send(Command::Connect("ask-b".into())).unwrap();
+
+        // B lets A in at once, then shows the code A asked it to check.
+        let request = |event: &Value| event["event"] == "pairing_requested";
+        let on_a = wait_for_event(&a.events, Duration::from_secs(6), request);
+        let on_b = wait_for_event(&b.events, Duration::from_secs(6), request);
+        assert_eq!(on_a["code"], on_b["code"]);
+        b.thread
+            .send(Command::AcceptPairing("ask-a".into()))
+            .unwrap();
+        a.thread
+            .send(Command::AcceptPairing("ask-b".into()))
+            .unwrap();
+        for core in [&a, &b] {
+            wait_for_event(&core.events, Duration::from_secs(3), |event| {
+                event["event"] == "paired"
+            });
+        }
+        wait_connected_event(&a, "ask-b");
+        a.thread.send(Command::SendInput(motion(4.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![4.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn declining_pairing_closes_the_connection_on_both_sides() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let require = |config: &mut CoreConfig| config.require_pairing = true;
+        let mut a = test_core_with("decline-a", discovery_port, require);
+        let mut b = test_core_with("decline-b", discovery_port, require);
+        wait_for_peers(&a, &["decline-b"]);
+        a.thread.send(Command::Connect("decline-b".into())).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(6), |event| {
+            event["event"] == "pairing_requested"
+        });
+        b.thread
+            .send(Command::RejectPairing("decline-a".into()))
+            .unwrap();
+        let ended = wait_for_event(&a.events, Duration::from_secs(4), |event| {
+            event["event"] == "pairing_ended"
+        });
+        assert_eq!(ended["peer_id"], "decline-b");
+        // The side that was declined is told so, not just that the
+        // connection closed.
+        assert_eq!(ended["reason"], runtime_reason::PAIRING_REJECTED_BY_PEER);
+        let disconnected = wait_for_event(&a.events, Duration::from_secs(4), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "decline-b"
+        });
+        assert_eq!(
+            disconnected["reason"],
+            runtime_reason::PAIRING_REJECTED_BY_PEER
+        );
+        assert!(events_named(&a, "paired").is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn paired_devices_reconnect_without_asking_and_a_changed_identity_is_refused() {
+        let _network = network_test();
+        let directory =
+            std::env::temp_dir().join(format!("linkcursor-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = |name: &str| directory.join(name).to_string_lossy().into_owned();
+        let identity = |name: &str| {
+            crate::secure::Identity::load_or_create(Some(std::path::Path::new(&path(name))), name)
+                .unwrap()
+                .fingerprint
+        };
+        let (a_fingerprint, b_fingerprint) = (identity("trust-a"), identity("trust-b"));
+        let trusting = |own: &'static str, other: &'static str, fingerprint: String| {
+            let identity_path = path(own);
+            move |config: &mut CoreConfig| {
+                config.require_pairing = true;
+                config.identity_path = Some(identity_path);
+                config.trusted_peers = vec![TrustedPeer {
+                    peer_id: other.to_owned(),
+                    fingerprint,
+                }];
+            }
+        };
+
+        // Paired before (the shell passes what `paired` reported): straight in.
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with(
+            "trust-a",
+            discovery_port,
+            trusting("trust-a", "trust-b", b_fingerprint.clone()),
+        );
+        let mut b = test_core_with(
+            "trust-b",
+            discovery_port,
+            trusting("trust-b", "trust-a", a_fingerprint.clone()),
+        );
+        wait_for_peers(&a, &["trust-b"]);
+        a.thread.send(Command::Connect("trust-b".into())).unwrap();
+        let connected = wait_connected_event(&a, "trust-b");
+        assert_eq!(connected["paired"], true);
+        assert!(events_named(&a, "pairing_requested").is_empty());
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+
+        // A device claiming to be a paired one with another certificate.
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with(
+            "trust-a",
+            discovery_port,
+            trusting("trust-a", "trust-b", "00".repeat(32)),
+        );
+        let mut b = test_core_with(
+            "trust-b",
+            discovery_port,
+            trusting("trust-b", "trust-a", a_fingerprint),
+        );
+        wait_for_peers(&a, &["trust-b"]);
+        a.thread.send(Command::Connect("trust-b".into())).unwrap();
+        let refused = wait_for_event(&a.events, Duration::from_secs(6), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "trust-b"
+        });
+        assert_eq!(refused["reason"], runtime_reason::IDENTITY_CHANGED);
+        assert!(events_named(&a, "connected").is_empty());
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn older_peers_connect_over_tcp_unless_pairing_is_required() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let older = |config: &mut CoreConfig| config.capabilities &= !model::CAPABILITY_QUIC;
+        let mut a = test_core("legacy-a", discovery_port);
+        let mut b = test_core_with("legacy-b", discovery_port, older);
+        wait_for_peers(&a, &["legacy-b"]);
+        a.thread.send(Command::Connect("legacy-b".into())).unwrap();
+        let connected = wait_connected_event(&a, "legacy-b");
+        assert_eq!(connected["encrypted"], false);
+        a.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![3.0]);
+
+        // Requiring pairing ends the unencrypted session and refuses new ones.
+        a.thread.send(Command::SetRequirePairing(true)).unwrap();
+        wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "legacy-b"
+        });
+        a.thread.send(Command::Connect("legacy-b".into())).unwrap();
+        let refused = wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "legacy-b"
+        });
+        assert_eq!(refused["reason"], runtime_reason::UNENCRYPTED_REFUSED);
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();

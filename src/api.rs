@@ -90,8 +90,28 @@ impl Core {
     /// that drives it, or starts to, is told to give control back and none
     /// of its input is played. This device can still drive peers.
     pub fn set_remote_control_allowed(&self, allowed: bool) -> Result<(), String> {
-        self.thread
-            .send(Command::SetRemoteControlAllowed(allowed))
+        self.thread.send(Command::SetRemoteControlAllowed(allowed))
+    }
+
+    /// The user checked the code of `pairing_requested` and accepts.
+    pub fn accept_pairing(&self, peer_id: &str) -> Result<(), String> {
+        self.thread.send(Command::AcceptPairing(peer_id.to_owned()))
+    }
+
+    /// The user declines pairing; the connection closes.
+    pub fn reject_pairing(&self, peer_id: &str) -> Result<(), String> {
+        self.thread.send(Command::RejectPairing(peer_id.to_owned()))
+    }
+
+    /// Forgets a paired peer (`unpaired`); the shell drops it from
+    /// `CoreConfig::trusted_peers`.
+    pub fn unpair(&self, peer_id: &str) -> Result<(), String> {
+        self.thread.send(Command::Unpair(peer_id.to_owned()))
+    }
+
+    /// Only paired peers may connect (`CoreConfig::require_pairing`).
+    pub fn set_require_pairing(&self, required: bool) -> Result<(), String> {
+        self.thread.send(Command::SetRequirePairing(required))
     }
 
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {

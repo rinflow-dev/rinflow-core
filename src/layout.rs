@@ -18,6 +18,10 @@ pub const MAX_DISPLAYS: usize = 16;
 pub const MIN_OVERLAP: f64 = 64.0;
 /// A placement this close to an alignment (ends or centres) snaps to it.
 const SNAP_DISTANCE: f64 = 24.0;
+/// Among spots about as near to a drop, the one sharing more edge wins: each
+/// point of shared edge counts as this much less distance. A rough drop then
+/// lands where the desktops fit snugly, not beside a small gap.
+const SNUG_BONUS: f64 = 0.05;
 /// Edges this close count as touching (rounding of scaled coordinates).
 const TOUCH_TOLERANCE: f64 = 0.5;
 
@@ -245,53 +249,93 @@ pub fn is_valid_placement(
     !collides && !portals(local, peer, offset).is_empty()
 }
 
-/// Moves a dropped placement to the nearest valid spot: touching one of this
-/// device's display edges with at least [`MIN_OVERLAP`] of shared edge, snapped
-/// to aligned ends or centres when close, and clear of other placed peers.
+/// Moves a dropped placement to the nearest valid spot: one of the peer's
+/// displays against an edge of one of this device's displays, sharing at
+/// least [`MIN_OVERLAP`] of it, snapped to aligned ends or centres when
+/// close, and clear of this desktop and of other placed peers.
+///
+/// Each peer display is tried against each local edge, not the peer's
+/// bounding box: a peer with displays of different sizes (an L shape) has
+/// edges inside its bounding box, and those are the ones that touch. A spot
+/// where another of its displays would collide is also tried moved along the
+/// edge just clear of what it hits.
 pub fn snap(
     local: &[Display],
     peer: &[Display],
     proposed: Offset,
     obstacles: &[Display],
 ) -> Option<Offset> {
-    let (peer_left, peer_top, peer_right, peer_bottom) = bounds(peer)?;
-    let (peer_width, peer_height) = (peer_right - peer_left, peer_bottom - peer_top);
-    // Where the peer's bounding box would be at the proposed offset.
-    let (want_left, want_top) = (peer_left + proposed.x, peer_top + proposed.y);
-
     let mut best: Option<(f64, Offset)> = None;
+    let mut consider = |candidate: Offset| {
+        if !is_valid_placement(local, peer, candidate, obstacles) {
+            return;
+        }
+        let shared: f64 = portals(local, peer, candidate)
+            .iter()
+            .map(|portal| portal.to - portal.from)
+            .sum();
+        let score =
+            (candidate.x - proposed.x).hypot(candidate.y - proposed.y) - SNUG_BONUS * shared;
+        if best.is_none_or(|(best_score, _)| score < best_score) {
+            best = Some((score, candidate));
+        }
+    };
     for l in local {
-        for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
-            let (left, top) = match side {
-                Side::Right | Side::Left => {
-                    let left = if side == Side::Right {
-                        l.right()
+        for p in peer {
+            // Where this display would be at the proposed offset.
+            let (want_x, want_y) = (p.x + proposed.x, p.y + proposed.y);
+            for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+                // `across` puts the display against the edge; `along` is its
+                // position along the edge, which may slide.
+                let (across, along, length, edge_start, edge_length) = match side {
+                    Side::Right => (l.right(), want_y, p.height, l.y, l.height),
+                    Side::Left => (l.x - p.width, want_y, p.height, l.y, l.height),
+                    Side::Bottom => (l.bottom(), want_x, p.width, l.x, l.width),
+                    Side::Top => (l.y - p.height, want_x, p.width, l.x, l.width),
+                };
+                let offset_at = |along: f64| {
+                    if side.is_vertical() {
+                        Offset {
+                            x: across - p.x,
+                            y: along - p.y,
+                        }
                     } else {
-                        l.x - peer_width
-                    };
-                    let top = slide(want_top, peer_height, l.y, l.height);
-                    (left, top)
+                        Offset {
+                            x: along - p.x,
+                            y: across - p.y,
+                        }
+                    }
+                };
+                let slid = slide(along, length, edge_start, edge_length);
+                let candidate = offset_at(slid);
+                consider(candidate);
+
+                // Something in the way: just clear of it on either side, as
+                // long as the display still shares the edge.
+                let overlap = MIN_OVERLAP.min(length).min(edge_length);
+                let (lowest, highest) = (
+                    edge_start - length + overlap,
+                    edge_start + edge_length - overlap,
+                );
+                for placed in placed(peer, candidate) {
+                    for other in local
+                        .iter()
+                        .chain(obstacles)
+                        .filter(|other| placed.overlaps(other))
+                    {
+                        let shifts = if side.is_vertical() {
+                            [other.y - placed.bottom(), other.bottom() - placed.y]
+                        } else {
+                            [other.x - placed.right(), other.right() - placed.x]
+                        };
+                        for shift in shifts {
+                            let moved = slid + shift;
+                            if (lowest..=highest).contains(&moved) {
+                                consider(offset_at(moved));
+                            }
+                        }
+                    }
                 }
-                Side::Bottom | Side::Top => {
-                    let top = if side == Side::Bottom {
-                        l.bottom()
-                    } else {
-                        l.y - peer_height
-                    };
-                    let left = slide(want_left, peer_width, l.x, l.width);
-                    (left, top)
-                }
-            };
-            let candidate = Offset {
-                x: left - peer_left,
-                y: top - peer_top,
-            };
-            if !is_valid_placement(local, peer, candidate, obstacles) {
-                continue;
-            }
-            let distance = (left - want_left).hypot(top - want_top);
-            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
-                best = Some((distance, candidate));
             }
         }
     }
@@ -654,6 +698,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapped.y, -300.0);
+    }
+
+    #[test]
+    fn an_l_shaped_peer_snaps_by_its_own_displays() {
+        // A Mac mini: a wide display, and a portrait one on its left that
+        // reaches 480 points lower. Its bounding box is not a display.
+        let pc = [display(0.0, 0.0, 1440.0, 960.0)];
+        let mac = [
+            display(0.0, 0.0, 2560.0, 1440.0),
+            display(-1080.0, 0.0, 1080.0, 1920.0),
+        ];
+        let snapped_to = |x: f64, y: f64| snap(&pc, &mac, Offset { x, y }, &[]).unwrap();
+
+        // Dropped centred above the PC, a little high: the wide display sits
+        // on the PC's top edge (centres aligned), the portrait one beside it.
+        let above = snapped_to((1440.0 - 2560.0) / 2.0, -1500.0);
+        assert_eq!(
+            above,
+            Offset {
+                x: -560.0,
+                y: -1440.0
+            }
+        );
+        let found = portals(&pc, &mac, above);
+        assert_eq!(
+            (
+                found[0].side,
+                found[0].peer_display,
+                found[0].from,
+                found[0].to
+            ),
+            (Side::Top, 0, 0.0, 1440.0)
+        );
+
+        // Dropped above but too far right for the portrait display to clear
+        // the PC: moved along the edge until it does.
+        let shifted = snapped_to(300.0, -1490.0);
+        assert_eq!(shifted, Offset { x: 0.0, y: -1440.0 });
+        assert!(is_valid_placement(&pc, &mac, shifted, &[]));
+
+        // To the right, the portrait display's left edge touches.
+        let right = snapped_to(2600.0, 0.0);
+        assert_eq!(
+            right,
+            Offset {
+                x: 1440.0 + 1080.0,
+                y: 0.0
+            }
+        );
+        assert_eq!(portals(&pc, &mac, right)[0].peer_display, 1);
+
+        // Below, both displays start at the same height and touch.
+        let below = snapped_to(-560.0, 1000.0);
+        assert_eq!(below.y, 960.0);
+        assert!(is_valid_placement(&pc, &mac, below, &[]));
+    }
+
+    #[test]
+    fn every_drop_lands_on_a_valid_spot_with_a_usable_edge() {
+        let pc = [display(0.0, 0.0, 1440.0, 960.0)];
+        let mac = [
+            display(0.0, 0.0, 2560.0, 1440.0),
+            display(-1080.0, 0.0, 1080.0, 1920.0),
+        ];
+        for x in (-6000..=4000).step_by(250) {
+            for y in (-4000..=3000).step_by(250) {
+                let proposed = Offset {
+                    x: f64::from(x),
+                    y: f64::from(y),
+                };
+                let snapped = snap(&pc, &mac, proposed, &[]).expect("a spot");
+                assert!(is_valid_placement(&pc, &mac, snapped, &[]), "{proposed:?}");
+                let longest = portals(&pc, &mac, snapped)
+                    .iter()
+                    .map(|portal| portal.to - portal.from)
+                    .fold(0.0, f64::max);
+                assert!(
+                    longest >= MIN_OVERLAP,
+                    "{proposed:?} -> {snapped:?}: {longest}"
+                );
+            }
+        }
     }
 
     #[test]

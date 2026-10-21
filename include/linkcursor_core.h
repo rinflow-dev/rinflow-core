@@ -17,8 +17,12 @@
  *    lc_core_accept_files, lc_core_cancel_files, config keys "files",
  *    "download_directory", "max_auto_receive_bytes", events "files_offered",
  *    "files_progress", "files_received", "files_failed".
+ * 7: QUIC with TLS 1.3 and pairing: config keys "identity_path",
+ *    "trusted_peers", "require_pairing"; lc_core_accept_pairing,
+ *    lc_core_reject_pairing, lc_core_unpair, lc_core_set_require_pairing;
+ *    events "pairing_requested", "paired", "pairing_ended", "unpaired".
  */
-#define LC_CORE_ABI_VERSION 6
+#define LC_CORE_ABI_VERSION 7
 
 #ifdef __cplusplus
 extern "C" {
@@ -166,6 +170,36 @@ bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
  */
 bool lc_core_accept_files(LcCore *core, uint32_t transfer);
 bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
+
+/*
+ * Security (version 7). Peers with QUIC connect over UDP (the control port's
+ * number) with TLS 1.3; both sides show a self-signed certificate, known by
+ * its SHA-256 fingerprint. Older peers connect over plain TCP, unencrypted.
+ *
+ * Config:
+ *   "identity_path": file for this device's key and certificate (PEM),
+ *       created on first start; keep it, or paired peers no longer know
+ *       this device. The fingerprint is in "started": {"fingerprint":…}.
+ *   "trusted_peers": [{"peer_id":…,"fingerprint":…}], saved from "paired".
+ *   "require_pairing": only paired peers may connect; unknown ones pair
+ *       first, unencrypted ones are refused.
+ *
+ * Pairing: both devices show the same six digits; each user compares them.
+ *   {"event":"pairing_requested","peer_id":…,"name":…,"platform":…,
+ *    "code":"482917","fingerprint":…}   show the code; then
+ *   lc_core_accept_pairing(core, peer_id) or lc_core_reject_pairing.
+ *   {"event":"paired","peer_id":…,"fingerprint":…}   save it
+ *   {"event":"pairing_ended","peer_id":…,"reason":…}  declined, timed out
+ *       or the connection ended: close the dialog
+ * A paired peer whose certificate changed is refused ("disconnected" with
+ * the reason "the device's identity changed").
+ * "connected" carries "encrypted", "paired" and the peer's "fingerprint".
+ */
+bool lc_core_accept_pairing(LcCore *core, const char *peer_id);
+bool lc_core_reject_pairing(LcCore *core, const char *peer_id);
+/* Forgets a paired peer: {"event":"unpaired","peer_id":…}. */
+bool lc_core_unpair(LcCore *core, const char *peer_id);
+bool lc_core_set_require_pairing(LcCore *core, bool required);
 
 enum {
     LC_INPUT_MOUSE_MOVE = 1,

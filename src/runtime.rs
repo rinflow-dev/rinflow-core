@@ -1,17 +1,21 @@
 mod data;
+pub(crate) mod trust;
 
 use crate::clipboard::{Clipboard, ClipboardAssembler};
 use crate::files::Offer;
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP,
-    LcInputEvent, Peer, PlacementRecord, WireMessage, negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CAPABILITY_QUIC, CoreConfig,
+    DISCOVERY_GROUP, LcInputEvent, Peer, PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::qos::TrafficClass;
+use crate::quic::QuicEndpoints;
 use crate::remap::ShortcutRemap;
+use crate::secure::Identity;
 use crate::transport::{
-    ActiveConnection, ConnectionEvent, connect_in_background, spawn_connection,
+    ActiveConnection, ConnectionEvent, Link, accept_in_background, connect_in_background,
+    spawn_connection,
 };
 use data::{DataLink, Download};
 use serde_json::{Value, json};
@@ -21,8 +25,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
+use trust::{Admission, Pairing};
 
 /// Sessions (established or still handshaking) a core keeps at once. Bounds
 /// what an unauthenticated device on the network can make us hold open.
@@ -92,6 +97,14 @@ pub enum Command {
     CancelFiles(u32),
     /// Lets peers drive this device (the default), or stops them.
     SetRemoteControlAllowed(bool),
+    /// The user confirmed the code shown for pairing with this peer.
+    AcceptPairing(String),
+    /// The user declined pairing with this peer.
+    RejectPairing(String),
+    /// Forgets a paired peer's certificate.
+    Unpair(String),
+    /// Only paired peers may connect (see `CoreConfig::require_pairing`).
+    SetRequirePairing(bool),
     Stop,
 }
 
@@ -212,6 +225,42 @@ async fn run(
         }
     };
 
+    // QUIC with TLS: this device's identity and its two endpoints. Without
+    // them the core still works over plain TCP, unencrypted.
+    let identity = match Identity::load_or_create(
+        config.identity_path.as_deref().map(std::path::Path::new),
+        &config.device_id,
+    ) {
+        Ok(identity) => Some(identity),
+        Err(error) => {
+            sink.emit_error(format!("no encrypted connections: {error}"));
+            None
+        }
+    };
+    let quic = match &identity {
+        Some(identity) if config.capabilities & CAPABILITY_QUIC != 0 => {
+            match QuicEndpoints::bind(config.control_port, identity) {
+                Ok(endpoints) => Some(endpoints),
+                Err(error) => {
+                    sink.emit_error(format!("no encrypted connections: {error}"));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let capabilities = if quic.is_some() {
+        config.advertised_capabilities()
+    } else {
+        config.advertised_capabilities() & !CAPABILITY_QUIC
+    };
+    let fingerprint = quic
+        .as_ref()
+        .and(identity.as_ref())
+        .map(|identity| identity.fingerprint.clone());
+    let control_endpoint = quic.as_ref().map(|quic| quic.control.clone());
+    let bulk_endpoint = quic.as_ref().map(|quic| quic.bulk.clone());
+
     let multicast = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::from(DISCOVERY_GROUP),
         config.discovery_port,
@@ -234,8 +283,23 @@ async fn run(
         input_target: None,
         next_connection_id: 1,
         ping_sequence: 0,
-        announcement: serde_json::to_vec(&Announcement::from_config(&config, &config.displays))
-            .unwrap_or_default(),
+        announcement: serde_json::to_vec(&Announcement::from_config(
+            &config,
+            &config.displays,
+            capabilities,
+            fingerprint.as_deref(),
+        ))
+        .unwrap_or_default(),
+        capabilities,
+        fingerprint: fingerprint.clone(),
+        quic: quic.clone(),
+        trusted: config
+            .trusted_peers
+            .iter()
+            .map(|peer| (peer.peer_id.clone(), peer.fingerprint.to_ascii_lowercase()))
+            .collect(),
+        require_pairing: config.require_pairing,
+        peer_names: HashMap::new(),
         local_displays: config.displays.clone(),
         placements: config
             .placements
@@ -262,7 +326,8 @@ async fn run(
         "event": "started",
         "device_id": config.device_id,
         "control_port": config.control_port,
-        "discovery_port": config.discovery_port
+        "discovery_port": config.discovery_port,
+        "fingerprint": fingerprint
     }));
     state.publish_portals();
 
@@ -281,6 +346,10 @@ async fn run(
                     Some(Command::AcceptFiles(transfer)) => state.accept_files(transfer),
                     Some(Command::CancelFiles(transfer)) => state.cancel_files(transfer),
                     Some(Command::SetRemoteControlAllowed(allowed)) => state.set_remote_control_allowed(allowed),
+                    Some(Command::AcceptPairing(peer_id)) => state.accept_pairing(&peer_id),
+                    Some(Command::RejectPairing(peer_id)) => state.reject_pairing(&peer_id),
+                    Some(Command::Unpair(peer_id)) => state.unpair(&peer_id),
+                    Some(Command::SetRequirePairing(required)) => state.set_require_pairing(required),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -289,9 +358,15 @@ async fn run(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _address)) => state.accept(stream),
+                    Ok((stream, _address)) => state.accept(Link::Tcp(stream), false),
                     Err(error) => sink.emit_error(format!("accept failed: {error}")),
                 }
+            }
+            Some(incoming) = next_incoming(control_endpoint.as_ref()) => {
+                accept_in_background(incoming, false, state.connection_events.clone());
+            }
+            Some(incoming) = next_incoming(bulk_endpoint.as_ref()) => {
+                accept_in_background(incoming, true, state.connection_events.clone());
             }
             received = udp.recv_from(&mut buffer) => {
                 if let Ok((length, source)) = received {
@@ -315,15 +390,37 @@ async fn run(
     }
 
     state.close_all("core stopped");
+    if let Some(quic) = &quic {
+        quic.close();
+        // Lets the close reach peers before the runtime goes away.
+        let _ = tokio::time::timeout(Duration::from_millis(300), quic.control.wait_idle()).await;
+    }
     sink.emit_value(json!({ "event": "stopped" }));
 }
 
-/// One connection to a peer. It becomes established once the peer's
-/// `Hello` has been accepted.
+/// The next connection arriving at a QUIC endpoint; never, without one.
+async fn next_incoming(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One connection to a peer. It is handshaken once the peer's `Hello` has
+/// been accepted, and established once the peer is admitted: trusted, or
+/// paired, or let in without pairing (see `runtime/trust.rs`).
 struct Session {
     connection: ActiveConnection,
     /// We dialed this connection (as opposed to accepting it).
     outgoing: bool,
+    /// Came in on the bulk QUIC endpoint: can only be a data link.
+    bulk_endpoint: bool,
+    admission: Admission,
+    /// Pairing in progress (see `trust.rs`).
+    pairing: Option<Pairing>,
+    /// Placement, displays and data-link invitations the peer sent before
+    /// this side admitted it, replayed on admission.
+    held: Vec<WireMessage>,
     /// What the peer holds down on this device, released when it goes away.
     remote_input: RemoteInputState,
     /// The peer was told to stop driving this device (`ControlRevoke`). Its
@@ -347,8 +444,14 @@ struct Session {
 }
 
 impl Session {
-    fn established(&self) -> bool {
+    /// The peer's `Hello` was accepted: it is identified.
+    fn handshaken(&self) -> bool {
         self.connection.protocol_version.is_some()
+    }
+
+    /// Handshaken and admitted: input, clipboard and placements flow.
+    fn established(&self) -> bool {
+        self.handshaken() && self.admission == Admission::Admitted
     }
 
     fn peer_id(&self) -> Option<&str> {
@@ -370,6 +473,18 @@ struct Runtime<'a> {
     ping_sequence: u64,
     /// The discovery datagram; rebuilt when the displays change.
     announcement: Vec<u8>,
+    /// What this device offers (`CoreConfig::advertised_capabilities`,
+    /// without QUIC when its endpoints could not be opened).
+    capabilities: u64,
+    /// This device's certificate fingerprint, with QUIC.
+    fingerprint: Option<String>,
+    quic: Option<QuicEndpoints>,
+    /// Paired peers: device ID to certificate fingerprint.
+    trusted: HashMap<String, String>,
+    require_pairing: bool,
+    /// Name and control port each peer gave in its `Hello`, for peers that
+    /// discovery has not reported.
+    peer_names: HashMap<String, (String, u16)>,
     local_displays: Vec<Display>,
     /// By peer ID, in this device's space.
     placements: HashMap<String, PlacementRecord>,
@@ -443,20 +558,26 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
     }
 
+    /// A session whose peer is identified, admitted or not (still pairing).
+    fn handshaken_session(&self, peer_id: &str) -> Option<u64> {
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.handshaken() && session.peer_id() == Some(peer_id))
+            .map(|(id, _)| *id)
+    }
+
     /// The input target was already switched to `peer_id` through the input
     /// queue, ahead of this command.
     fn connect(&mut self, peer_id: String) {
         if let Some(id) = self.established_session(&peer_id) {
             // Already connected: repeat the event so a shell that lost track
             // of the session can resync.
-            let session = &self.sessions[&id];
-            let peer = self.peer_value(&peer_id, None, session.connection.capabilities);
-            self.sink.emit_value(json!({
-                "event": "connected",
-                "peer": peer,
-                "protocol_version": session.connection.protocol_version,
-                "capabilities": session.connection.capabilities
-            }));
+            self.emit_connected(id);
+            return;
+        }
+        if let Some(id) = self.handshaken_session(&peer_id) {
+            // Pairing: show the code again.
+            self.announce_pairing(id);
             return;
         }
         let pending = self
@@ -472,10 +593,24 @@ impl Runtime<'_> {
             return;
         };
         let address = peer.socket_address;
+        // QUIC (encrypted) when both sides have it; plain TCP otherwise,
+        // which a device that requires pairing does not even try.
+        let endpoint = match &self.quic {
+            Some(quic) if peer.capabilities & CAPABILITY_QUIC != 0 => Some(quic.dialer(false)),
+            _ if self.require_pairing => {
+                self.sink.emit_value(json!({
+                    "event": "disconnected",
+                    "peer_id": peer_id,
+                    "reason": trust::UNENCRYPTED_REFUSED
+                }));
+                return;
+            }
+            _ => None,
+        };
         self.sink
             .emit_value(json!({ "event": "connecting", "peer_id": peer_id }));
         self.dialing.insert(peer_id.clone());
-        connect_in_background(peer_id, address, self.connection_events.clone());
+        connect_in_background(peer_id, endpoint, address, self.connection_events.clone());
     }
 
     fn disconnect_target(&mut self) {
@@ -653,7 +788,9 @@ impl Runtime<'_> {
         }
     }
 
-    fn accept(&mut self, stream: TcpStream) {
+    /// A connection that came in: TCP on the control port, or QUIC on either
+    /// endpoint (`bulk`: the bulk one, data links only).
+    fn accept(&mut self, link: Link, bulk: bool) {
         // A new connection never replaces an existing session; at the limit
         // it is simply refused.
         if self.sessions.len() >= MAX_SESSIONS {
@@ -661,18 +798,29 @@ impl Runtime<'_> {
                 .emit_error("incoming connection refused: too many sessions");
             return;
         }
-        self.start_session(stream, None);
+        if matches!(link, Link::Tcp(_)) && self.require_pairing {
+            // Plain TCP is neither encrypted nor authenticated.
+            return;
+        }
+        self.start_session(link, None, bulk);
     }
 
-    fn start_session(&mut self, stream: TcpStream, peer_id: Option<String>) {
+    fn start_session(&mut self, link: Link, peer_id: Option<String>, bulk_endpoint: bool) {
         let id = self.next_connection_id;
+        if let (Some(quic), Link::Quic(_), Some(remote)) = (&self.quic, &link, link.remote()) {
+            quic.note_peer(remote, bulk_endpoint);
+        }
         // Accepted ones may turn out to be data links (see `attach_data_link`).
         match spawn_connection(
             id,
-            stream,
-            WireMessage::hello(self.config),
+            link,
+            WireMessage::hello(self.config, self.capabilities),
             self.connection_events.clone(),
-            TrafficClass::Interactive,
+            if bulk_endpoint {
+                TrafficClass::Bulk
+            } else {
+                TrafficClass::Interactive
+            },
         ) {
             Ok(mut connection) => {
                 self.next_connection_id += 1;
@@ -683,6 +831,10 @@ impl Runtime<'_> {
                     Session {
                         connection,
                         outgoing,
+                        bulk_endpoint,
+                        admission: Admission::Waiting,
+                        pairing: None,
+                        held: Vec::new(),
                         remote_input: RemoteInputState::default(),
                         revoked: false,
                         last_seen: Instant::now(),
@@ -720,6 +872,10 @@ impl Runtime<'_> {
             port: message.control_port,
             capabilities: message.capabilities,
             displays: message.displays.clone(),
+            fingerprint: message
+                .fingerprint
+                .filter(|fingerprint| fingerprint.len() == 64)
+                .map(|fingerprint| fingerprint.to_ascii_lowercase()),
             socket_address: SocketAddr::new(source.ip(), message.control_port),
             last_seen: Instant::now(),
         };
@@ -826,6 +982,8 @@ impl Runtime<'_> {
         self.announcement = serde_json::to_vec(&Announcement::from_config(
             self.config,
             &self.local_displays,
+            self.capabilities,
+            self.fingerprint.as_deref(),
         ))
         .unwrap_or_default();
         let info = WireMessage::ScreenInfo {
@@ -1015,7 +1173,7 @@ impl Runtime<'_> {
                     return;
                 }
                 match result {
-                    Ok(stream) => {
+                    Ok(link) => {
                         if self.sessions.len() >= MAX_SESSIONS {
                             self.sink.emit_value(json!({
                                 "event": "disconnected",
@@ -1024,7 +1182,7 @@ impl Runtime<'_> {
                             }));
                             return;
                         }
-                        self.start_session(stream, Some(peer_id));
+                        self.start_session(link, Some(peer_id), false);
                     }
                     Err(error) => self.sink.emit_value(json!({
                         "event": "disconnected",
@@ -1042,9 +1200,10 @@ impl Runtime<'_> {
                 token,
                 result,
             } => match result {
-                Ok(stream) => self.data_connected(session, token, stream),
+                Ok(link) => self.data_connected(session, token, link),
                 Err(error) => self.sink.emit_error(format!("data link failed: {error}")),
             },
+            ConnectionEvent::Accepted { link, bulk } => self.accept(link, bulk),
             ConnectionEvent::FilesWritten { writer, outcome } => {
                 self.files_written(writer, outcome);
             }
@@ -1068,14 +1227,38 @@ impl Runtime<'_> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if !session.established() {
+        if !session.handshaken() {
             match message {
-                WireMessage::Hello { .. } => {}
+                // The bulk endpoint takes data links only.
+                WireMessage::Hello { .. } if !session.bulk_endpoint => {}
                 // An accepted connection that is really a data link.
                 WireMessage::DataHello { device_id, token } => {
                     return self.attach_data_link(id, device_id, token);
                 }
                 _ => return self.close_session(id, "message before hello", true),
+            }
+        } else if !session.established() {
+            // Identified, not admitted yet (pairing): only what pairing
+            // needs. The peer may have admitted this side already; what it
+            // sends about the arrangement and the data link waits.
+            match message {
+                WireMessage::Ping { .. }
+                | WireMessage::Pong { .. }
+                | WireMessage::PairRequest
+                | WireMessage::PairAccept
+                | WireMessage::PairReject => {}
+                WireMessage::ScreenInfo { .. }
+                | WireMessage::Placement { .. }
+                | WireMessage::DataInvite { .. } => {
+                    let kind = std::mem::discriminant(&message);
+                    session
+                        .held
+                        .retain(|held| std::mem::discriminant(held) != kind);
+                    session.held.push(message);
+                    return;
+                }
+                // Input, revokes and anything else from before admission.
+                _ => return,
             }
         }
 
@@ -1148,8 +1331,13 @@ impl Runtime<'_> {
                     self.remote_placement(&peer_id, offset, updated_ms);
                 }
             }
-            WireMessage::DataInvite { token } => self.data_invited(id, token),
+            WireMessage::DataInvite { token, port } => self.data_invited(id, token, port),
             WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
+            WireMessage::PairRequest => self.pair_requested(id),
+            WireMessage::PairAccept => self.pair_accepted(id),
+            WireMessage::PairReject => {
+                self.close_session(id, trust::PAIRING_REJECTED_BY_PEER, true)
+            }
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
             | WireMessage::ClipboardChunk { .. }
@@ -1231,7 +1419,7 @@ impl Runtime<'_> {
         let config = self.config;
         let session = &self.sessions[&id];
         let negotiated = negotiate_protocol(hello.min_protocol_version, hello.max_protocol_version);
-        let incompatible = session.established()
+        let incompatible = session.handshaken()
             || negotiated.is_none()
             || hello.capabilities & CAPABILITY_INPUT_V2 == 0
             || hello.device_id == config.device_id
@@ -1246,7 +1434,7 @@ impl Runtime<'_> {
         // One session per peer. Two connections to the same peer appear when
         // the peer reconnects before the old one timed out, or when both
         // sides dial each other at once.
-        if let Some(other) = self.established_session(&hello.device_id) {
+        if let Some(other) = self.handshaken_session(&hello.device_id) {
             let other_outgoing = self.sessions[&other].outgoing;
             let keep_new = if other_outgoing == session.outgoing {
                 // The same side dialed again: the old connection is stale.
@@ -1284,22 +1472,31 @@ impl Runtime<'_> {
         session.connection.capabilities = hello.capabilities;
         session.connection.shortcut_remap = shortcut_remap;
         session.last_seen = Instant::now();
+        self.peer_names.insert(
+            hello.device_id.clone(),
+            (hello.device_name, hello.control_port),
+        );
+        // Trusted, paired, or let in without pairing (see `trust.rs`).
+        self.admit_or_pair(id);
+    }
+
+    /// The session's peer may use the connection now: tell the shell, then
+    /// exchange displays, placements and the data link.
+    fn admit(&mut self, id: u64) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        session.admission = Admission::Admitted;
+        let held = std::mem::take(&mut session.held);
+        let Some(peer_id) = session.peer_id().map(str::to_owned) else {
+            return;
+        };
         if self.input_target.is_none() {
             // With no explicit choice, input goes to the first connected peer,
             // as it did when the core held a single connection.
-            self.input_target = Some(hello.device_id.clone());
+            self.input_target = Some(peer_id.clone());
         }
-        let peer = self.peer_value(
-            &hello.device_id,
-            Some((&hello.device_name, hello.control_port)),
-            hello.capabilities,
-        );
-        self.sink.emit_value(json!({
-            "event": "connected",
-            "peer": peer,
-            "protocol_version": protocol_version,
-            "capabilities": hello.capabilities
-        }));
+        self.emit_connected(id);
 
         // Describe our displays, then offer our placement of the peer. The
         // peer does the same; whichever placement is newer wins on both sides.
@@ -1308,10 +1505,38 @@ impl Runtime<'_> {
                 displays: self.local_displays.clone(),
             });
         }
-        self.send_placement(&hello.device_id);
+        self.send_placement(&peer_id);
         self.invite_data_link(id);
+        // What the peer sent while it waited for this side.
+        for message in held {
+            self.message(id, message);
+        }
         // A disconnect held back for this peer is moot now.
         self.flush_disconnects(false);
+    }
+
+    fn emit_connected(&self, id: u64) {
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        let Some(peer_id) = session.peer_id() else {
+            return;
+        };
+        let fallback = self
+            .peer_names
+            .get(peer_id)
+            .map(|(name, port)| (name.as_str(), *port));
+        let peer = self.peer_value(peer_id, fallback, session.connection.capabilities);
+        let fingerprint = session.connection.fingerprint.as_deref();
+        self.sink.emit_value(json!({
+            "event": "connected",
+            "peer": peer,
+            "protocol_version": session.connection.protocol_version,
+            "capabilities": session.connection.capabilities,
+            "encrypted": fingerprint.is_some(),
+            "paired": fingerprint.is_some_and(|fingerprint| self.trusted.get(peer_id).map(String::as_str) == Some(fingerprint)),
+            "fingerprint": fingerprint
+        }));
     }
 
     fn peer_value(
@@ -1345,6 +1570,13 @@ impl Runtime<'_> {
             return;
         };
         let peer_id = session.peer_id().map(str::to_owned);
+        if session.pairing.is_some() {
+            self.sink.emit_value(json!({
+                "event": "pairing_ended",
+                "peer_id": peer_id,
+                "reason": reason
+            }));
+        }
         session.connection.abort();
         if let Some(link) = session.data {
             self.close_data_link(link, reason);
@@ -1432,13 +1664,14 @@ impl Runtime<'_> {
             if session.last_seen.elapsed() > SESSION_TIMEOUT {
                 stale.push((
                     *id,
-                    if session.established() {
+                    if session.handshaken() {
                         "heartbeat timeout"
                     } else {
                         "handshake timeout"
                     },
                 ));
-            } else if session.established() {
+            } else if session.handshaken() {
+                // Also while pairing, which can take the user a while.
                 // A ping still unanswered is forgotten: the round trip is
                 // measured from the newest one.
                 session.ping = Some((self.ping_sequence, Instant::now()));
@@ -1450,6 +1683,7 @@ impl Runtime<'_> {
         for (id, reason) in stale {
             self.close_session(id, reason, true);
         }
+        self.expire_pairings();
         self.reinvite_data_links();
     }
 }

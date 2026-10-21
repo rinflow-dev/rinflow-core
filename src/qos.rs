@@ -19,7 +19,13 @@
 //!
 //! All of it is best effort: a connection that cannot be tagged works as
 //! before.
+//!
+//! QUIC connections share their endpoint's UDP socket, so there the socket
+//! carries the class: one endpoint for control, one for bulk (see
+//! `quic.rs`). On Windows, qWAVE takes an unconnected socket only per
+//! destination, so each peer the endpoint talks to is added.
 
+use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +46,12 @@ pub struct Qos {
     raw: std::os::windows::io::RawSocket,
     #[cfg(windows)]
     flow: std::sync::Mutex<Option<u32>>,
+    /// An unconnected socket's class and, on Windows, its flow per
+    /// destination.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    udp_class: Option<TrafficClass>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    destinations: std::sync::Mutex<Vec<(SocketAddr, u32)>>,
 }
 
 impl Qos {
@@ -51,11 +63,42 @@ impl Qos {
             raw: std::os::windows::io::AsRawSocket::as_raw_socket(stream),
             #[cfg(windows)]
             flow: std::sync::Mutex::new(None),
+            udp_class: None,
+            destinations: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// A UDP socket that sends everything in `class`. The socket must stay
+    /// open as long as this value lives.
+    pub fn udp(socket: &std::net::UdpSocket, class: TrafficClass) -> Self {
+        let qos = Self {
+            #[cfg(unix)]
+            raw: std::os::fd::AsRawFd::as_raw_fd(socket),
+            #[cfg(windows)]
+            raw: std::os::windows::io::AsRawSocket::as_raw_socket(socket),
+            #[cfg(windows)]
+            flow: std::sync::Mutex::new(None),
+            udp_class: Some(class),
+            destinations: std::sync::Mutex::new(Vec::new()),
+        };
+        // The socket option covers every destination, except on Windows.
+        #[cfg(not(windows))]
+        platform::set(&qos, class);
+        qos
     }
 
     pub fn set(&self, class: TrafficClass) {
         platform::set(self, class);
+    }
+
+    /// A UDP socket now also sends to `address` (Windows needs to know).
+    pub fn add_destination(&self, address: SocketAddr) {
+        #[cfg(windows)]
+        if let Some(class) = self.udp_class {
+            platform::add_destination(self, class, address);
+        }
+        #[cfg(not(windows))]
+        let _ = address;
     }
 }
 
@@ -195,11 +238,54 @@ mod platform {
         }
     }
 
-    pub fn remove_flow(qos: &Qos) {
-        let (Some(handle), Ok(mut flow)) = (handle(), qos.flow.lock()) else {
+    /// An unconnected socket joins a flow per destination.
+    pub fn add_destination(qos: &Qos, class: TrafficClass, address: std::net::SocketAddr) {
+        let (Some(handle), Ok(mut destinations)) = (handle(), qos.destinations.lock()) else {
             return;
         };
-        if let Some(id) = flow.take() {
+        if destinations.iter().any(|(known, _)| *known == address) {
+            return;
+        }
+        let traffic = match class {
+            TrafficClass::Interactive => QOSTrafficTypeVoice,
+            TrafficClass::Bulk => QOSTrafficTypeBackground,
+        };
+        let target = socket2::SockAddr::from(address);
+        let mut id = 0;
+        // SAFETY: `target` is a valid socket address for the call's duration.
+        let added = unsafe {
+            QOSAddSocketToFlow(
+                handle as _,
+                qos.raw as SOCKET,
+                target.as_ptr().cast(),
+                traffic,
+                QOS_NON_ADAPTIVE_FLOW,
+                &mut id,
+            )
+        } != 0;
+        if added {
+            destinations.push((address, id));
+        } else {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            let error = std::io::Error::last_os_error();
+            REPORTED.call_once(|| {
+                eprintln!("linkcursor-core: no network priority for a QUIC peer: {error}");
+            });
+        }
+    }
+
+    pub fn remove_flow(qos: &Qos) {
+        let Some(handle) = handle() else {
+            return;
+        };
+        let mut ids: Vec<u32> = Vec::new();
+        if let Ok(mut flow) = qos.flow.lock() {
+            ids.extend(flow.take());
+        }
+        if let Ok(mut destinations) = qos.destinations.lock() {
+            ids.extend(destinations.drain(..).map(|(_, id)| id));
+        }
+        for id in ids {
             // SAFETY: as in `set`; harmless if the socket is already closed.
             unsafe {
                 QOSRemoveSocketFromFlow(handle as _, qos.raw as SOCKET, id, 0);
