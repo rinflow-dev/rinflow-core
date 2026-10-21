@@ -44,11 +44,11 @@ mod tests {
     use super::layout::{Display, Offset, Side};
     use super::model::PlacementRecord;
     use super::model::{
-        Announcement, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_KEY_DOWN,
-        LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE,
-        LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL, LC_MODIFIER_LEFT_COMMAND,
-        LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LcInputEvent, PROTOCOL_MAX_VERSION,
-        WireMessage,
+        Announcement, CAPABILITY_CONTROL_REVOKE, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION,
+        LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP,
+        LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL, LC_MODIFIER_LEFT_COMMAND,
+        LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES, LcInputEvent,
+        PROTOCOL_MAX_VERSION, WireMessage,
     };
     use super::protocol::{decode_message, encode_message};
     use super::remap::ShortcutRemap;
@@ -278,6 +278,18 @@ mod tests {
             let bytes = encode_message(&message).unwrap();
             assert_eq!(decode_message(&bytes).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn control_revoke_round_trips_and_rejects_other_flags() {
+        for handoff in [false, true] {
+            let message = WireMessage::ControlRevoke { handoff };
+            let bytes = encode_message(&message).unwrap();
+            assert_eq!(decode_message(&bytes).unwrap(), message);
+        }
+        let mut bytes = encode_message(&WireMessage::ControlRevoke { handoff: true }).unwrap();
+        *bytes.last_mut().unwrap() = 2;
+        assert!(decode_message(&bytes).is_err());
     }
 
     #[test]
@@ -1046,6 +1058,198 @@ mod tests {
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();
+    }
+
+    fn wait_revoked(core: &TestCore, peer_id: &str, reason: &str) -> Value {
+        wait_for_event(&core.events, Duration::from_secs(3), |event| {
+            event["event"] == "control_revoked"
+                && event["peer_id"] == peer_id
+                && event["reason"] == reason
+        })
+    }
+
+    fn wait_control_ended(core: &TestCore, peer_id: &str) {
+        wait_for_event(&core.events, Duration::from_secs(3), |event| {
+            event["event"] == "remote_control_ended" && event["peer_id"] == peer_id
+        });
+    }
+
+    #[test]
+    fn a_device_driving_a_peer_gives_way_when_another_takes_it_over() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("drive-a", discovery_port);
+        let mut b = test_core("drive-b", discovery_port);
+        let mut c = test_core("drive-c", discovery_port);
+        wait_for_peers(&a, &["drive-b", "drive-c"]);
+        wait_for_peers(&c, &["drive-a"]);
+        a.thread.send(Command::Connect("drive-b".into())).unwrap();
+        wait_connected(&a, "drive-b");
+        wait_connected(&b, "drive-a");
+        c.thread.send(Command::Connect("drive-a".into())).unwrap();
+        wait_connected(&c, "drive-a");
+
+        // A drives B; then C starts driving A.
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![1.0]);
+        c.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![2.0]);
+
+        // A's control of B ends: its shell is told, and B is released.
+        let revoked = wait_revoked(&a, "drive-b", "taken_over");
+        assert_eq!(revoked["by"], "drive-c");
+        wait_control_ended(&b, "drive-a");
+        // Until A's shell acknowledges, its leftover input goes nowhere.
+        a.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert!(received(&b, Duration::from_millis(300)).is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_new_controller_takes_a_device_from_the_previous_one() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("taken-a", discovery_port);
+        let mut b = test_core("taken-b", discovery_port);
+        let mut c = test_core("taken-c", discovery_port);
+        wait_for_peers(&b, &["taken-a"]);
+        wait_for_peers(&c, &["taken-a"]);
+        b.thread.send(Command::Connect("taken-a".into())).unwrap();
+        wait_connected(&b, "taken-a");
+        c.thread.send(Command::Connect("taken-a".into())).unwrap();
+        wait_connected(&c, "taken-a");
+
+        // B drives A; then C starts driving A too.
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![1.0]);
+        c.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![2.0]);
+
+        // B is told to stop and its pointer comes home; A only plays C.
+        wait_revoked(&b, "taken-a", "revoked");
+        wait_control_ended(&a, "taken-b");
+        b.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        c.thread.send(Command::SendInput(motion(4.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![4.0]);
+
+        // Once B's shell has given control back, B can take A again.
+        b.thread.send(Command::ResetInput).unwrap();
+        b.thread
+            .send(Command::SetInputTarget(Some("taken-a".into())))
+            .unwrap();
+        b.thread.send(Command::SendInput(motion(5.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![5.0]);
+        wait_revoked(&c, "taken-a", "revoked");
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
+    }
+
+    #[test]
+    fn pushing_into_the_controlling_peer_hands_control_over() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("handoff-a", discovery_port);
+        let mut b = test_core("handoff-b", discovery_port);
+        wait_for_peers(&b, &["handoff-a"]);
+        b.thread.send(Command::Connect("handoff-a".into())).unwrap();
+        wait_connected(&b, "handoff-a");
+        wait_connected(&a, "handoff-b");
+
+        // B drives A; then someone at A pushes the pointer over to B.
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![1.0]);
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![2.0]);
+
+        // B gives way and leaves its pointer to A; B's stale input is dropped.
+        let revoked = wait_revoked(&b, "handoff-a", "taken_over");
+        assert_eq!(revoked["by"], "handoff-a");
+        wait_control_ended(&a, "handoff-b");
+        b.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert!(received(&a, Duration::from_millis(300)).is_empty());
+        a.thread.send(Command::SendInput(motion(4.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![4.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn driving_another_peer_stops_whoever_drives_this_device() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("local-a", discovery_port);
+        let mut b = test_core("local-b", discovery_port);
+        let mut c = test_core("local-c", discovery_port);
+        wait_for_peers(&a, &["local-c"]);
+        wait_for_peers(&b, &["local-a"]);
+        b.thread.send(Command::Connect("local-a".into())).unwrap();
+        wait_connected(&b, "local-a");
+        wait_connected(&a, "local-b");
+        a.thread.send(Command::Connect("local-c".into())).unwrap();
+        wait_connected(&a, "local-c");
+
+        // B drives A; then someone at A pushes the pointer over to C.
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![1.0]);
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&c, Duration::from_millis(400)), vec![2.0]);
+
+        // B is told to stop, and A no longer plays what B sends.
+        wait_revoked(&b, "local-a", "revoked");
+        wait_control_ended(&a, "local-b");
+        b.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert!(received(&a, Duration::from_millis(300)).is_empty());
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_controller_that_cannot_be_told_is_ignored_until_it_resets() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("older-a", discovery_port);
+        // An older build: it does not know `ControlRevoke`.
+        let mut b = test_core_with("older-b", discovery_port, |config| {
+            config.capabilities = LOCAL_CAPABILITIES & !CAPABILITY_CONTROL_REVOKE;
+        });
+        let mut c = test_core("older-c", discovery_port);
+        wait_for_peers(&b, &["older-a"]);
+        wait_for_peers(&c, &["older-a"]);
+        b.thread.send(Command::Connect("older-a".into())).unwrap();
+        wait_connected(&b, "older-a");
+        c.thread.send(Command::Connect("older-a".into())).unwrap();
+        wait_connected(&c, "older-a");
+
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![1.0]);
+        c.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![2.0]);
+        wait_control_ended(&a, "older-b");
+
+        // B was sent nothing it cannot read, so it stays connected, but A
+        // plays only C until B gives control back by itself.
+        b.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        c.thread.send(Command::SendInput(motion(4.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![4.0]);
+        assert!(events_named(&b, "control_revoked").is_empty());
+        assert!(events_named(&b, "disconnected").is_empty());
+
+        b.thread.send(Command::ResetInput).unwrap();
+        b.thread.send(Command::SendInput(motion(5.0))).unwrap();
+        assert_eq!(received(&a, Duration::from_millis(400)), vec![5.0]);
+        wait_revoked(&c, "older-a", "revoked");
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
     }
 
     #[track_caller]

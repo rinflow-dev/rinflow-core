@@ -5,8 +5,8 @@ use crate::files::Offer;
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer,
-    PlacementRecord, WireMessage, negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP,
+    LcInputEvent, Peer, PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::qos::TrafficClass;
 use crate::remap::ShortcutRemap;
@@ -246,6 +246,7 @@ async fn run(
         clipboard: None,
         next_clipboard_id: 0,
         controlling: None,
+        input_suspended: false,
         data_links: HashMap::new(),
         offer: None,
         next_transfer: 0,
@@ -321,6 +322,9 @@ struct Session {
     outgoing: bool,
     /// What the peer holds down on this device, released when it goes away.
     remote_input: RemoteInputState,
+    /// The peer was told to stop driving this device (`ControlRevoke`). Its
+    /// input is ignored until the `InputReset` that gives control back.
+    revoked: bool,
     /// Last sign of life: creation, handshake or pong.
     last_seen: Instant,
     /// The clipboard last exchanged with this peer, either way.
@@ -373,6 +377,10 @@ struct Runtime<'a> {
     /// The peer this device's input is driving, from the first event sent
     /// after a target change or reset until the next one.
     controlling: Option<String>,
+    /// This device's control was taken away (`control_revoked`). The shell's
+    /// input is dropped until it acknowledges with a reset or a new target,
+    /// so a capture that has not ended yet cannot take control again.
+    input_suspended: bool,
     /// Data links by connection ID.
     data_links: HashMap<u64, DataLink>,
     /// Files on this device's clipboard.
@@ -523,6 +531,9 @@ impl Runtime<'_> {
         for entry in entries {
             match entry {
                 PlatformEntry::Event(event) => {
+                    if self.input_suspended {
+                        continue;
+                    }
                     let Some(target) = self.input_target.clone() else {
                         continue;
                     };
@@ -530,6 +541,10 @@ impl Runtime<'_> {
                         continue;
                     };
                     if self.controlling.as_deref() != Some(target.as_str()) {
+                        // Someone using this device's own keyboard and mouse
+                        // takes it back from whoever drives it. If that is
+                        // the target, control simply changes hands.
+                        self.revoke_controllers(None, Some(&target), "taken back locally");
                         // Control moves to the peer, and the clipboard with it.
                         self.controlling = Some(target);
                         self.sync_clipboard(id);
@@ -538,8 +553,75 @@ impl Runtime<'_> {
                         self.sink.emit_error(error);
                     }
                 }
-                PlatformEntry::SetTarget(peer_id) => self.set_input_target(peer_id),
-                PlatformEntry::Reset => self.reset_target_input(),
+                PlatformEntry::SetTarget(peer_id) => {
+                    self.input_suspended = false;
+                    self.set_input_target(peer_id);
+                }
+                PlatformEntry::Reset => {
+                    self.input_suspended = false;
+                    self.reset_target_input();
+                }
+            }
+        }
+    }
+
+    /// Stops every peer that drives this device, except session `keep`: what
+    /// it holds here is released, and a peer that understands it is told to
+    /// give control back. Its input is ignored until that reset arrives.
+    /// `next` is the peer that drives this device next, if it is one of them.
+    fn revoke_controllers(&mut self, keep: Option<u64>, next: Option<&str>, reason: &str) {
+        let sink = self.sink;
+        for (id, session) in &mut self.sessions {
+            if Some(*id) == keep || !session.remote_input.is_controlling() {
+                continue;
+            }
+            let peer_id = session.peer_id().map(str::to_owned);
+            if session.connection.capabilities & CAPABILITY_CONTROL_REVOKE != 0 {
+                let handoff = next.is_some() && peer_id.as_deref() == next;
+                let _ = session
+                    .connection
+                    .send_control(WireMessage::ControlRevoke { handoff });
+            }
+            session.revoked = true;
+            end_remote_control(&mut session.remote_input, sink, reason, peer_id.as_deref());
+        }
+    }
+
+    /// Ends this device's own control of a peer because it lost it: the
+    /// peer gets a reset, and the shell, told by `control_revoked`, stops
+    /// capturing. `reason` is `taken_over` when a peer (`by`) now drives
+    /// this device and places the pointer itself, or `revoked` when the
+    /// driven peer was taken over by someone else and the pointer comes back.
+    fn lose_control(&mut self, reason: &str, by: Option<&str>) {
+        let Some(driven) = self.controlling.clone() else {
+            return;
+        };
+        self.reset_target_input();
+        self.input_suspended = true;
+        self.sink.emit_value(json!({
+            "event": "control_revoked",
+            "peer_id": driven,
+            "reason": reason,
+            "by": by
+        }));
+    }
+
+    /// The peer this device drives tells it to stop.
+    fn control_revoked(&mut self, id: u64, handoff: bool) {
+        let Some(peer_id) = self
+            .sessions
+            .get(&id)
+            .and_then(Session::peer_id)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        // Already given back otherwise; that reset is on its way to the peer.
+        if self.controlling.as_deref() == Some(peer_id.as_str()) {
+            if handoff {
+                self.lose_control("taken_over", Some(&peer_id));
+            } else {
+                self.lose_control("revoked", None);
             }
         }
     }
@@ -582,6 +664,7 @@ impl Runtime<'_> {
                         connection,
                         outgoing,
                         remote_input: RemoteInputState::default(),
+                        revoked: false,
                         last_seen: Instant::now(),
                         clipboard_synced: None,
                         clipboard_in: ClipboardAssembler::default(),
@@ -997,48 +1080,13 @@ impl Runtime<'_> {
             WireMessage::InputBatch {
                 first_sequence,
                 events,
-            } => {
-                let peer_id = session.peer_id().map(str::to_owned);
-                let sink = self.sink;
-                match session
-                    .remote_input
-                    .accept_range(first_sequence, events.len())
-                {
-                    SequenceStatus::Duplicate => return,
-                    SequenceStatus::Gap { expected, received } => {
-                        emit_release_events(
-                            session.remote_input.release_events(),
-                            sink,
-                            "input sequence gap",
-                            peer_id.as_deref(),
-                        );
-                        sink.emit_value(json!({
-                            "event": "input_sequence_gap",
-                            "peer_id": peer_id,
-                            "expected": expected,
-                            "received": received
-                        }));
-                    }
-                    SequenceStatus::InOrder => {}
-                }
-                if session.remote_input.begin_control() {
-                    sink.emit_value(
-                        json!({ "event": "remote_control_started", "peer_id": peer_id }),
-                    );
-                }
-                let shortcut_remap = session.connection.shortcut_remap;
-                for mut event in events {
-                    // Translate before observing, so the synthetic key-ups
-                    // for held keys use the same codes the shell saw.
-                    shortcut_remap.apply(&mut event);
-                    session.remote_input.observe(event);
-                    (sink.input)(event);
-                }
-            }
+            } => self.remote_input_batch(id, first_sequence, events),
             WireMessage::InputReset { sequence } => {
                 if session.remote_input.accept_sequence(sequence) == SequenceStatus::Duplicate {
                     return;
                 }
+                // A revoked peer confirms here that it stopped driving.
+                session.revoked = false;
                 // The controlling peer sends a reset when it gives control back.
                 let peer_id = session.peer_id().map(str::to_owned);
                 end_remote_control(
@@ -1068,12 +1116,70 @@ impl Runtime<'_> {
                 }
             }
             WireMessage::DataInvite { token } => self.data_invited(id, token),
+            WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
             | WireMessage::ClipboardChunk { .. }
             | WireMessage::FileRequest { .. }
             | WireMessage::FileChunk { .. }
             | WireMessage::FileCancel { .. } => {}
+        }
+    }
+
+    /// Input from a peer. A peer that starts driving this device takes it
+    /// over, as in lan-mouse, so one device is never driven by two peers or
+    /// driven while it drives another: the newest controller wins. The peer
+    /// that drove it before is told to stop, and so is this device's own
+    /// control of another peer.
+    fn remote_input_batch(&mut self, id: u64, first_sequence: u64, events: Vec<LcInputEvent>) {
+        let sink = self.sink;
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let peer_id = session.peer_id().map(str::to_owned);
+        match session
+            .remote_input
+            .accept_range(first_sequence, events.len())
+        {
+            SequenceStatus::Duplicate => return,
+            SequenceStatus::Gap { expected, received } => {
+                emit_release_events(
+                    session.remote_input.release_events(),
+                    sink,
+                    "input sequence gap",
+                    peer_id.as_deref(),
+                );
+                sink.emit_value(json!({
+                    "event": "input_sequence_gap",
+                    "peer_id": peer_id,
+                    "expected": expected,
+                    "received": received
+                }));
+            }
+            SequenceStatus::InOrder => {}
+        }
+        if session.revoked {
+            // Sent before the peer heard that it lost control.
+            return;
+        }
+        if !session.remote_input.is_controlling() {
+            self.lose_control("taken_over", peer_id.as_deref());
+            self.revoke_controllers(Some(id), None, "taken over by another device");
+        }
+
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if session.remote_input.begin_control() {
+            sink.emit_value(json!({ "event": "remote_control_started", "peer_id": peer_id }));
+        }
+        let shortcut_remap = session.connection.shortcut_remap;
+        for mut event in events {
+            // Translate before observing, so the synthetic key-ups for held
+            // keys use the same codes the shell saw.
+            shortcut_remap.apply(&mut event);
+            session.remote_input.observe(event);
+            (sink.input)(event);
         }
     }
 

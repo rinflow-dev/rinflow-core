@@ -288,6 +288,11 @@ impl RemoteInputState {
         std::mem::replace(&mut self.controlled, false)
     }
 
+    /// The peer is driving this device right now.
+    pub fn is_controlling(&self) -> bool {
+        self.controlled
+    }
+
     pub fn accept_range(&mut self, first_sequence: u64, count: usize) -> SequenceStatus {
         let Some(last_sequence) = first_sequence.checked_add(count.saturating_sub(1) as u64) else {
             return SequenceStatus::Gap {

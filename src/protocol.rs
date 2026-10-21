@@ -22,6 +22,7 @@ const MESSAGE_DATA_HELLO: u8 = 10;
 const MESSAGE_FILE_REQUEST: u8 = 11;
 const MESSAGE_FILE_CHUNK: u8 = 12;
 const MESSAGE_FILE_CANCEL: u8 = 13;
+const MESSAGE_CONTROL_REVOKE: u8 = 14;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -39,6 +40,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::FileRequest { .. } => MESSAGE_FILE_REQUEST,
         WireMessage::FileChunk { .. } => MESSAGE_FILE_CHUNK,
         WireMessage::FileCancel { .. } => MESSAGE_FILE_CANCEL,
+        WireMessage::ControlRevoke { .. } => MESSAGE_CONTROL_REVOKE,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -161,6 +163,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.u16(reason.len() as u16);
             encoder.bytes.extend_from_slice(reason.as_bytes());
         }
+        WireMessage::ControlRevoke { handoff } => encoder.u8(u8::from(*handoff)),
     }
     Ok(encoder.bytes)
 }
@@ -328,6 +331,13 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 .map_err(|_| invalid_data("cancel reason is not UTF-8"))?;
             WireMessage::FileCancel { transfer, reason }
         }
+        MESSAGE_CONTROL_REVOKE => WireMessage::ControlRevoke {
+            handoff: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid_data("invalid control revoke flag")),
+            },
+        },
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;

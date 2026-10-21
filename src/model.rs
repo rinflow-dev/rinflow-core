@@ -27,12 +27,16 @@ pub const CAPABILITY_FILES: u64 = 1 << 6;
 pub const CAPABILITY_CLIPBOARD: u64 = 1 << 7;
 /// Features carried by the data link (see `transport.rs`).
 pub const DATA_LINK_CAPABILITIES: u64 = CAPABILITY_CLIPBOARD | CAPABILITY_FILES;
+/// Gives control back when told to (`ControlRevoke`). Sent only to peers
+/// with this bit, for the same reason as the data-link messages.
+pub const CAPABILITY_CONTROL_REVOKE: u64 = 1 << 8;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
-    | CAPABILITY_HID_KEYBOARD;
+    | CAPABILITY_HID_KEYBOARD
+    | CAPABILITY_CONTROL_REVOKE;
 
 pub const LC_INPUT_MOUSE_MOVE: u32 = 1;
 pub const LC_INPUT_MOUSE_BUTTON_DOWN: u32 = 2;
@@ -411,6 +415,12 @@ pub enum WireMessage {
     FileCancel {
         transfer: u32,
         reason: String,
+    },
+    /// Control connection: stop driving the sender, which someone else now
+    /// controls. The receiver gives control back with an `InputReset`. With
+    /// `handoff` the sender itself drives the receiver next.
+    ControlRevoke {
+        handoff: bool,
     },
 }
 
