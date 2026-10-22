@@ -27,6 +27,10 @@ pub const PAIRING_DECLINED_BY_PEER: &str = "pairing declined on the other device
 /// `disconnected` reason when the peer's user (or shell) disconnected.
 pub const PEER_DISCONNECTED: &str = "disconnected on the other device";
 
+/// `disconnected` reason when nobody confirmed pairing in time, on either
+/// side.
+pub const PAIRING_TIMED_OUT: &str = "pairing timed out";
+
 /// `disconnected` reason when the peer would not let this device in: it
 /// is paired with another certificate under this device's ID, it now only
 /// takes paired devices, or it forgot this one.
@@ -47,6 +51,8 @@ pub enum CloseCode {
     Disconnected = 2,
     /// This device would not let the peer in: [`PEER_REFUSED`].
     Refused = 3,
+    /// Pairing was not confirmed in time: [`PAIRING_TIMED_OUT`].
+    PairingTimedOut = 4,
 }
 
 impl CloseCode {
@@ -56,6 +62,7 @@ impl CloseCode {
             1 => PAIRING_DECLINED_BY_PEER,
             2 => PEER_DISCONNECTED,
             3 => PEER_REFUSED,
+            4 => PAIRING_TIMED_OUT,
             _ => PEER_CLOSED,
         }
     }

@@ -31,9 +31,11 @@ use std::time::{Duration, Instant};
 /// `transport::PAIRING_DECLINED_BY_PEER`.
 pub const IDENTITY_CHANGED: &str = "the device's identity changed";
 pub const PAIRING_REJECTED: &str = "pairing declined";
-pub const PAIRING_TIMED_OUT: &str = "pairing timed out";
+pub const PAIRING_TIMED_OUT: &str = crate::transport::PAIRING_TIMED_OUT;
 pub const UNPAIRED: &str = "unpaired";
 pub const PAIRING_REQUIRED: &str = "pairing required";
+/// Another device is pairing with this one right now.
+pub const PAIRING_BUSY: &str = "another pairing is in progress";
 
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -79,6 +81,19 @@ impl Runtime<'_> {
     /// Starts pairing on a session: asks the peer (`request`) and shows the
     /// code here.
     fn start_pairing(&mut self, id: u64, request: bool) {
+        // One pairing at a time: the code the user is comparing must not be
+        // swapped for another device's under the same dialog.
+        let busy = self
+            .sessions
+            .iter()
+            .any(|(other, session)| *other != id && session.pairing.is_some());
+        if busy {
+            if let Some(session) = self.sessions.get(&id) {
+                session.connection.close_with(CloseCode::Refused);
+            }
+            self.close_session(id, PAIRING_BUSY, true);
+            return;
+        }
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -229,10 +244,14 @@ impl Runtime<'_> {
         if !required {
             return;
         }
+        // Every session let in without being paired, also one that is
+        // pairing now: until both users confirm, it gets nothing.
         let untrusted: Vec<u64> = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.handshaken() && session.pairing.is_none())
+            .filter(|(_, session)| {
+                session.handshaken() && (session.pairing.is_none() || session.established())
+            })
             .filter(|(_, session)| {
                 let paired = session
                     .peer_id()
@@ -278,6 +297,10 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
+            // The peer is told, so it does not dial again and ask anew.
+            if let Some(session) = self.sessions.get(&id) {
+                session.connection.close_with(CloseCode::PairingTimedOut);
+            }
             self.close_session(id, PAIRING_TIMED_OUT, true);
         }
     }

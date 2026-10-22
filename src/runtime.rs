@@ -18,7 +18,7 @@ use crate::transport::{
     connect_in_background, spawn_connection,
 };
 use data::{DataLink, Download};
-use reconnect::{INCOMPATIBLE, LOCAL_REQUEST, Retry};
+use reconnect::{INCOMPATIBLE, LOCAL_REQUEST, Retry, WRONG_DEVICE};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,8 @@ use trust::{Admission, Pairing};
 /// Sessions (established or still handshaking) a core keeps at once. Bounds
 /// what an unauthenticated device on the network can make us hold open.
 const MAX_SESSIONS: usize = 8;
+/// Of those, connections not identified yet (before `Hello`).
+const MAX_ANONYMOUS: usize = 3;
 /// A session that has not answered a ping, or not finished its handshake,
 /// within this time is closed.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -308,7 +310,9 @@ async fn run(
         remote_control_allowed: true,
         data_links: HashMap::new(),
         offer: None,
-        next_transfer: 0,
+        // Unpredictable, and unlikely to match another device's numbers.
+        next_transfer: random_u64() as u32,
+        offered_to: HashSet::new(),
         download: None,
         download_failures: Vec::new(),
         uploads: HashMap::new(),
@@ -516,6 +520,9 @@ struct Runtime<'a> {
     data_links: HashMap<u64, DataLink>,
     /// Files on this device's clipboard.
     offer: Option<Arc<Offer>>,
+    /// Sessions the clipboard with `offer` was sent to: only they may fetch
+    /// its files.
+    offered_to: HashSet<u64>,
     next_transfer: u32,
     /// Files being received.
     download: Option<Download>,
@@ -839,10 +846,14 @@ impl Runtime<'_> {
     /// data links only).
     fn accept(&mut self, link: Link, bulk: bool) {
         // A new connection never replaces an existing session; at the limit
-        // it is simply refused.
-        if self.sessions.len() >= MAX_SESSIONS {
-            self.sink
-                .emit_error("incoming connection refused: too many sessions");
+        // it is simply refused. Connections that have not said who they are
+        // get only a few of the places, so they cannot take them all.
+        let anonymous = self
+            .sessions
+            .values()
+            .filter(|session| !session.handshaken())
+            .count();
+        if self.sessions.len() >= MAX_SESSIONS || anonymous >= MAX_ANONYMOUS {
             return;
         }
         self.start_session(link, None, bulk, false);
@@ -929,7 +940,9 @@ impl Runtime<'_> {
             self.sink
                 .emit_value(json!({ "event": "peer_up", "peer": peer }));
         }
-        if !message.displays.is_empty() {
+        // Anyone can announce anything: while the peer has a session, its
+        // displays come from the session (`ScreenInfo`) only.
+        if !message.displays.is_empty() && self.handshaken_session(&message.device_id).is_none() {
             self.update_peer_displays(&message.device_id, message.displays);
         }
         if is_new {
@@ -1133,7 +1146,7 @@ impl Runtime<'_> {
             .placements
             .get(peer_id)
             .map_or(0, |record| record.updated_ms);
-        let updated_ms = now_ms().max(seen + 1);
+        let updated_ms = now_ms().max(seen.saturating_add(1));
         self.store_placement(peer_id, offset, updated_ms, "local");
     }
 
@@ -1463,12 +1476,19 @@ impl Runtime<'_> {
         let incompatible = session.handshaken()
             || negotiated.is_none()
             || hello.capabilities & CAPABILITY_INPUT_V2 == 0
-            || hello.device_id == config.device_id
-            || session
-                .peer_id()
-                .is_some_and(|expected| expected != hello.device_id);
+            || hello.device_id == config.device_id;
         if incompatible {
             self.refuse_session(id, INCOMPATIBLE);
+            return;
+        }
+        // Dialed one device, another answered (it took over the address, or
+        // an announcement pointed us there): not this peer's fault, so
+        // reconnecting goes on as after any failure.
+        if session
+            .peer_id()
+            .is_some_and(|expected| expected != hello.device_id)
+        {
+            self.close_session(id, WRONG_DEVICE, true);
             return;
         }
 
@@ -1476,6 +1496,22 @@ impl Runtime<'_> {
         // the peer reconnects before the old one timed out, or when both
         // sides dial each other at once.
         if let Some(other) = self.handshaken_session(&hello.device_id) {
+            // Only the same device (the same certificate) may replace its
+            // connection. Anything else claiming its ID must not push out a
+            // paired or pairing session: it is refused, and the session
+            // stays.
+            if self.sessions[&other].connection.fingerprint != session.connection.fingerprint {
+                self.sink.emit_error(format!(
+                    "a connection claiming to be {} showed another certificate; refused",
+                    hello.device_id
+                ));
+                if let Some(session) = self.sessions.get(&id) {
+                    session.connection.close_with(CloseCode::Refused);
+                }
+                self.close_session(id, "another device under this ID", false);
+                return;
+            }
+            let session = &self.sessions[&id];
             let other_outgoing = self.sessions[&other].outgoing;
             let keep_new = if other_outgoing == session.outgoing {
                 // The same side dialed again: the old connection is stale.
@@ -1707,6 +1743,18 @@ impl Runtime<'_> {
             .collect();
         for peer_id in expired {
             self.peers.remove(&peer_id);
+            // What strangers announced is not kept forever; the user's
+            // devices (placed, paired, or connected) keep their displays.
+            let keep = self.placements.contains_key(&peer_id)
+                || self.trusted.contains_key(&peer_id)
+                || self
+                    .sessions
+                    .values()
+                    .any(|session| session.peer_id() == Some(peer_id.as_str()));
+            if !keep {
+                self.peer_displays.remove(&peer_id);
+                self.peer_names.remove(&peer_id);
+            }
             self.sink
                 .emit_value(json!({ "event": "peer_down", "peer_id": peer_id }));
         }

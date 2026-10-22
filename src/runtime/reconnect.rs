@@ -55,6 +55,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const LOCAL_REQUEST: &str = "local request";
 /// `disconnected` reason for a peer this core cannot talk to.
 pub const INCOMPATIBLE: &str = "incompatible peer";
+/// `disconnected` reason when another device answered at a peer's address.
+pub const WRONG_DEVICE: &str = "another device answered";
 /// `disconnected` reason, on this device, for sessions it ended because the
 /// system is going to sleep.
 pub const GOING_TO_SLEEP: &str = "going to sleep";

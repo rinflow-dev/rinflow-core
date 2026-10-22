@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_DISPLAYS: usize = 16;
 /// Shortest shared edge a placement may have, in points.
 pub const MIN_OVERLAP: f64 = 64.0;
+/// The smallest display side accepted, in points.
+const MIN_DISPLAY_SIZE: f64 = 16.0;
 /// A placement this close to an alignment (ends or centres) snaps to it.
 const SNAP_DISTANCE: f64 = 24.0;
 /// Among spots about as near to a drop, the one sharing more edge wins: each
@@ -80,7 +82,8 @@ impl Display {
         if !values.iter().all(|value| value.is_finite()) {
             return Err("display geometry must be finite");
         }
-        if self.width < 1.0 || self.height < 1.0 || self.scale <= 0.0 {
+        // No real display is smaller; tinier ones only invite rounding trouble.
+        if self.width < MIN_DISPLAY_SIZE || self.height < MIN_DISPLAY_SIZE || self.scale <= 0.0 {
             return Err("display must have a positive size and scale");
         }
         if values.iter().any(|value| value.abs() > 1.0e7) {
@@ -349,7 +352,7 @@ fn slide(wanted: f64, length: f64, edge_start: f64, edge_length: f64) -> f64 {
     let overlap = MIN_OVERLAP.min(length).min(edge_length);
     let lowest = edge_start - length + overlap;
     let highest = edge_start + edge_length - overlap;
-    let position = wanted.clamp(lowest, highest);
+    let position = clamp_between(wanted, lowest, highest);
     let alignments = [
         edge_start,
         edge_start + edge_length - length,
@@ -511,7 +514,7 @@ impl RemotePointer {
     /// `(x, y)`, for giving control back without crossing.
     pub fn return_point(&self, x: f64, y: f64) -> (f64, f64) {
         let portal = &self.entry;
-        let along = |value: f64| value.clamp(portal.from, (portal.to - 1.0).max(portal.from));
+        let along = |value: f64| clamp_between(value, portal.from, portal.to - 1.0);
         match portal.side {
             Side::Right => (portal.line - RETURN_INSET, along(y)),
             Side::Left => (portal.line + RETURN_INSET, along(y)),
@@ -528,9 +531,15 @@ fn contains(display: &Display, x: f64, y: f64) -> bool {
 /// The nearest point inside the display (the far edges are exclusive).
 fn clamp_into(display: &Display, x: f64, y: f64) -> (f64, f64) {
     (
-        x.clamp(display.x, display.right() - 1.0),
-        y.clamp(display.y, display.bottom() - 1.0),
+        clamp_between(x, display.x, display.right() - 1.0),
+        clamp_between(y, display.y, display.bottom() - 1.0),
     )
+}
+
+/// `value` within `low..=high`, or `low` when rounding left `high` below
+/// it. Unlike `f64::clamp` it never panics: geometry comes from peers.
+fn clamp_between(value: f64, low: f64, high: f64) -> f64 {
+    value.min(high).max(low)
 }
 
 /// If the local point `(x, y)` lies back on this device's side of the

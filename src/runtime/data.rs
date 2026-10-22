@@ -239,6 +239,21 @@ impl Runtime<'_> {
             token,
         };
         match spawn_connection(id, link, hello, self.connection_events.clone()) {
+            // The same certificate as the session, as the accepting side
+            // checks too: otherwise whoever answered at that port (an
+            // attacker on the path) would get the clipboard and files.
+            Ok(connection)
+                if self
+                    .sessions
+                    .get(&session)
+                    .is_none_or(|owner| owner.connection.fingerprint != connection.fingerprint) =>
+            {
+                self.next_connection_id += 1;
+                connection.close_with(crate::transport::CloseCode::Refused);
+                connection.abort();
+                self.sink
+                    .emit_error("data link answered by another device; refused");
+            }
             Ok(connection) => {
                 self.next_connection_id += 1;
                 self.data_links.insert(
@@ -322,6 +337,9 @@ impl Runtime<'_> {
             session.data = None;
             session.data_token = None;
             session.data_invited = None;
+            // A clipboard still on its way may never have arrived: send it
+            // again next time instead of taking it as delivered.
+            session.clipboard_synced = None;
         }
         if self
             .download
@@ -417,6 +435,10 @@ impl Runtime<'_> {
         };
         session.clipboard_synced = Some(*digest);
         session.clipboard_pending = false;
+        // This peer may now ask for the files the clipboard offers.
+        if self.offer.is_some() {
+            self.offered_to.insert(id);
+        }
         self.next_clipboard_id = self.next_clipboard_id.wrapping_add(1);
         link.connection
             .send_bulk(clipboard::chunks(self.next_clipboard_id, encoded));
@@ -458,19 +480,29 @@ impl Runtime<'_> {
                 return;
             }
         };
-        // The peer has these contents: they are not sent back to it. They are
-        // this device's clipboard now, as the shell will make them, so they
-        // travel on to the next peer.
-        let digest = clipboard::digest(&encoded);
-        owner.clipboard_synced = Some(digest);
-        let peer_id = owner.peer_id().unwrap_or_default().to_owned();
-        self.clipboard = Some((digest, Arc::new(encoded)));
-
         let (manifests, rest): (Vec<ClipboardFormat>, Vec<ClipboardFormat>) = clipboard
             .formats
             .into_iter()
+            // Paths on the peer mean nothing here (a core sends files as a
+            // manifest); paths that point somewhere here, or to a network
+            // share, must never reach this device's clipboard from a peer.
+            .filter(|format| format.mime != MIME_URI_LIST)
             .partition(|format| format.mime == MIME_FILES);
         let rest = Clipboard { formats: rest };
+        // The rest is this device's clipboard now, as the shell will make it,
+        // so it travels on to the next peer; not sent back to this one. A
+        // file manifest does not travel on: only the peer that offered the
+        // files can serve them (once received, the shell puts them on the
+        // clipboard and they are offered from here).
+        let kept = if manifests.is_empty() {
+            encoded
+        } else {
+            rest.encode()
+        };
+        let digest = clipboard::digest(&kept);
+        owner.clipboard_synced = Some(digest);
+        let peer_id = owner.peer_id().unwrap_or_default().to_owned();
+        self.clipboard = Some((digest, Arc::new(kept)));
         if self.config.files
             && let Some(manifest) = manifests.first()
         {
@@ -504,6 +536,8 @@ impl Runtime<'_> {
     /// Replaces a `text/uri-list` of local files with their manifest, and
     /// remembers where they are.
     fn offer_files(&mut self, clipboard: &mut Clipboard) {
+        // A new clipboard: no peer has been offered its files yet.
+        self.offered_to.clear();
         let Some(index) = clipboard
             .formats
             .iter()
@@ -548,12 +582,15 @@ impl Runtime<'_> {
 
     /// A peer asks for an entry of this device's offer on data link `link`.
     fn file_requested(&mut self, link: u64, transfer: u32, entry: usize, offset: u64) {
-        let Some(connection) = self.data_links.get(&link).map(|link| &link.connection) else {
+        let Some(data_link) = self.data_links.get(&link) else {
             return;
         };
+        let connection = &data_link.connection;
         let control = connection.control_sender();
+        // Only to a peer this offer was sent to.
+        let offered = self.offered_to.contains(&data_link.session);
         let opened = match &self.offer {
-            Some(offer) if offer.manifest.transfer == transfer => offer.open(entry),
+            Some(offer) if offered && offer.manifest.transfer == transfer => offer.open(entry),
             _ => Err("files are no longer on the clipboard".to_owned()),
         }
         .and_then(|(path, size)| {
