@@ -20,9 +20,22 @@
 //! - the peer's user disconnected (close code `Disconnected`) or the peer
 //!   refused this device (`Refused`),
 //! - pairing was declined or timed out, or the peer's identity changed.
+//!
+//! Sleep and network changes, which the shell reports:
+//! - **Going to sleep** (`lc_core_system_will_sleep`): every session ends now,
+//!   in order. Peers see `"peer closed the connection"` (no error), get
+//!   control back and release what this device held, at once instead of
+//!   after a heartbeat timeout. Until the system is asleep, no connections
+//!   are made or taken, so the peers' attempts to reconnect are refused.
+//! - **Woken up, or the network changed** (`lc_core_network_changed`): this
+//!   device announces itself and rejoins the discovery group now, dials the
+//!   user's devices without waiting for backoff, and sessions that did not
+//!   survive (no pong) end after `PROBE_TIMEOUT` instead of the full
+//!   heartbeat timeout. Sessions that did survive (QUIC follows an address
+//!   change) carry on.
 
-use super::Runtime;
 use super::trust;
+use super::{Runtime, SESSION_TIMEOUT};
 use crate::transport::{PAIRING_DECLINED_BY_PEER, PEER_DISCONNECTED, PEER_REFUSED};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -32,11 +45,19 @@ const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// How long the device with the higher ID lets the other one dial first.
 const YIELD: Duration = Duration::from_secs(2);
+/// How long after `lc_core_system_will_sleep` the system is taken to be
+/// asleep, if it does not report waking before (the sleep was cancelled).
+const SLEEP_HOLD: Duration = Duration::from_secs(15);
+/// How long a session may stay silent after a network change.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `disconnected` reason when this device's shell disconnected a peer.
 pub const LOCAL_REQUEST: &str = "local request";
 /// `disconnected` reason for a peer this core cannot talk to.
 pub const INCOMPATIBLE: &str = "incompatible peer";
+/// `disconnected` reason, on this device, for sessions it ended because the
+/// system is going to sleep.
+pub const GOING_TO_SLEEP: &str = "going to sleep";
 
 /// When to try a peer next.
 pub(super) struct Retry {
@@ -89,9 +110,47 @@ impl Runtime<'_> {
         }
     }
 
+    /// The system is going to sleep: no connections in or out.
+    pub(super) fn asleep(&self) -> bool {
+        self.asleep_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    pub(super) fn will_sleep(&mut self) {
+        self.asleep_until = Some(Instant::now() + SLEEP_HOLD);
+        let ids: Vec<u64> = self.sessions.keys().copied().collect();
+        for id in ids {
+            // An ordinary close: the peers try again, and find this device
+            // once it is awake and announces itself.
+            self.close_session(id, GOING_TO_SLEEP, true);
+        }
+    }
+
+    pub(super) fn network_changed(&mut self) {
+        self.asleep_until = None;
+        // Backoff from attempts that could not work is no reason to wait.
+        self.reconnect.clear();
+        // A session that no longer answers ends `PROBE_TIMEOUT` from now:
+        // as if it had last been heard of that much before the timeout.
+        // Pings go out every second; a pong puts it right.
+        if let Some(probe) = Instant::now().checked_sub(SESSION_TIMEOUT - PROBE_TIMEOUT) {
+            for session in self
+                .sessions
+                .values_mut()
+                .filter(|session| session.handshaken())
+            {
+                session.last_seen = session.last_seen.min(probe);
+            }
+        }
+        self.auto_connect();
+    }
+
     /// Dials the user's devices that are around and have no session, when
     /// their turn has come. Runs every second and when a peer shows up.
     pub(super) fn auto_connect(&mut self) {
+        if self.asleep() {
+            return;
+        }
         let wanted: HashSet<String> = self
             .peers
             .keys()

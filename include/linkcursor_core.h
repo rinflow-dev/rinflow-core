@@ -25,8 +25,9 @@
  *    talk to version 3: every device needs this core.
  * 8: the core keeps the user's devices connected by itself: config key
  *    "auto_connect" (default true); "disconnected" reasons
- *    "disconnected on the other device" and "refused by the other device".
- *    See "Staying connected" below.
+ *    "disconnected on the other device" and "refused by the other device";
+ *    lc_core_system_will_sleep and lc_core_network_changed. See "Staying
+ *    connected" below.
  */
 #define LC_CORE_ABI_VERSION 8
 
@@ -120,7 +121,22 @@ bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
  *     not reconnect by itself either.
  *   - So is a peer after declined or timed-out pairing, a changed identity,
  *     or "refused by the other device" (it would not let this device in).
+ *
+ * Sleep and network changes (version 8). Report them so sessions end in
+ * order and come back at once, instead of after heartbeat timeouts:
+ *   lc_core_system_will_sleep   when the system is about to sleep (macOS:
+ *       NSWorkspace.willSleepNotification). Every session ends now, so
+ *       peers get control back and release held keys; this device's own
+ *       "disconnected" events say "going to sleep". Until the system is
+ *       asleep (at most 15 s), no connections are made or taken.
+ *   lc_core_network_changed     after waking (didWakeNotification) and
+ *       whenever the network changes (an address came or went: Wi-Fi
+ *       joined, DHCP, VPN; NWPathMonitor). Announces this device, rejoins
+ *       the discovery group, dials the user's devices now, and ends within
+ *       3 s the sessions that no longer answer. Harmless to call too often.
  */
+bool lc_core_system_will_sleep(LcCore *core);
+bool lc_core_network_changed(LcCore *core);
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */

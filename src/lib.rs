@@ -2296,6 +2296,79 @@ mod tests {
     }
 
     #[test]
+    fn a_device_going_to_sleep_ends_its_sessions_in_order_and_is_back_on_waking() {
+        let _network = network_test();
+        let (directory, a_fingerprint, b_fingerprint) =
+            paired_identities("sleep", "sleep-a", "sleep-b");
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with(
+            "sleep-a",
+            discovery_port,
+            paired_with(&directory, "sleep-a", "sleep-b", &b_fingerprint),
+        );
+        let mut b = test_core_with(
+            "sleep-b",
+            discovery_port,
+            paired_with(&directory, "sleep-b", "sleep-a", &a_fingerprint),
+        );
+        wait_connected(&a, "sleep-b");
+        wait_connected(&b, "sleep-a");
+
+        // B goes to sleep while driving A: A gets an ordinary close at once
+        // (no heartbeat timeout) and control back.
+        b.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "remote_control_started"
+        });
+        b.thread.send(Command::WillSleep).unwrap();
+        wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "remote_control_ended" && event["peer_id"] == "sleep-b"
+        });
+        let ended = wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "sleep-b"
+        });
+        assert_eq!(ended["reason"], crate::transport::PEER_CLOSED);
+
+        // A keeps trying; B, about to sleep, takes nothing.
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(events_named(&a, "connected").is_empty());
+        assert!(events_named(&b, "connected").is_empty());
+
+        // B wakes: they are connected again within moments.
+        b.thread.send(Command::NetworkChanged).unwrap();
+        wait_for_event(&a.events, Duration::from_secs(6), |event| {
+            event["event"] == "connected" && event["peer"]["id"] == "sleep-b"
+        });
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_network_change_keeps_sessions_that_still_answer() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("change-a", discovery_port);
+        let mut b = test_core("change-b", discovery_port);
+        wait_for_peers(&a, &["change-b"]);
+        a.thread.send(Command::Connect("change-b".into())).unwrap();
+        wait_connected(&a, "change-b");
+
+        // Probed, and answering: nothing ends.
+        a.thread.send(Command::NetworkChanged).unwrap();
+        b.thread.send(Command::NetworkChanged).unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(events_named(&a, "disconnected").is_empty());
+        assert!(events_named(&b, "disconnected").is_empty());
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![2.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
     fn placed_peers_are_kept_connected_unless_only_paired_ones_may_connect() {
         let _network = network_test();
         let placed = |peer_id: &str| {

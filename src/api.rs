@@ -114,6 +114,20 @@ impl Core {
         self.thread.send(Command::SetRequirePairing(required))
     }
 
+    /// The system is about to sleep. Sessions end now, in order, so peers
+    /// get control back and release held keys at once instead of timing
+    /// out; for a few seconds no connections are made or taken.
+    pub fn system_will_sleep(&self) -> Result<(), String> {
+        self.thread.send(Command::WillSleep)
+    }
+
+    /// The system woke up, or the network changed (an address came or
+    /// went): announce this device, dial the user's devices and drop the
+    /// sessions that did not survive, now rather than after timeouts.
+    pub fn network_changed(&self) -> Result<(), String> {
+        self.thread.send(Command::NetworkChanged)
+    }
+
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {
         self.thread.send(Command::SendInput(event))
     }

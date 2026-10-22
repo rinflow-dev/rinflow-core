@@ -19,6 +19,8 @@ pub struct LcCore {
 /// `trusted_peers`, `require_pairing`; `lc_core_accept_pairing`,
 /// `lc_core_reject_pairing`, `lc_core_unpair`, `lc_core_set_require_pairing`;
 /// events `pairing_requested`, `paired`, `pairing_ended`, `unpaired`.
+/// Version 8 keeps the user's devices connected (`auto_connect`) and adds
+/// `lc_core_system_will_sleep` and `lc_core_network_changed`.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
     8
@@ -309,6 +311,18 @@ pub unsafe extern "C" fn lc_core_unpair(core: *mut LcCore, peer_id: *const c_cha
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lc_core_set_require_pairing(core: *mut LcCore, required: bool) -> bool {
     send_command(core, Command::SetRequirePairing(required))
+}
+
+/// The system is about to sleep: sessions end in order now.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_system_will_sleep(core: *mut LcCore) -> bool {
+    send_command(core, Command::WillSleep)
+}
+
+/// The system woke up, or the network changed: find and reconnect peers now.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_network_changed(core: *mut LcCore) -> bool {
+    send_command(core, Command::NetworkChanged)
 }
 
 /// Lets peers drive this device (the default), or stops them. Added within

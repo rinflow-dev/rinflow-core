@@ -106,6 +106,10 @@ pub enum Command {
     Unpair(String),
     /// Only paired peers may connect (see `CoreConfig::require_pairing`).
     SetRequirePairing(bool),
+    /// The system is about to sleep (see `reconnect.rs`).
+    WillSleep,
+    /// The system woke up, or the network changed (see `reconnect.rs`).
+    NetworkChanged,
     Stop,
 }
 
@@ -241,17 +245,22 @@ async fn run(
     let capabilities = config.advertised_capabilities();
     let fingerprint = identity.fingerprint.clone();
 
-    let multicast = SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::from(DISCOVERY_GROUP),
-        config.discovery_port,
-    ));
+    let group = Ipv4Addr::from(DISCOVERY_GROUP);
+    let multicast = SocketAddr::V4(SocketAddrV4::new(group, config.discovery_port));
     let broadcast = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::BROADCAST,
         config.discovery_port,
     ));
+    // Not fatal: without a network yet (a PC that starts LinkCursor at
+    // sign-in before Wi-Fi is up) the join fails, and is tried again with
+    // every announcement. Broadcast works meanwhile.
+    let mut joined = join_discovery_group(&udp, group);
     let (connection_events_tx, mut connection_events_rx) = mpsc::unbounded_channel();
     let mut announce_timer = tokio::time::interval(Duration::from_secs(2));
     let mut maintenance_timer = tokio::time::interval(Duration::from_secs(1));
+    // After the system slept, one tick each rather than every one missed.
+    announce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut state = Runtime {
         config: &config,
@@ -262,6 +271,7 @@ async fn run(
         dialing: HashMap::new(),
         reconnect: HashMap::new(),
         auto_suppressed: HashSet::new(),
+        asleep_until: None,
         input_target: None,
         next_connection_id: 1,
         ping_sequence: 0,
@@ -332,6 +342,15 @@ async fn run(
                     Some(Command::RejectPairing(peer_id)) => state.reject_pairing(&peer_id),
                     Some(Command::Unpair(peer_id)) => state.unpair(&peer_id),
                     Some(Command::SetRequirePairing(required)) => state.set_require_pairing(required),
+                    Some(Command::WillSleep) => state.will_sleep(),
+                    Some(Command::NetworkChanged) => {
+                        state.network_changed();
+                        // The group membership belongs to an interface, which
+                        // may be gone or new: join afresh, and announce now.
+                        let _ = udp.leave_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
+                        joined = join_discovery_group(&udp, group);
+                        announce_timer.reset_immediately();
+                    }
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -339,10 +358,18 @@ async fn run(
                 }
             }
             Some(incoming) = quic.control.accept() => {
-                accept_in_background(incoming, false, state.connection_events.clone());
+                if state.asleep() {
+                    incoming.refuse();
+                } else {
+                    accept_in_background(incoming, false, state.connection_events.clone());
+                }
             }
             Some(incoming) = quic.bulk.accept() => {
-                accept_in_background(incoming, true, state.connection_events.clone());
+                if state.asleep() {
+                    incoming.refuse();
+                } else {
+                    accept_in_background(incoming, true, state.connection_events.clone());
+                }
             }
             received = udp.recv_from(&mut buffer) => {
                 if let Ok((length, source)) = received {
@@ -355,6 +382,9 @@ async fn run(
                 }
             }
             _ = announce_timer.tick() => {
+                if !joined {
+                    joined = join_discovery_group(&udp, group);
+                }
                 let announcement = state.announcement.clone();
                 let _ = udp.send_to(&announcement, multicast).await;
                 // Broadcast is a compatibility fallback for networks or VPN setups that
@@ -442,6 +472,9 @@ struct Runtime<'a> {
     reconnect: HashMap<String, Retry>,
     /// Peers not to connect to by itself until someone connects on purpose.
     auto_suppressed: HashSet<String>,
+    /// The system is going to sleep: no connections in or out until then
+    /// (see `reconnect.rs`).
+    asleep_until: Option<Instant>,
     input_target: Option<String>,
     next_connection_id: u64,
     ping_sequence: u64,
@@ -542,8 +575,10 @@ impl Runtime<'_> {
     /// The input target was already switched to `peer_id` through the input
     /// queue, ahead of this command.
     fn connect(&mut self, peer_id: String) {
-        // On purpose: whatever stopped automatic connects no longer holds.
+        // On purpose: whatever stopped automatic connects no longer holds,
+        // and someone is clearly using this device, so it is not asleep.
         self.resume_auto_connect(&peer_id);
+        self.asleep_until = None;
         if let Some(id) = self.established_session(&peer_id) {
             // Already connected: repeat the event so a shell that lost track
             // of the session can resync.
@@ -1186,6 +1221,8 @@ impl Runtime<'_> {
                     return;
                 };
                 let reason = match result {
+                    // Dialed just before the system started going to sleep.
+                    Ok(_) if self.asleep() => reconnect::GOING_TO_SLEEP.to_owned(),
                     Ok(_) if self.sessions.len() >= MAX_SESSIONS => "too many sessions".to_owned(),
                     Ok(link) => return self.start_session(link, Some(peer_id), false, automatic),
                     Err(error) => format!("connect failed: {error}"),
@@ -1763,7 +1800,16 @@ fn create_discovery_socket(port: u16) -> std::io::Result<UdpSocket> {
     socket.set_multicast_loop_v4(true)?;
     socket.set_broadcast(true)?;
     socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-    socket.join_multicast_v4(&Ipv4Addr::from(DISCOVERY_GROUP), &Ipv4Addr::UNSPECIFIED)?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
+}
+
+/// Joins the discovery group on the system's default interface; false if
+/// that is not possible now (no network).
+fn join_discovery_group(socket: &UdpSocket, group: Ipv4Addr) -> bool {
+    match socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED) {
+        Ok(()) => true,
+        // Still a member there.
+        Err(error) => error.kind() == std::io::ErrorKind::AddrInUse,
+    }
 }
