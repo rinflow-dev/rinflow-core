@@ -23,8 +23,12 @@
  *    lc_core_set_require_pairing; events "pairing_requested", "paired",
  *    "pairing_ended", "unpaired". Wire protocol version 4, which does not
  *    talk to version 3: every device needs this core.
+ * 8: the core keeps the user's devices connected by itself: config key
+ *    "auto_connect" (default true); "disconnected" reasons
+ *    "disconnected on the other device" and "refused by the other device".
+ *    See "Staying connected" below.
  */
-#define LC_CORE_ABI_VERSION 7
+#define LC_CORE_ABI_VERSION 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,6 +103,24 @@ bool lc_core_connect(LcCore *core, const char *peer_id);
 /* Closes the session with the input target, or every session if none is set. */
 bool lc_core_disconnect(LcCore *core);
 bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
+
+/*
+ * Staying connected (version 8, config "auto_connect", default true). The
+ * core connects by itself to the user's devices: paired peers, and placed
+ * peers unless "require_pairing" is on. It connects when such a peer is
+ * discovered, and again after its session drops while the peer is still
+ * around (1 s, 2 s, 4 s … up to 30 s between failed attempts). The shell
+ * needs no timer of its own.
+ *   - Automatic attempts are quiet: no "connecting", and no "disconnected"
+ *     unless they reached "connected" (or the peer's certificate changed).
+ *     They do not change the input target.
+ *   - A peer disconnected with lc_core_disconnect_peer / lc_core_disconnect
+ *     is left alone until lc_core_connect, or until it connects to this
+ *     device. The peer reports "disconnected on the other device" and does
+ *     not reconnect by itself either.
+ *   - So is a peer after declined or timed-out pairing, a changed identity,
+ *     or "refused by the other device" (it would not let this device in).
+ */
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */

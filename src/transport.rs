@@ -24,15 +24,29 @@ pub const PEER_CLOSED: &str = "peer closed the connection";
 /// `disconnected` reason when the peer's user declined pairing.
 pub const PAIRING_DECLINED_BY_PEER: &str = "pairing declined on the other device";
 
+/// `disconnected` reason when the peer's user (or shell) disconnected.
+pub const PEER_DISCONNECTED: &str = "disconnected on the other device";
+
+/// `disconnected` reason when the peer would not let this device in: it
+/// is paired with another certificate under this device's ID, it now only
+/// takes paired devices, or it forgot this one.
+pub const PEER_REFUSED: &str = "refused by the other device";
+
 /// Why this side closes a connection, sent as the application error code of
 /// its QUIC CONNECTION_CLOSE frame. A message queued just before closing
 /// would be dropped with the connection; the close frame always arrives.
+/// The peer also learns from it whether to reconnect by itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseCode {
-    /// An orderly close: the peer reports [`PEER_CLOSED`].
+    /// An orderly close (this device quit, or dropped a duplicate
+    /// connection): the peer reports [`PEER_CLOSED`].
     Closed = 0,
     /// The user declined pairing: [`PAIRING_DECLINED_BY_PEER`].
     PairingDeclined = 1,
+    /// The user disconnected: [`PEER_DISCONNECTED`].
+    Disconnected = 2,
+    /// This device would not let the peer in: [`PEER_REFUSED`].
+    Refused = 3,
 }
 
 impl CloseCode {
@@ -40,6 +54,8 @@ impl CloseCode {
     fn reason(code: u64) -> &'static str {
         match code {
             1 => PAIRING_DECLINED_BY_PEER,
+            2 => PEER_DISCONNECTED,
+            3 => PEER_REFUSED,
             _ => PEER_CLOSED,
         }
     }

@@ -21,7 +21,7 @@ pub struct LcCore {
 /// events `pairing_requested`, `paired`, `pairing_ended`, `unpaired`.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    7
+    8
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.

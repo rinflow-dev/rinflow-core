@@ -1,4 +1,5 @@
 mod data;
+pub(crate) mod reconnect;
 pub(crate) mod trust;
 
 use crate::clipboard::{Clipboard, ClipboardAssembler};
@@ -13,10 +14,11 @@ use crate::quic::QuicEndpoints;
 use crate::remap::ShortcutRemap;
 use crate::secure::Identity;
 use crate::transport::{
-    ActiveConnection, ConnectionEvent, Link, accept_in_background, connect_in_background,
-    spawn_connection,
+    ActiveConnection, CloseCode, ConnectionEvent, Link, accept_in_background,
+    connect_in_background, spawn_connection,
 };
 use data::{DataLink, Download};
+use reconnect::{INCOMPATIBLE, LOCAL_REQUEST, Retry};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -257,7 +259,9 @@ async fn run(
         connection_events: connection_events_tx,
         peers: HashMap::new(),
         sessions: HashMap::new(),
-        dialing: HashSet::new(),
+        dialing: HashMap::new(),
+        reconnect: HashMap::new(),
+        auto_suppressed: HashSet::new(),
         input_target: None,
         next_connection_id: 1,
         ping_sequence: 0,
@@ -375,6 +379,9 @@ struct Session {
     connection: ActiveConnection,
     /// We dialed this connection (as opposed to accepting it).
     outgoing: bool,
+    /// Dialed by `auto_connect`, and the shell has not heard of it yet: it
+    /// ends quietly unless it gets as far as `connected`.
+    automatic: bool,
     /// Came in on the bulk endpoint: can only be a data link.
     bulk_endpoint: bool,
     admission: Admission,
@@ -428,8 +435,13 @@ struct Runtime<'a> {
     peers: HashMap<String, Peer>,
     /// By connection ID.
     sessions: HashMap<u64, Session>,
-    /// Peers with an outgoing connect still in flight.
-    dialing: HashSet<String>,
+    /// Peers with an outgoing connect still in flight, and whether it is an
+    /// automatic one (see `reconnect.rs`).
+    dialing: HashMap<String, bool>,
+    /// When to dial the user's devices again (see `reconnect.rs`).
+    reconnect: HashMap<String, Retry>,
+    /// Peers not to connect to by itself until someone connects on purpose.
+    auto_suppressed: HashSet<String>,
     input_target: Option<String>,
     next_connection_id: u64,
     ping_sequence: u64,
@@ -530,33 +542,66 @@ impl Runtime<'_> {
     /// The input target was already switched to `peer_id` through the input
     /// queue, ahead of this command.
     fn connect(&mut self, peer_id: String) {
+        // On purpose: whatever stopped automatic connects no longer holds.
+        self.resume_auto_connect(&peer_id);
         if let Some(id) = self.established_session(&peer_id) {
             // Already connected: repeat the event so a shell that lost track
             // of the session can resync.
             self.emit_connected(id);
             return;
         }
+        // An automatic attempt under way becomes this one: the shell hears
+        // about it from now on.
+        let pending = self
+            .sessions
+            .iter_mut()
+            .find(|(_, session)| session.outgoing && session.peer_id() == Some(peer_id.as_str()));
+        if let Some((_, session)) = pending {
+            let announce = std::mem::take(&mut session.automatic);
+            if announce {
+                self.sink
+                    .emit_value(json!({ "event": "connecting", "peer_id": peer_id }));
+            }
+        }
         if let Some(id) = self.handshaken_session(&peer_id) {
             // Pairing: show the code again.
             self.announce_pairing(id);
             return;
         }
-        let pending = self
+        if self
             .sessions
             .values()
-            .any(|session| session.outgoing && session.peer_id() == Some(peer_id.as_str()));
-        if pending || self.dialing.contains(&peer_id) {
+            .any(|session| session.outgoing && session.peer_id() == Some(peer_id.as_str()))
+        {
             return;
         }
-        let Some(peer) = self.peers.get(&peer_id) else {
+        if let Some(automatic) = self.dialing.get_mut(&peer_id) {
+            if std::mem::take(automatic) {
+                self.sink
+                    .emit_value(json!({ "event": "connecting", "peer_id": peer_id }));
+            }
+            return;
+        }
+        if !self.peers.contains_key(&peer_id) {
             self.sink
                 .emit_error(format!("peer is no longer available: {peer_id}"));
             return;
+        }
+        self.dial(peer_id, false);
+    }
+
+    /// Dials a discovered peer. `automatic` ones (see `reconnect.rs`) are
+    /// not announced with `connecting`.
+    fn dial(&mut self, peer_id: String, automatic: bool) {
+        let Some(peer) = self.peers.get(&peer_id) else {
+            return;
         };
         let address = peer.socket_address;
-        self.sink
-            .emit_value(json!({ "event": "connecting", "peer_id": peer_id }));
-        self.dialing.insert(peer_id.clone());
+        if !automatic {
+            self.sink
+                .emit_value(json!({ "event": "connecting", "peer_id": peer_id }));
+        }
+        self.dialing.insert(peer_id.clone(), automatic);
         connect_in_background(
             peer_id,
             self.quic.dialer(false),
@@ -573,11 +618,11 @@ impl Runtime<'_> {
                     .sessions
                     .values()
                     .filter_map(|session| session.peer_id().map(str::to_owned))
-                    .chain(self.dialing.iter().cloned())
+                    .chain(self.dialing.keys().cloned())
                     .collect();
                 if peers.is_empty() {
                     self.sink
-                        .emit_value(json!({ "event": "disconnected", "reason": "local request" }));
+                        .emit_value(json!({ "event": "disconnected", "reason": LOCAL_REQUEST }));
                 }
                 for peer_id in peers {
                     self.disconnect_peer(&peer_id);
@@ -596,16 +641,31 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.close_session(id, "local request", false);
+            if let Some(session) = self.sessions.get(&id) {
+                // The peer does not reconnect by itself either.
+                session.connection.close_with(CloseCode::Disconnected);
+            }
+            self.close_session(id, LOCAL_REQUEST, false);
         }
+        // Not until the user connects again.
+        self.leave_alone(peer_id);
         if self.input_target.as_deref() == Some(peer_id) {
             self.input_target = None;
         }
         self.sink.emit_value(json!({
             "event": "disconnected",
             "peer_id": peer_id,
-            "reason": "local request"
+            "reason": LOCAL_REQUEST
         }));
+    }
+
+    /// Closes a session this device will not let in, telling the peer so
+    /// (it then stops reconnecting by itself).
+    fn refuse_session(&mut self, id: u64, reason: &str) {
+        if let Some(session) = self.sessions.get(&id) {
+            session.connection.close_with(CloseCode::Refused);
+        }
+        self.close_session(id, reason, true);
     }
 
     fn set_input_target(&mut self, peer_id: Option<String>) {
@@ -750,10 +810,16 @@ impl Runtime<'_> {
                 .emit_error("incoming connection refused: too many sessions");
             return;
         }
-        self.start_session(link, None, bulk);
+        self.start_session(link, None, bulk, false);
     }
 
-    fn start_session(&mut self, link: Link, peer_id: Option<String>, bulk_endpoint: bool) {
+    fn start_session(
+        &mut self,
+        link: Link,
+        peer_id: Option<String>,
+        bulk_endpoint: bool,
+        automatic: bool,
+    ) {
         let id = self.next_connection_id;
         self.quic.note_peer(link.remote(), bulk_endpoint);
         // Those from the bulk endpoint must turn out to be data links (see
@@ -773,6 +839,7 @@ impl Runtime<'_> {
                     Session {
                         connection,
                         outgoing,
+                        automatic,
                         bulk_endpoint,
                         admission: Admission::Waiting,
                         pairing: None,
@@ -829,6 +896,10 @@ impl Runtime<'_> {
         }
         if !message.displays.is_empty() {
             self.update_peer_displays(&message.device_id, message.displays);
+        }
+        if is_new {
+            // One of the user's devices came back: no need to wait.
+            self.auto_connect();
         }
     }
 
@@ -1110,27 +1181,23 @@ impl Runtime<'_> {
     fn connection_event(&mut self, event: ConnectionEvent) {
         match event {
             ConnectionEvent::ConnectResult { peer_id, result } => {
-                if !self.dialing.remove(&peer_id) {
+                let Some(automatic) = self.dialing.remove(&peer_id) else {
                     // Cancelled by a disconnect while the connect was in flight.
                     return;
-                }
-                match result {
-                    Ok(link) => {
-                        if self.sessions.len() >= MAX_SESSIONS {
-                            self.sink.emit_value(json!({
-                                "event": "disconnected",
-                                "peer_id": peer_id,
-                                "reason": "too many sessions"
-                            }));
-                            return;
-                        }
-                        self.start_session(link, Some(peer_id), false);
-                    }
-                    Err(error) => self.sink.emit_value(json!({
+                };
+                let reason = match result {
+                    Ok(_) if self.sessions.len() >= MAX_SESSIONS => "too many sessions".to_owned(),
+                    Ok(link) => return self.start_session(link, Some(peer_id), false, automatic),
+                    Err(error) => format!("connect failed: {error}"),
+                };
+                self.connect_failed(&peer_id);
+                // Automatic attempts fail quietly; the next one is scheduled.
+                if !automatic {
+                    self.sink.emit_value(json!({
                         "event": "disconnected",
                         "peer_id": peer_id,
-                        "reason": format!("connect failed: {error}")
-                    })),
+                        "reason": reason
+                    }));
                 }
             }
             ConnectionEvent::Message {
@@ -1364,7 +1431,7 @@ impl Runtime<'_> {
                 .peer_id()
                 .is_some_and(|expected| expected != hello.device_id);
         if incompatible {
-            self.close_session(id, "incompatible peer", true);
+            self.refuse_session(id, INCOMPATIBLE);
             return;
         }
 
@@ -1424,10 +1491,14 @@ impl Runtime<'_> {
             return;
         };
         session.admission = Admission::Admitted;
+        // The shell hears about it now (`connected`), and about its end.
+        session.automatic = false;
         let held = std::mem::take(&mut session.held);
         let Some(peer_id) = session.peer_id().map(str::to_owned) else {
             return;
         };
+        // Connected, whoever asked: automatic connects start afresh after.
+        self.resume_auto_connect(&peer_id);
         if self.input_target.is_none() {
             // With no explicit choice, input goes to the first connected peer,
             // as it did when the core held a single connection.
@@ -1526,7 +1597,16 @@ impl Runtime<'_> {
             reason,
             peer_id.as_deref(),
         );
-        if notify && let Some(peer_id) = peer_id {
+        if let Some(peer_id) = &peer_id {
+            self.session_ended(peer_id, reason);
+        }
+        // An automatic attempt the shell never heard of ends quietly, unless
+        // the device turned out not to be the one paired.
+        let quiet = session.automatic && reason != trust::IDENTITY_CHANGED;
+        if notify
+            && !quiet
+            && let Some(peer_id) = peer_id
+        {
             self.notify_disconnected(peer_id, reason);
         } else {
             // A connection that might have been a held-back peer is gone.
@@ -1621,6 +1701,7 @@ impl Runtime<'_> {
         }
         self.expire_pairings();
         self.reinvite_data_links();
+        self.auto_connect();
     }
 }
 

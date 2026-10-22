@@ -116,6 +116,10 @@ pub struct CoreConfig {
     pub trusted_peers: Vec<TrustedPeer>,
     /// Only paired peers may connect: others are asked to pair first.
     pub require_pairing: bool,
+    /// Keep the user's devices connected without being asked: paired peers,
+    /// and placed ones unless `require_pairing` (see `runtime/reconnect.rs`).
+    /// On by default.
+    pub auto_connect: bool,
 }
 
 /// A paired peer: its device ID and the fingerprint of its certificate.
@@ -155,6 +159,7 @@ impl Default for CoreConfig {
             identity_path: None,
             trusted_peers: Vec::new(),
             require_pairing: false,
+            auto_connect: true,
         }
     }
 }

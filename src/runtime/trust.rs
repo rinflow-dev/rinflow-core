@@ -69,7 +69,7 @@ impl Runtime<'_> {
                 self.sink.emit_error(format!(
                     "{peer_id} presented a different certificate than when it was paired; refused"
                 ));
-                self.close_session(id, IDENTITY_CHANGED, true);
+                self.refuse_session(id, IDENTITY_CHANGED);
             }
             None if self.require_pairing => self.start_pairing(id, true),
             None => self.admit(id),
@@ -219,7 +219,7 @@ impl Runtime<'_> {
         self.sink
             .emit_value(json!({ "event": "unpaired", "peer_id": peer_id }));
         if self.require_pairing {
-            self.close_peer_sessions(peer_id, UNPAIRED);
+            self.refuse_peer_sessions(peer_id, UNPAIRED);
         }
     }
 
@@ -242,7 +242,7 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
             .collect();
         for id in untrusted {
-            self.close_session(id, PAIRING_REQUIRED, true);
+            self.refuse_session(id, PAIRING_REQUIRED);
         }
     }
 
@@ -253,7 +253,7 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
     }
 
-    fn close_peer_sessions(&mut self, peer_id: &str, reason: &str) {
+    fn refuse_peer_sessions(&mut self, peer_id: &str, reason: &str) {
         let ids: Vec<u64> = self
             .sessions
             .iter()
@@ -261,7 +261,7 @@ impl Runtime<'_> {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.close_session(id, reason, true);
+            self.refuse_session(id, reason);
         }
     }
 

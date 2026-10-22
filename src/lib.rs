@@ -1022,11 +1022,11 @@ mod tests {
         a.thread
             .send(Command::DisconnectPeer("multi-c".into()))
             .unwrap();
-        // C sees an orderly close, not a failure.
+        // C learns that A disconnected on purpose, not that something failed.
         wait_for_event(&c.events, Duration::from_secs(3), |event| {
             event["event"] == "disconnected"
                 && event["peer_id"] == "multi-a"
-                && event["reason"] == "peer closed the connection"
+                && event["reason"] == crate::transport::PEER_DISCONNECTED
         });
         a.thread.send(Command::SendInput(motion(3.0))).unwrap();
         assert_eq!(received(&b, Duration::from_millis(400)), vec![3.0]);
@@ -1382,9 +1382,12 @@ mod tests {
         let mut b = test_core_with("decline-b", discovery_port, require);
         wait_for_peers(&a, &["decline-b"]);
         a.thread.send(Command::Connect("decline-b".into())).unwrap();
-        wait_for_event(&b.events, Duration::from_secs(6), |event| {
-            event["event"] == "pairing_requested"
-        });
+        // Both show the code before B's user declines.
+        for core in [&a, &b] {
+            wait_for_event(&core.events, Duration::from_secs(6), |event| {
+                event["event"] == "pairing_requested"
+            });
+        }
         b.thread
             .send(Command::RejectPairing("decline-a".into()))
             .unwrap();
@@ -2170,6 +2173,159 @@ mod tests {
         let refitted = wait_for_placement(&a, "saved-b", "local");
         assert_eq!(refitted["offset"]["x"], 1440.0);
 
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    /// Identity files for two devices that paired before, in a fresh
+    /// directory: (directory, fingerprint of `a`, fingerprint of `b`).
+    fn paired_identities(test: &str, a: &str, b: &str) -> (PathBuf, String, String) {
+        let directory =
+            std::env::temp_dir().join(format!("linkcursor-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let fingerprint = |id: &str| {
+            crate::secure::Identity::load_or_create(Some(&directory.join(id)), id)
+                .unwrap()
+                .fingerprint
+        };
+        let (a, b) = (fingerprint(a), fingerprint(b));
+        (directory, a, b)
+    }
+
+    /// The config of `own`, which paired with `other` (as the shell passes
+    /// back what `paired` reported).
+    fn paired_with(
+        directory: &Path,
+        own: &str,
+        other: &str,
+        fingerprint: &str,
+    ) -> impl FnOnce(&mut CoreConfig) + use<> {
+        let identity_path = directory.join(own).to_string_lossy().into_owned();
+        let peer = TrustedPeer {
+            peer_id: other.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+        };
+        move |config: &mut CoreConfig| {
+            config.identity_path = Some(identity_path);
+            config.trusted_peers = vec![peer];
+        }
+    }
+
+    #[test]
+    fn paired_devices_connect_by_themselves_and_come_back_after_a_restart() {
+        let _network = network_test();
+        let (directory, a_fingerprint, b_fingerprint) =
+            paired_identities("auto", "auto-a", "auto-b");
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with(
+            "auto-a",
+            discovery_port,
+            paired_with(&directory, "auto-a", "auto-b", &b_fingerprint),
+        );
+        let mut b = test_core_with(
+            "auto-b",
+            discovery_port,
+            paired_with(&directory, "auto-b", "auto-a", &a_fingerprint),
+        );
+
+        // Nobody asks: they find each other and connect, quietly.
+        let connected = wait_connected_event(&a, "auto-b");
+        assert_eq!(connected["paired"], true);
+        wait_connected(&b, "auto-a");
+        assert!(events_named(&a, "connecting").is_empty());
+
+        // B quits and starts again: they connect again by themselves.
+        b.thread.stop_and_join();
+        wait_for_event(&a.events, Duration::from_secs(4), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "auto-b"
+        });
+        let mut b = test_core_with(
+            "auto-b",
+            discovery_port,
+            paired_with(&directory, "auto-b", "auto-a", &a_fingerprint),
+        );
+        wait_for_event(&a.events, Duration::from_secs(12), |event| {
+            event["event"] == "connected" && event["peer"]["id"] == "auto-b"
+        });
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![1.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_disconnect_on_either_side_holds_until_someone_connects_again() {
+        let _network = network_test();
+        let (directory, a_fingerprint, b_fingerprint) =
+            paired_identities("hold", "hold-a", "hold-b");
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with(
+            "hold-a",
+            discovery_port,
+            paired_with(&directory, "hold-a", "hold-b", &b_fingerprint),
+        );
+        let mut b = test_core_with(
+            "hold-b",
+            discovery_port,
+            paired_with(&directory, "hold-b", "hold-a", &a_fingerprint),
+        );
+        wait_connected(&a, "hold-b");
+        wait_connected(&b, "hold-a");
+
+        // A's user disconnects: B is told why, and neither reconnects.
+        a.thread
+            .send(Command::DisconnectPeer("hold-b".into()))
+            .unwrap();
+        let ended = wait_for_event(&b.events, Duration::from_secs(3), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "hold-a"
+        });
+        assert_eq!(ended["reason"], crate::transport::PEER_DISCONNECTED);
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(events_named(&a, "connected").is_empty());
+        assert!(events_named(&b, "connected").is_empty());
+
+        // B's user connects: that is on purpose.
+        b.thread.send(Command::Connect("hold-a".into())).unwrap();
+        wait_connected(&a, "hold-b");
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn placed_peers_are_kept_connected_unless_only_paired_ones_may_connect() {
+        let _network = network_test();
+        let placed = |peer_id: &str| {
+            vec![PlacementRecord {
+                peer_id: peer_id.to_owned(),
+                offset: Some(Offset { x: 1440.0, y: 0.0 }),
+                updated_ms: 1,
+            }]
+        };
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with("placed-a", discovery_port, |config| {
+            config.placements = placed("placed-b");
+        });
+        let mut b = test_core("placed-b", discovery_port);
+        wait_connected(&a, "placed-b");
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+
+        // Not paired and only paired devices may connect: connecting would
+        // ask the user to pair out of the blue, so it is left to the user.
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with("strict-placed-a", discovery_port, |config| {
+            config.placements = placed("strict-placed-b");
+            config.require_pairing = true;
+        });
+        let mut b = test_core("strict-placed-b", discovery_port);
+        wait_for_peers(&a, &["strict-placed-b"]);
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(events_named(&a, "pairing_requested").is_empty());
+        assert!(events_named(&a, "connected").is_empty());
         a.thread.stop_and_join();
         b.thread.stop_and_join();
     }
