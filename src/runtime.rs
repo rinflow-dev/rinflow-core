@@ -1,4 +1,5 @@
 mod data;
+pub mod manual;
 pub(crate) mod reconnect;
 pub(crate) mod trust;
 
@@ -7,8 +8,9 @@ use crate::files::Offer;
 use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CoreConfig, DISCOVERY_GROUP,
-    LcInputEvent, Peer, PlacementRecord, WireMessage, negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CAPABILITY_POINTER_LOCK,
+    CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer, PlacementRecord,
+    WireMessage, negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
 use crate::remap::ShortcutRemap;
@@ -17,7 +19,7 @@ use crate::transport::{
     ActiveConnection, CloseCode, ConnectionEvent, Link, accept_in_background,
     connect_in_background, spawn_connection,
 };
-use data::{DataLink, Download};
+use data::{DataLink, Download, Upload};
 use reconnect::{INCOMPATIBLE, LOCAL_REQUEST, Retry, WRONG_DEVICE};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -39,6 +41,8 @@ const MAX_ANONYMOUS: usize = 3;
 /// within this time is closed.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(8);
 const PEER_EXPIRY: Duration = Duration::from_secs(7);
+/// `UserActive` goes to each peer at most this often.
+const ACTIVITY_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct EventSink {
@@ -112,6 +116,19 @@ pub enum Command {
     WillSleep,
     /// The system woke up, or the network changed (see `reconnect.rs`).
     NetworkChanged,
+    /// Addresses to find devices at besides multicast (see `manual.rs`).
+    SetManualAddresses(Vec<String>),
+    /// Translate Command and Control shortcuts from peers of the other
+    /// platform convention (`CoreConfig::shortcut_remap`).
+    SetShortcutRemap(bool),
+    /// Someone used this device's own keyboard or mouse: peers that want to
+    /// stay awake meanwhile hear so (`UserActive`).
+    ReportUserActivity,
+    /// The user locked this device: peers lock too if their users want that.
+    LockPeers,
+    /// A game or a pointer-lock page holds this device's pointer: whoever
+    /// drives it stops crossing at its edges meanwhile.
+    SetPointerLocked(bool),
     Stop,
 }
 
@@ -277,13 +294,15 @@ async fn run(
         input_target: None,
         next_connection_id: 1,
         ping_sequence: 0,
-        announcement: serde_json::to_vec(&Announcement::from_config(
-            &config,
-            &config.displays,
-            capabilities,
-            &fingerprint,
-        ))
-        .unwrap_or_default(),
+        announcement: Vec::new(),
+        probe: Vec::new(),
+        datagrams: Vec::new(),
+        manual: Vec::new(),
+        manual_status: Value::Null,
+        answered_probes: HashMap::new(),
+        shortcut_remap: config.shortcut_remap,
+        pointer_locked: false,
+        refitting: false,
         capabilities,
         fingerprint: fingerprint.clone(),
         quic: quic.clone(),
@@ -325,7 +344,9 @@ async fn run(
         "discovery_port": config.discovery_port,
         "fingerprint": fingerprint
     }));
+    state.rebuild_announcements();
     state.publish_portals();
+    state.set_manual_addresses(config.manual_addresses.clone());
 
     loop {
         tokio::select! {
@@ -349,12 +370,21 @@ async fn run(
                     Some(Command::WillSleep) => state.will_sleep(),
                     Some(Command::NetworkChanged) => {
                         state.network_changed();
+                        state.manual_network_changed();
                         // The group membership belongs to an interface, which
                         // may be gone or new: join afresh, and announce now.
                         let _ = udp.leave_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
                         joined = join_discovery_group(&udp, group);
                         announce_timer.reset_immediately();
                     }
+                    Some(Command::SetManualAddresses(addresses)) => state.set_manual_addresses(addresses),
+                    Some(Command::SetShortcutRemap(enabled)) => {
+                        state.shortcut_remap = enabled;
+                        state.refresh_shortcut_remap();
+                    }
+                    Some(Command::ReportUserActivity) => state.report_user_activity(),
+                    Some(Command::LockPeers) => state.lock_peers(),
+                    Some(Command::SetPointerLocked(locked)) => state.set_pointer_locked(locked),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
@@ -394,8 +424,14 @@ async fn run(
                 // Broadcast is a compatibility fallback for networks or VPN setups that
                 // suppress multicast. Receivers deduplicate announcements by device ID.
                 let _ = udp.send_to(&announcement, broadcast).await;
+                // And straight to the addresses the user added (`manual.rs`).
+                state.probe_manual();
             }
             _ = maintenance_timer.tick() => state.maintenance(),
+        }
+        // Probes and answers queued meanwhile (see `manual.rs`).
+        for (datagram, target) in std::mem::take(&mut state.datagrams) {
+            let _ = udp.send_to(&datagram, target).await;
         }
     }
 
@@ -444,6 +480,8 @@ struct Session {
     /// The token this side invited the peer with, and when.
     data_token: Option<u64>,
     data_invited: Option<Instant>,
+    /// When `UserActive` last went to the peer.
+    activity_sent: Option<Instant>,
 }
 
 impl Session {
@@ -484,6 +522,23 @@ struct Runtime<'a> {
     ping_sequence: u64,
     /// The discovery datagram; rebuilt when the displays change.
     announcement: Vec<u8>,
+    /// The same, asking for an answer: sent to manually added addresses.
+    probe: Vec<u8>,
+    /// Datagrams to send from the discovery socket (probes, answers).
+    datagrams: Vec<(Vec<u8>, SocketAddr)>,
+    /// Addresses to find devices at by hand, and their state as last
+    /// reported (see `manual.rs`).
+    manual: Vec<manual::ManualAddress>,
+    manual_status: Value,
+    /// When each sender's probe was last answered.
+    answered_probes: HashMap<std::net::IpAddr, Instant>,
+    /// Translate shortcuts from peers of the other platform convention.
+    shortcut_remap: bool,
+    /// A game or a pointer-lock page holds this device's pointer.
+    pointer_locked: bool,
+    /// Placements are being fitted again after a change (`refit_others`);
+    /// the moves that makes do not start another round.
+    refitting: bool,
     /// What this device offers (`CoreConfig::advertised_capabilities`).
     capabilities: u64,
     /// This device's certificate fingerprint.
@@ -530,7 +585,7 @@ struct Runtime<'a> {
     /// that writer has removed its partial file.
     download_failures: Vec<(u64, Value)>,
     /// File uploads in progress, by data link.
-    uploads: HashMap<u64, tokio::task::JoinHandle<()>>,
+    uploads: HashMap<u64, Upload>,
 }
 
 /// How long a disconnect may be held back while a duplicate connection that
@@ -900,6 +955,7 @@ impl Runtime<'_> {
                         data: None,
                         data_token: None,
                         data_invited: None,
+                        activity_sent: None,
                     },
                 );
             }
@@ -907,6 +963,19 @@ impl Runtime<'_> {
                 .sink
                 .emit_error(format!("connection setup failed: {error}")),
         }
+    }
+
+    /// The discovery datagram, and the probe that asks for an answer.
+    fn rebuild_announcements(&mut self) {
+        let mut announcement = Announcement::from_config(
+            self.config,
+            &self.local_displays,
+            self.capabilities,
+            &self.fingerprint,
+        );
+        self.announcement = serde_json::to_vec(&announcement).unwrap_or_default();
+        announcement.reply = true;
+        self.probe = serde_json::to_vec(&announcement).unwrap_or_default();
     }
 
     fn announcement(&mut self, data: &[u8], source: SocketAddr) {
@@ -919,6 +988,8 @@ impl Runtime<'_> {
         {
             return;
         }
+        // Answers probes, and notes devices found at manual addresses.
+        self.manual_announcement(source, &message.device_id, message.reply);
         let peer = Peer {
             id: message.device_id.clone(),
             name: message.device_name,
@@ -946,8 +1017,87 @@ impl Runtime<'_> {
             self.update_peer_displays(&message.device_id, message.displays);
         }
         if is_new {
+            // Its platform decides how shortcuts are translated.
+            self.refresh_shortcut_remap();
             // One of the user's devices came back: no need to wait.
             self.auto_connect();
+        }
+    }
+
+    /// Sets each session's shortcut translation from the peer's platform
+    /// and the setting. Keys held through a change were translated the old
+    /// way, so they are released first.
+    fn refresh_shortcut_remap(&mut self) {
+        let sink = self.sink;
+        for session in self.sessions.values_mut() {
+            let Some(peer_id) = session.peer_id().map(str::to_owned) else {
+                continue;
+            };
+            let platform = self
+                .peers
+                .get(&peer_id)
+                .map_or("unknown", |peer| peer.platform.as_str());
+            let remap = if self.shortcut_remap {
+                ShortcutRemap::between(platform, &self.config.platform)
+            } else {
+                ShortcutRemap::None
+            };
+            if session.connection.shortcut_remap == remap {
+                continue;
+            }
+            emit_release_events(
+                session.remote_input.release_events(),
+                sink,
+                "shortcut translation changed",
+                Some(&peer_id),
+            );
+            session.connection.shortcut_remap = remap;
+        }
+    }
+
+    // ---- Presence -------------------------------------------------------
+
+    /// Someone uses this device: peers that understand it hear so, each at
+    /// most every [`ACTIVITY_INTERVAL`].
+    fn report_user_activity(&mut self) {
+        let now = Instant::now();
+        for session in self.sessions.values_mut() {
+            if !session.established()
+                || session.connection.capabilities & CAPABILITY_PRESENCE == 0
+                || session
+                    .activity_sent
+                    .is_some_and(|at| now.duration_since(at) < ACTIVITY_INTERVAL)
+            {
+                continue;
+            }
+            session.activity_sent = Some(now);
+            let _ = session.connection.send_control(WireMessage::UserActive);
+        }
+    }
+
+    /// This device was locked: so are peers whose users want that.
+    fn lock_peers(&mut self) {
+        for session in self.sessions.values().filter(|session| {
+            session.established() && session.connection.capabilities & CAPABILITY_PRESENCE != 0
+        }) {
+            let _ = session.connection.send_control(WireMessage::LockScreen);
+        }
+    }
+
+    /// Tells the peers driving this device whether its pointer is held.
+    fn set_pointer_locked(&mut self, locked: bool) {
+        if self.pointer_locked == locked {
+            return;
+        }
+        self.pointer_locked = locked;
+        for session in self.sessions.values().filter(|session| {
+            session.established()
+                && session.remote_input.is_controlling()
+                && session.connection.capabilities & CAPABILITY_POINTER_LOCK != 0
+        }) {
+            let _ = session
+                .connection
+                .send_control(WireMessage::PointerLock { locked });
         }
     }
 
@@ -1022,13 +1172,46 @@ impl Runtime<'_> {
             return;
         };
         let peer = self.peer_layout(peer_id);
-        let obstacles = self.obstacles(peer_id);
-        if layout::is_valid_placement(&self.local_displays, &peer, offset, &obstacles) {
+        let others = self.others(peer_id);
+        if layout::is_valid_in_arrangement(&self.local_displays, &peer, offset, &others) {
             return;
         }
-        if let Some(snapped) = layout::snap(&self.local_displays, &peer, offset, &obstacles) {
+        if let Some(snapped) =
+            layout::snap_in_arrangement(&self.local_displays, &peer, offset, &others)
+        {
             self.store_local_placement(peer_id, Some(snapped));
         }
+    }
+
+    /// After a placement changed: peers placed against it may now float or
+    /// overlap, and are fitted again.
+    fn refit_others(&mut self, changed: &str) {
+        if self.refitting {
+            return;
+        }
+        self.refitting = true;
+        let placed: Vec<String> = self
+            .placements
+            .values()
+            .filter(|record| record.offset.is_some() && record.peer_id != changed)
+            .map(|record| record.peer_id.clone())
+            .collect();
+        for peer_id in placed {
+            self.refit_placement(&peer_id);
+        }
+        self.refitting = false;
+    }
+
+    /// Whether the peer's placement touches this device itself, rather than
+    /// only another placed peer (see `layout.rs`, chained arrangements).
+    fn touches_local(&self, peer_id: &str) -> bool {
+        self.placements
+            .get(peer_id)
+            .and_then(|record| record.offset)
+            .is_some_and(|offset| {
+                !layout::portals(&self.local_displays, &self.peer_layout(peer_id), offset)
+                    .is_empty()
+            })
     }
 
     fn set_local_displays(&mut self, displays: Vec<Display>) {
@@ -1040,13 +1223,7 @@ impl Runtime<'_> {
             return;
         }
         self.local_displays = displays;
-        self.announcement = serde_json::to_vec(&Announcement::from_config(
-            self.config,
-            &self.local_displays,
-            self.capabilities,
-            &self.fingerprint,
-        ))
-        .unwrap_or_default();
+        self.rebuild_announcements();
         let info = WireMessage::ScreenInfo {
             displays: self.local_displays.clone(),
         };
@@ -1081,18 +1258,24 @@ impl Runtime<'_> {
         )
     }
 
-    /// Displays of every other placed peer, in this device's space.
-    fn obstacles(&self, except: &str) -> Vec<Display> {
-        self.placements
+    /// Every other placed peer, as its displays in this device's space.
+    fn others(&self, except: &str) -> Vec<Vec<Display>> {
+        let mut others: Vec<(&String, Vec<Display>)> = self
+            .placements
             .values()
             .filter(|record| record.peer_id != except)
             .filter_map(|record| {
-                record
-                    .offset
-                    .map(|offset| layout::placed(&self.peer_layout(&record.peer_id), offset))
+                record.offset.map(|offset| {
+                    (
+                        &record.peer_id,
+                        layout::placed(&self.peer_layout(&record.peer_id), offset),
+                    )
+                })
             })
-            .flatten()
-            .collect()
+            .collect();
+        // The same order every time, so snapping is repeatable.
+        others.sort_by(|a, b| a.0.cmp(b.0));
+        others.into_iter().map(|(_, displays)| displays).collect()
     }
 
     fn set_placement(&mut self, peer_id: &str, proposed: Option<Offset>) {
@@ -1109,8 +1292,8 @@ impl Runtime<'_> {
                     return;
                 }
                 let peer = self.peer_layout(peer_id);
-                let obstacles = self.obstacles(peer_id);
-                match layout::snap(&self.local_displays, &peer, proposed, &obstacles) {
+                let others = self.others(peer_id);
+                match layout::snap_in_arrangement(&self.local_displays, &peer, proposed, &others) {
                     Some(snapped) => Some(snapped),
                     None => {
                         self.sink.emit_error(format!("no room to place {peer_id}"));
@@ -1129,8 +1312,8 @@ impl Runtime<'_> {
             return;
         }
         let peer = self.peer_layout(peer_id);
-        let obstacles = self.obstacles(peer_id);
-        match layout::place_beside(&self.local_displays, &peer, side, &obstacles) {
+        let others = self.others(peer_id);
+        match layout::place_beside_in_arrangement(&self.local_displays, &peer, side, &others) {
             Some(offset) => self.store_local_placement(peer_id, Some(offset)),
             None => self
                 .sink
@@ -1176,8 +1359,13 @@ impl Runtime<'_> {
             self.send_placement(peer_id);
         }
         self.publish_portals();
+        self.refit_others(peer_id);
     }
 
+    /// Tells the peer where it sits. A peer placed against another peer
+    /// only (chained) is not told: it does not touch this device, so seen
+    /// from it this device sits nowhere it could place it, and its own
+    /// arrangement stays as its user left it.
     fn send_placement(&self, peer_id: &str) {
         let (Some(record), Some(id)) = (
             self.placements.get(peer_id),
@@ -1185,6 +1373,9 @@ impl Runtime<'_> {
         ) else {
             return;
         };
+        if record.offset.is_some() && !self.touches_local(peer_id) {
+            return;
+        }
         let _ = self.sessions[&id]
             .connection
             .send_control(WireMessage::Placement {
@@ -1214,10 +1405,10 @@ impl Runtime<'_> {
             && !self.local_displays.is_empty()
         {
             let peer = self.peer_layout(peer_id);
-            let obstacles = self.obstacles(peer_id);
-            if !layout::is_valid_placement(&self.local_displays, &peer, mirrored, &obstacles)
+            let others = self.others(peer_id);
+            if !layout::is_valid_in_arrangement(&self.local_displays, &peer, mirrored, &others)
                 && let Some(snapped) =
-                    layout::snap(&self.local_displays, &peer, mirrored, &obstacles)
+                    layout::snap_in_arrangement(&self.local_displays, &peer, mirrored, &others)
             {
                 self.store_local_placement(peer_id, Some(snapped));
                 return;
@@ -1265,6 +1456,9 @@ impl Runtime<'_> {
             ConnectionEvent::Accepted { link, bulk } => self.accept(link, bulk),
             ConnectionEvent::FilesWritten { writer, outcome } => {
                 self.files_written(writer, outcome);
+            }
+            ConnectionEvent::ManualResolved { address, result } => {
+                self.manual_resolved(&address, result);
             }
             ConnectionEvent::Closed {
                 connection_id,
@@ -1392,6 +1586,23 @@ impl Runtime<'_> {
             WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
             WireMessage::PairRequest => self.pair_requested(id),
             WireMessage::PairAccept => self.pair_accepted(id),
+            // The shell decides, by its user's settings (see `CoreConfig`
+            // and the header's "Presence" section).
+            WireMessage::UserActive => {
+                self.sink
+                    .emit_value(json!({ "event": "peer_active", "peer_id": session.peer_id() }));
+            }
+            WireMessage::LockScreen => {
+                self.sink
+                    .emit_value(json!({ "event": "lock_requested", "peer_id": session.peer_id() }));
+            }
+            WireMessage::PointerLock { locked } => {
+                self.sink.emit_value(json!({
+                    "event": "peer_pointer_lock",
+                    "peer_id": session.peer_id(),
+                    "locked": locked
+                }));
+            }
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
             | WireMessage::ClipboardChunk { .. }
@@ -1458,6 +1669,14 @@ impl Runtime<'_> {
         };
         if session.remote_input.begin_control() {
             sink.emit_value(json!({ "event": "remote_control_started", "peer_id": peer_id }));
+            // A game here holds the pointer already: the new controller
+            // keeps it here instead of crossing at the edges.
+            if self.pointer_locked && session.connection.capabilities & CAPABILITY_POINTER_LOCK != 0
+            {
+                let _ = session
+                    .connection
+                    .send_control(WireMessage::PointerLock { locked: true });
+            }
         }
         let shortcut_remap = session.connection.shortcut_remap;
         for mut event in events {
@@ -1536,7 +1755,7 @@ impl Runtime<'_> {
             .get(&hello.device_id)
             .map(|peer| peer.platform.as_str())
             .unwrap_or("unknown");
-        let shortcut_remap = if config.shortcut_remap {
+        let shortcut_remap = if self.shortcut_remap {
             ShortcutRemap::between(peer_platform, &config.platform)
         } else {
             ShortcutRemap::None
@@ -1786,6 +2005,7 @@ impl Runtime<'_> {
         }
         self.expire_pairings();
         self.reinvite_data_links();
+        self.publish_manual();
         self.auto_connect();
     }
 }

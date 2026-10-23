@@ -32,6 +32,7 @@ pub use model::{
     LC_MODIFIER_RIGHT_CONTROL, LC_MODIFIER_RIGHT_OPTION, LC_MODIFIER_RIGHT_SHIFT,
     LC_MODIFIER_SHIFT, LcInputEvent, PlacementRecord, TrustedPeer,
 };
+pub use runtime::manual::parse_address;
 
 #[cfg(test)]
 mod tests {
@@ -1812,10 +1813,24 @@ mod tests {
             .unwrap();
         a.thread.send(Command::SendInput(motion(1.0))).unwrap();
 
+        // Both sides can show what goes on.
+        let receiving = wait_for_event(&b.events, Duration::from_secs(10), |event| {
+            event["event"] == "files_receiving"
+        });
+        assert_eq!(receiving["peer_id"], "files-a");
+        assert_eq!(receiving["name"], "报告");
+        assert_eq!(receiving["items"], 2);
+        assert_eq!(receiving["count"], 4);
+        assert_eq!(receiving["total_size"], 400_006);
         let done = wait_for_event(&b.events, Duration::from_secs(10), |event| {
             event["event"] == "files_received" || event["event"] == "files_failed"
         });
         assert_eq!(done["event"], "files_received", "{done}");
+        let sent = wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "files_send_ended"
+        });
+        assert_eq!(sent["peer_id"], "files-b");
+        assert_eq!(sent["reason"], "done");
         let got = |path: &Path| std::fs::read(path).unwrap();
         assert_eq!(got(&downloads.join("报告/a.txt")), pattern(100_000, 1));
         assert_eq!(got(&downloads.join("报告/empty.txt")), b"");
@@ -2401,6 +2416,157 @@ mod tests {
         assert!(events_named(&a, "connected").is_empty());
         a.thread.stop_and_join();
         b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn devices_find_each_other_by_address_where_multicast_does_not_reach() {
+        let _network = network_test();
+        // Different discovery ports: their multicast never meets.
+        let (port_a, port_b) = (free_udp_port(), free_udp_port());
+        let address = format!("127.0.0.1:{port_b}");
+        let mut b = test_core("addr-b", port_b);
+        let manual = address.clone();
+        let mut a = test_core_with("addr-a", port_a, move |config| {
+            config.manual_addresses = vec![manual, "not an address".to_owned()];
+        });
+        // Only A was given B's address; both find each other.
+        wait_for_peers(&a, &["addr-b"]);
+        wait_for_peers(&b, &["addr-a"]);
+        let status = wait_for_event(&a.events, Duration::from_secs(6), |event| {
+            event["event"] == "manual_addresses" && event["addresses"][0]["status"] == "found"
+        });
+        assert_eq!(status["addresses"][0]["address"], address);
+        assert_eq!(status["addresses"][0]["peer_id"], "addr-b");
+        assert_eq!(status["addresses"][1]["status"], "unresolved");
+        a.thread.send(Command::Connect("addr-b".into())).unwrap();
+        wait_connected(&a, "addr-b");
+        wait_connected(&b, "addr-a");
+        // No longer looked for.
+        a.thread
+            .send(Command::SetManualAddresses(Vec::new()))
+            .unwrap();
+        wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "manual_addresses" && event["addresses"] == serde_json::json!([])
+        });
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn peers_hear_when_this_device_is_used_and_when_it_is_locked() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("presence-a", discovery_port);
+        let mut b = test_core("presence-b", discovery_port);
+        wait_for_peers(&a, &["presence-b"]);
+        a.thread
+            .send(Command::Connect("presence-b".into()))
+            .unwrap();
+        wait_connected(&a, "presence-b");
+        wait_connected(&b, "presence-a");
+        // Reported as often as the shell likes; sent once in a while.
+        a.thread.send(Command::ReportUserActivity).unwrap();
+        a.thread.send(Command::ReportUserActivity).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "peer_active" && event["peer_id"] == "presence-a"
+        });
+        a.thread.send(Command::LockPeers).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            assert_ne!(event["event"], "peer_active", "activity sent twice");
+            event["event"] == "lock_requested" && event["peer_id"] == "presence-a"
+        });
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_driven_device_whose_pointer_is_held_tells_its_controller() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("lock-a", discovery_port);
+        let mut b = test_core("lock-b", discovery_port);
+        wait_for_peers(&a, &["lock-b"]);
+        a.thread.send(Command::Connect("lock-b".into())).unwrap();
+        wait_connected(&a, "lock-b");
+        wait_connected(&b, "lock-a");
+        let lock_event = |locked: bool| {
+            wait_for_event(&a.events, Duration::from_secs(2), move |event| {
+                event["event"] == "peer_pointer_lock"
+                    && event["peer_id"] == "lock-b"
+                    && event["locked"] == locked
+            })
+        };
+        // Nobody drives B yet: nobody to tell.
+        b.thread.send(Command::SetPointerLocked(true)).unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&b, Duration::from_millis(400)), vec![1.0]);
+        // Told as soon as A starts driving it, and of every change.
+        lock_event(true);
+        b.thread.send(Command::SetPointerLocked(false)).unwrap();
+        lock_event(false);
+        b.thread.send(Command::SetPointerLocked(true)).unwrap();
+        lock_event(true);
+        // Control ends and starts again: told again.
+        a.thread.send(Command::ResetInput).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "remote_control_ended"
+        });
+        a.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        lock_event(true);
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn shortcut_translation_can_be_switched_while_connected() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut mac = test_core_with("remap-mac", discovery_port, |config| {
+            config.platform = "macos".into();
+        });
+        let mut pc = test_core_with("remap-pc", discovery_port, |config| {
+            config.platform = "windows".into();
+        });
+        wait_for_peers(&pc, &["remap-mac"]);
+        wait_for_peers(&mac, &["remap-pc"]);
+        mac.thread
+            .send(Command::Connect("remap-pc".into()))
+            .unwrap();
+        wait_connected(&mac, "remap-pc");
+        wait_connected(&pc, "remap-mac");
+        let key = |kind: u32| LcInputEvent {
+            kind,
+            code: 0xE3, // left Command
+            ..LcInputEvent::default()
+        };
+        let next_key = |core: &TestCore| loop {
+            let event = core
+                .input
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a key arrives");
+            if event.kind == LC_INPUT_KEY_DOWN || event.kind == LC_INPUT_KEY_UP {
+                return event.code;
+            }
+        };
+        // Off by default: Command stays the Windows key.
+        mac.thread
+            .send(Command::SendInput(key(LC_INPUT_KEY_DOWN)))
+            .unwrap();
+        assert_eq!(next_key(&pc), 0xE3);
+        // Turned on while Command is held: it is released, then translated.
+        pc.thread.send(Command::SetShortcutRemap(true)).unwrap();
+        assert_eq!(next_key(&pc), 0xE3);
+        std::thread::sleep(Duration::from_millis(100));
+        mac.thread
+            .send(Command::SendInput(key(LC_INPUT_KEY_UP)))
+            .unwrap();
+        mac.thread
+            .send(Command::SendInput(key(LC_INPUT_KEY_DOWN)))
+            .unwrap();
+        let codes = [next_key(&pc), next_key(&pc)];
+        assert_eq!(codes, [0xE0, 0xE0], "Command plays as Control now");
+        mac.thread.stop_and_join();
+        pc.thread.stop_and_join();
     }
 
     fn free_udp_port() -> u16 {

@@ -28,8 +28,18 @@
  *    "disconnected on the other device" and "refused by the other device";
  *    lc_core_system_will_sleep and lc_core_network_changed. See "Staying
  *    connected" below.
+ * 9: devices by address (config key "manual_addresses",
+ *    lc_core_set_manual_addresses, event "manual_addresses");
+ *    lc_core_set_shortcut_remap; presence (lc_core_report_user_activity,
+ *    lc_core_lock_peers, events "peer_active", "lock_requested"); pointer
+ *    lock (lc_core_set_pointer_locked, event "peer_pointer_lock"); file
+ *    events "files_receiving", "files_sending", "files_send_ended", and
+ *    "peer_id" in "files_progress"; lc_core_cancel_files also stops this
+ *    device's own files being sent; placements may chain (a peer against
+ *    another placed peer). The new messages go only to peers that announce
+ *    them, so version 8 cores still connect.
  */
-#define LC_CORE_ABI_VERSION 8
+#define LC_CORE_ABI_VERSION 9
 
 #ifdef __cplusplus
 extern "C" {
@@ -137,6 +147,54 @@ bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
  */
 bool lc_core_system_will_sleep(LcCore *core);
 bool lc_core_network_changed(LcCore *core);
+
+/*
+ * Devices by address (version 9). Discovery rides on multicast, which guest
+ * and company networks, access points that keep clients apart, other
+ * subnets and VPNs often do not carry. The user can then add the other
+ * device's address: host name or IPv4 address, optionally with the
+ * discovery port ("192.168.1.20", "mac-mini.local:42420"). This device
+ * sends its announcement straight there and the other device answers, so
+ * from then on it is found as if multicast worked (only one of the two
+ * needs the other's address). Config key "manual_addresses": [...], or at
+ * run time lc_core_set_manual_addresses(core, "[\"192.168.1.20\"]"), which
+ * replaces the list. Their state:
+ *   {"event":"manual_addresses","addresses":[{"address":"192.168.1.20",
+ *    "status":"found","peer_id":…,"name":…}, …]}
+ * status: "searching", "found", "no_response", or "unresolved" (with
+ * "error").
+ */
+bool lc_core_set_manual_addresses(LcCore *core, const char *addresses_json);
+
+/*
+ * Shortcut translation (config key "shortcut_remap", version 9 also at run
+ * time): see LcInputEvent above. Keys held while it changes are released.
+ */
+bool lc_core_set_shortcut_remap(LcCore *core, bool enabled);
+
+/*
+ * Presence (version 9). While someone uses this device's own keyboard or
+ * mouse, call lc_core_report_user_activity every few seconds; connected
+ * peers then report {"event":"peer_active","peer_id":…} (at most every 20 s
+ * per peer) and can keep their screens awake meanwhile, if their users want
+ * that. When the user locks this device, lc_core_lock_peers makes peers
+ * report {"event":"lock_requested","peer_id":…}; they lock if their users
+ * want that. Both decisions belong to the receiving shell's settings.
+ */
+bool lc_core_report_user_activity(LcCore *core);
+bool lc_core_lock_peers(LcCore *core);
+
+/*
+ * Pointer lock (version 9). A game or a pointer-lock web page that hides and
+ * holds the pointer needs relative motion and no edges. The driven device's
+ * shell detects that and calls lc_core_set_pointer_locked(core, true) (and
+ * false when it ends); the device driving it then reports
+ *   {"event":"peer_pointer_lock","peer_id":…,"locked":true}
+ * and keeps the pointer on that peer instead of crossing at its edges until
+ * "locked":false (or until it stops driving it). The release shortcut still
+ * brings the pointer back.
+ */
+bool lc_core_set_pointer_locked(LcCore *core, bool locked);
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */
@@ -160,6 +218,13 @@ bool lc_core_set_remote_control_allowed(LcCore *core, bool allowed);
  * reports it as "placement_changed" (save it and pass it back in the
  * "placements" config key next time) and syncs the mirrored placement to the
  * peer. The most recent edit on either side wins.
+ *
+ * Since version 9 a peer may also sit against another placed peer (three
+ * devices in a row, whichever has the keyboard), as long as every placed
+ * peer connects to this device through others. Such a chained placement is
+ * not synced: the peer it does not touch keeps its own arrangement.
+ * "portals_changed" still lists only the portals of this device's own
+ * edges; the pointer crosses between placed peers where they touch.
  */
 /* displays_json: [{"x":0,"y":0,"width":1512,"height":982,"scale":2}, …] */
 bool lc_core_set_local_displays(LcCore *core, const char *displays_json);
@@ -202,11 +267,22 @@ bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
  *   {"event":"files_offered","peer_id":…,"transfer":N,"count":…,"total_size":…}
  *       over the limit: ask the user, then lc_core_accept_files(core, N)
  *       (or lc_core_cancel_files)
- *   {"event":"files_progress","transfer":N,"received":…,"total":…}
+ *   {"event":"files_receiving","peer_id":…,"transfer":N,"name":…,
+ *    "items":…,"count":…,"total_size":…}   accepted, under way (version 9):
+ *       "name" is the first top-level item, "items" how many there are,
+ *       "count" how many files in all
+ *   {"event":"files_progress","peer_id":…,"transfer":N,"received":…,"total":…}
  *   {"event":"files_received","peer_id":…,"transfer":N,"paths":[…]}
  *       followed by a "clipboard" event whose formats start with
  *       "text/uri-list" of those paths: write it so pasting gives the files
  *   {"event":"files_failed","peer_id":…,"transfer":N,"reason":…}
+ *
+ * Sending (version 9), while a peer pulls this device's files:
+ *   {"event":"files_sending","peer_id":…,"transfer":N,"name":…,"items":…,
+ *    "count":…,"sent":…,"total":…}
+ *   {"event":"files_send_ended","peer_id":…,"transfer":N,"reason":"done"}
+ *       or another reason when it stopped (cancelled, connection lost)
+ * lc_core_cancel_files with that transfer stops it, and the peer.
  */
 bool lc_core_accept_files(LcCore *core, uint32_t transfer);
 bool lc_core_cancel_files(LcCore *core, uint32_t transfer);

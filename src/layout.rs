@@ -268,17 +268,137 @@ pub fn snap(
     proposed: Offset,
     obstacles: &[Display],
 ) -> Option<Offset> {
+    let blockers: Vec<Display> = local.iter().chain(obstacles).copied().collect();
+    snap_against(
+        local,
+        &blockers,
+        peer,
+        proposed,
+        |candidate| is_valid_placement(local, peer, candidate, obstacles),
+        |candidate| shared_edge(local, peer, candidate),
+    )
+}
+
+/// How much edge the peer at `offset` shares with `with`, in points.
+fn shared_edge(with: &[Display], peer: &[Display], offset: Offset) -> f64 {
+    portals(with, peer, offset)
+        .iter()
+        .map(|portal| portal.to - portal.from)
+        .sum()
+}
+
+// ---- Chained arrangements ----------------------------------------------
+//
+// A peer may also sit against another placed peer instead of this device,
+// so three devices can stand in a row whichever one has the keyboard: the
+// pointer then crosses from one peer straight into the next (see
+// `RemotePointer::step`). Every placed peer must still connect to this
+// device, directly or through others, so nothing floats on its own.
+
+/// Which of the other placed peers (each as its displays in this device's
+/// space) connect to this device, touching it or a connected peer.
+pub fn connected(local: &[Display], others: &[Vec<Display>]) -> Vec<bool> {
+    let touches =
+        |a: &[Display], b: &[Display]| !portals(a, b, Offset { x: 0.0, y: 0.0 }).is_empty();
+    let mut reached: Vec<bool> = others.iter().map(|other| touches(local, other)).collect();
+    loop {
+        let mut grew = false;
+        for index in 0..others.len() {
+            if reached[index] {
+                continue;
+            }
+            if (0..others.len()).any(|from| reached[from] && touches(&others[from], &others[index]))
+            {
+                reached[index] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            return reached;
+        }
+    }
+}
+
+/// The displays a peer may sit against: this device's and those of the
+/// other placed peers that connect to it.
+fn anchors(local: &[Display], others: &[Vec<Display>]) -> Vec<Display> {
+    let reached = connected(local, others);
+    local
+        .iter()
+        .copied()
+        .chain(
+            others
+                .iter()
+                .zip(reached)
+                .filter(|(_, reached)| *reached)
+                .flat_map(|(other, _)| other.iter().copied()),
+        )
+        .collect()
+}
+
+/// Whether a placement is usable among the other placed peers (`others`,
+/// in this device's space): it overlaps nothing, and touches this desktop
+/// or a peer connected to it.
+pub fn is_valid_in_arrangement(
+    local: &[Display],
+    peer: &[Display],
+    offset: Offset,
+    others: &[Vec<Display>],
+) -> bool {
+    let placed: Vec<Display> = peer.iter().map(|p| p.translated(offset)).collect();
+    let collides = placed.iter().any(|p| {
+        local
+            .iter()
+            .chain(others.iter().flatten())
+            .any(|other| p.overlaps(other))
+    });
+    !collides && !portals(&anchors(local, others), peer, offset).is_empty()
+}
+
+/// [`snap`] among the other placed peers: the peer may also be put against
+/// a peer that connects to this device.
+pub fn snap_in_arrangement(
+    local: &[Display],
+    peer: &[Display],
+    proposed: Offset,
+    others: &[Vec<Display>],
+) -> Option<Offset> {
+    let anchors = anchors(local, others);
+    let blockers: Vec<Display> = local
+        .iter()
+        .chain(others.iter().flatten())
+        .copied()
+        .collect();
+    snap_against(
+        &anchors,
+        &blockers,
+        peer,
+        proposed,
+        |candidate| is_valid_in_arrangement(local, peer, candidate, others),
+        |candidate| shared_edge(&anchors, peer, candidate),
+    )
+}
+
+/// The spot nearest to `proposed` where one of the peer's displays sits
+/// against an edge of one of `edges` and `valid` holds, preferring spots
+/// that share more edge. A spot where something of `blockers` is in the way
+/// is also tried moved along the edge just clear of it.
+fn snap_against(
+    edges: &[Display],
+    blockers: &[Display],
+    peer: &[Display],
+    proposed: Offset,
+    valid: impl Fn(Offset) -> bool,
+    shared: impl Fn(Offset) -> f64,
+) -> Option<Offset> {
+    let local = edges;
     let mut best: Option<(f64, Offset)> = None;
     let mut consider = |candidate: Offset| {
-        if !is_valid_placement(local, peer, candidate, obstacles) {
+        if !valid(candidate) {
             return;
         }
-        let shared: f64 = portals(local, peer, candidate)
-            .iter()
-            .map(|portal| portal.to - portal.from)
-            .sum();
-        let score =
-            (candidate.x - proposed.x).hypot(candidate.y - proposed.y) - SNUG_BONUS * shared;
+        let score = (candidate.x - proposed.x).hypot(candidate.y - proposed.y)
+            - SNUG_BONUS * shared(candidate);
         if best.is_none_or(|(best_score, _)| score < best_score) {
             best = Some((score, candidate));
         }
@@ -321,11 +441,7 @@ pub fn snap(
                     edge_start + edge_length - overlap,
                 );
                 for placed in placed(peer, candidate) {
-                    for other in local
-                        .iter()
-                        .chain(obstacles)
-                        .filter(|other| placed.overlaps(other))
-                    {
+                    for other in blockers.iter().filter(|other| placed.overlaps(other)) {
                         let shifts = if side.is_vertical() {
                             [other.y - placed.bottom(), other.bottom() - placed.y]
                         } else {
@@ -366,13 +482,32 @@ fn slide(wanted: f64, length: f64, edge_start: f64, edge_length: f64) -> f64 {
 }
 
 /// Places the peer beside this device's outermost edge on `side`, centred on
-/// the display that forms it.
+/// the display that forms it, clear of the other placed peers.
 pub fn place_beside(
     local: &[Display],
     peer: &[Display],
     side: Side,
     obstacles: &[Display],
 ) -> Option<Offset> {
+    let (left, top) = beside(local, peer, side)?;
+    snap(local, peer, Offset { x: left, y: top }, obstacles)
+}
+
+/// [`place_beside`] among the other placed peers (see
+/// [`snap_in_arrangement`]).
+pub fn place_beside_in_arrangement(
+    local: &[Display],
+    peer: &[Display],
+    side: Side,
+    others: &[Vec<Display>],
+) -> Option<Offset> {
+    let (left, top) = beside(local, peer, side)?;
+    snap_in_arrangement(local, peer, Offset { x: left, y: top }, others)
+}
+
+/// The offset that puts the peer centred beside this device's outermost
+/// edge on `side`.
+fn beside(local: &[Display], peer: &[Display], side: Side) -> Option<(f64, f64)> {
     let (peer_left, peer_top, peer_right, peer_bottom) = bounds(peer)?;
     let (peer_width, peer_height) = (peer_right - peer_left, peer_bottom - peer_top);
     let outermost = local.iter().max_by(|a, b| {
@@ -402,15 +537,7 @@ pub fn place_beside(
             outermost.y - peer_height,
         ),
     };
-    snap(
-        local,
-        peer,
-        Offset {
-            x: left - peer_left,
-            y: top - peer_top,
-        },
-        obstacles,
-    )
+    Some((left - peer_left, top - peer_top))
 }
 
 /// The peer's displays moved into this device's space, e.g. to use as
@@ -442,12 +569,131 @@ pub struct RemotePointer {
     /// come back through any of them.
     portals: Vec<Portal>,
     offset: Offset,
-    entry: Portal,
+    /// Where the pointer left this device, for giving control back without
+    /// crossing; none when it came by shortcut.
+    entry: Option<Portal>,
+    /// Other placed peers it may move on into (see [`RemotePointer::step`]).
+    neighbors: Vec<Neighbor>,
     x: f64,
     y: f64,
 }
 
+/// Another placed peer, by its displays in this device's space.
+#[derive(Clone, Debug)]
+pub struct Neighbor {
+    pub id: String,
+    pub displays: Vec<Display>,
+}
+
+/// Where a move took the pointer (see [`RemotePointer::step`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Motion {
+    /// Still on the peer.
+    Stay,
+    /// Back on this device, continuing at this local point: the crossing
+    /// is over.
+    Home(f64, f64),
+    /// Into another placed peer that touches this one, at this point in
+    /// this device's space. The pointer itself stopped at the edge, so a
+    /// caller that does not move on simply has an edge there.
+    Neighbor { id: String, x: f64, y: f64 },
+}
+
 impl RemotePointer {
+    /// Arrives on the peer at the local point `(x, y)`: from another peer
+    /// (`entry` is then the portal the pointer first left this device
+    /// through), or by shortcut (no entry). The point is moved into the
+    /// nearest of the peer's displays.
+    pub fn enter_at(
+        peer: &[Display],
+        portals: &[Portal],
+        offset: Offset,
+        x: f64,
+        y: f64,
+        entry: Option<Portal>,
+    ) -> Self {
+        let peer = peer_or_default(peer);
+        let (px, py) = (x - offset.x, y - offset.y);
+        let distance = |display: &Display| {
+            let (cx, cy) = clamp_into(display, px, py);
+            (cx - px).hypot(cy - py)
+        };
+        let display = peer
+            .iter()
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            .copied()
+            .unwrap_or(peer[0]);
+        let (px, py) = clamp_into(&display, px, py);
+        Self {
+            peer,
+            portals: portals.to_vec(),
+            offset,
+            entry,
+            neighbors: Vec::new(),
+            x: px,
+            y: py,
+        }
+    }
+
+    /// Lets the pointer move on into these peers where they touch this one.
+    pub fn with_neighbors(mut self, neighbors: Vec<Neighbor>) -> Self {
+        self.neighbors = neighbors;
+        self
+    }
+
+    /// The portal the pointer first left this device through, if it crossed.
+    pub fn entry(&self) -> Option<Portal> {
+        self.entry
+    }
+
+    /// Where the pointer is, in this device's space.
+    pub fn local_position(&self) -> (f64, f64) {
+        (self.x + self.offset.x, self.y + self.offset.y)
+    }
+
+    /// Moves by `(dx, dy)` points: within the peer, back to this device
+    /// through a portal, or on into a neighbouring peer.
+    pub fn step(&mut self, dx: f64, dy: f64) -> Motion {
+        let (x, y) = (self.x + dx, self.y + dy);
+        if self.peer.iter().any(|display| contains(display, x, y)) {
+            (self.x, self.y) = (x, y);
+            return Motion::Stay;
+        }
+        let (local_x, local_y) = (x + self.offset.x, y + self.offset.y);
+        if let Some((home_x, home_y)) = self
+            .portals
+            .iter()
+            .find_map(|portal| exit_through(portal, local_x, local_y))
+        {
+            return Motion::Home(home_x, home_y);
+        }
+        let neighbor = self
+            .neighbors
+            .iter()
+            .find(|neighbor| {
+                neighbor
+                    .displays
+                    .iter()
+                    .any(|display| contains(display, local_x, local_y))
+            })
+            .map(|neighbor| neighbor.id.clone());
+        let current = self
+            .peer
+            .iter()
+            .find(|display| contains(display, self.x, self.y))
+            .copied()
+            .unwrap_or(self.peer[0]);
+        (self.x, self.y) = clamp_into(&current, x, y);
+        match neighbor {
+            Some(id) => Motion::Neighbor {
+                id,
+                x: local_x,
+                y: local_y,
+            },
+            None => Motion::Stay,
+        }
+    }
+
     /// Crosses through `portal` from the local point `(x, y)` on its edge.
     /// The position is where the pointer appears on the peer (send it as an
     /// absolute move so the peer's cursor starts there too).
@@ -472,7 +718,8 @@ impl RemotePointer {
             peer,
             portals: portals.to_vec(),
             offset,
-            entry: portal,
+            entry: Some(portal),
+            neighbors: Vec::new(),
             x: px,
             y: py,
         }
@@ -485,35 +732,22 @@ impl RemotePointer {
 
     /// Moves by `(dx, dy)` points. Returns the local point to continue at
     /// when the move leaves the peer through a portal; the crossing is then
-    /// over and this pointer should be dropped.
+    /// over and this pointer should be dropped. Neighbours are edges here
+    /// (see [`RemotePointer::step`]).
     pub fn move_by(&mut self, dx: f64, dy: f64) -> Option<(f64, f64)> {
-        let (x, y) = (self.x + dx, self.y + dy);
-        if self.peer.iter().any(|display| contains(display, x, y)) {
-            (self.x, self.y) = (x, y);
-            return None;
+        match self.step(dx, dy) {
+            Motion::Home(x, y) => Some((x, y)),
+            Motion::Stay | Motion::Neighbor { .. } => None,
         }
-        let (local_x, local_y) = (x + self.offset.x, y + self.offset.y);
-        if let Some(exit) = self
-            .portals
-            .iter()
-            .find_map(|portal| exit_through(portal, local_x, local_y))
-        {
-            return Some(exit);
-        }
-        let current = self
-            .peer
-            .iter()
-            .find(|display| contains(display, self.x, self.y))
-            .copied()
-            .unwrap_or(self.peer[0]);
-        (self.x, self.y) = clamp_into(&current, x, y);
-        None
     }
 
     /// A local point just inside the edge the pointer left through, near
-    /// `(x, y)`, for giving control back without crossing.
+    /// `(x, y)`, for giving control back without crossing; `(x, y)` itself
+    /// when it came by shortcut.
     pub fn return_point(&self, x: f64, y: f64) -> (f64, f64) {
-        let portal = &self.entry;
+        let Some(portal) = &self.entry else {
+            return (x, y);
+        };
         let along = |value: f64| clamp_between(value, portal.from, portal.to - 1.0);
         match portal.side {
             Side::Right => (portal.line - RETURN_INSET, along(y)),
@@ -639,6 +873,83 @@ mod tests {
         assert_eq!(pointer.move_by(-3.0, 0.0), Some((1438.0, 550.0)));
         // Released without crossing: just inside the edge it left through.
         assert_eq!(pointer.return_point(1440.0, 2000.0), (1432.0, 899.0));
+    }
+
+    #[test]
+    fn three_devices_stand_in_a_row_whichever_has_the_keyboard() {
+        // This laptop, a Mac to its right, and a PC dropped right of the Mac.
+        let mac = [display(0.0, 0.0, 1512.0, 982.0)];
+        let pc = [display(0.0, 0.0, 1920.0, 1080.0)];
+        let mac_offset = Offset { x: 1440.0, y: 0.0 };
+        let others = vec![placed(&mac, mac_offset)];
+        let drop = Offset {
+            x: 1440.0 + 1512.0 + 30.0,
+            y: 20.0,
+        };
+        // Against the Mac, not pulled back next to the laptop.
+        let chained = snap_in_arrangement(&[LAPTOP], &pc, drop, &others).expect("a spot");
+        assert_eq!(chained.x, 1440.0 + 1512.0);
+        assert!(is_valid_in_arrangement(&[LAPTOP], &pc, chained, &others));
+        assert!(portals(&[LAPTOP], &pc, chained).is_empty());
+        // Placements that only touch the laptop still work as before, and
+        // the old rules (no chaining) still pull the PC back to the laptop.
+        let alone = snap(&[LAPTOP], &pc, drop, &others[0]).expect("a spot");
+        assert!(!portals(&[LAPTOP], &pc, alone).is_empty());
+        // Peers that connect only to each other float: not anchors.
+        let island = vec![
+            placed(&mac, Offset { x: 5000.0, y: 0.0 }),
+            placed(&pc, Offset { x: 6512.0, y: 0.0 }),
+        ];
+        assert_eq!(connected(&[LAPTOP], &island), vec![false, false]);
+        assert!(!is_valid_in_arrangement(
+            &[LAPTOP],
+            &pc,
+            Offset { x: 6512.0, y: 0.0 },
+            &island[..1]
+        ));
+        assert_eq!(
+            connected(&[LAPTOP], &[others[0].clone(), placed(&pc, chained)]),
+            vec![true, true]
+        );
+    }
+
+    #[test]
+    fn the_pointer_moves_from_one_peer_straight_into_the_next() {
+        let mac = [display(0.0, 0.0, 1512.0, 982.0)];
+        let pc = [display(0.0, 0.0, 1920.0, 1080.0)];
+        let mac_offset = Offset { x: 1440.0, y: 0.0 };
+        let pc_offset = Offset {
+            x: 1440.0 + 1512.0,
+            y: 0.0,
+        };
+        let found = portals(&[LAPTOP], &mac, mac_offset);
+        let mut pointer = RemotePointer::enter(&mac, &found, mac_offset, found[0], 1440.0, 400.0)
+            .with_neighbors(vec![Neighbor {
+                id: "pc".to_owned(),
+                displays: placed(&pc, pc_offset),
+            }]);
+        // Across the Mac to its right edge, then one point further.
+        assert_eq!(pointer.step(1508.0, 0.0), Motion::Stay);
+        assert_eq!(
+            pointer.step(3.0, 0.0),
+            Motion::Neighbor {
+                id: "pc".to_owned(),
+                x: 1440.0 + 1513.0,
+                y: 400.0
+            }
+        );
+        // The pointer itself stopped at the edge (as if nothing was there).
+        assert_eq!(pointer.position(), (1511.0, 400.0));
+        // On the PC from that point; the way home is still the first portal.
+        let next =
+            RemotePointer::enter_at(&pc, &[], pc_offset, 1440.0 + 1513.0, 400.0, pointer.entry());
+        assert_eq!(next.position(), (1.0, 400.0));
+        assert_eq!(next.local_position(), (2953.0, 400.0));
+        assert_eq!(next.return_point(1440.0, 400.0), (1432.0, 400.0));
+        // By shortcut (no entry), giving control back returns where it was.
+        let jumped = RemotePointer::enter_at(&pc, &[], pc_offset, 5000.0, 500.0, None);
+        assert_eq!(jumped.position(), (1919.0, 500.0));
+        assert_eq!(jumped.return_point(700.0, 450.0), (700.0, 450.0));
     }
 
     #[test]

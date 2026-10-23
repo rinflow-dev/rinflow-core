@@ -21,9 +21,16 @@ pub struct LcCore {
 /// events `pairing_requested`, `paired`, `pairing_ended`, `unpaired`.
 /// Version 8 keeps the user's devices connected (`auto_connect`) and adds
 /// `lc_core_system_will_sleep` and `lc_core_network_changed`.
+/// Version 9 finds devices by address (config key `manual_addresses`,
+/// `lc_core_set_manual_addresses`, event `manual_addresses`), switches
+/// shortcut translation at run time (`lc_core_set_shortcut_remap`), adds
+/// presence (`lc_core_report_user_activity`, `lc_core_lock_peers`, events
+/// `peer_active`, `lock_requested`) and pointer lock
+/// (`lc_core_set_pointer_locked`, event `peer_pointer_lock`), events for
+/// file transfers on both sides, and chained placements.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    8
+    9
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -323,6 +330,49 @@ pub unsafe extern "C" fn lc_core_system_will_sleep(core: *mut LcCore) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lc_core_network_changed(core: *mut LcCore) -> bool {
     send_command(core, Command::NetworkChanged)
+}
+
+/// `addresses_json`: a JSON array of strings, host names or IPv4 addresses
+/// with an optional discovery port, replacing the earlier list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_manual_addresses(
+    core: *mut LcCore,
+    addresses_json: *const c_char,
+) -> bool {
+    let Some(json) = (unsafe { string_argument(addresses_json) }) else {
+        return false;
+    };
+    match serde_json::from_str::<Vec<String>>(&json) {
+        Ok(addresses) => send_command(core, Command::SetManualAddresses(addresses)),
+        Err(_) => false,
+    }
+}
+
+/// Translates Command and Control shortcuts from peers of the other
+/// platform convention (config key `shortcut_remap`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_shortcut_remap(core: *mut LcCore, enabled: bool) -> bool {
+    send_command(core, Command::SetShortcutRemap(enabled))
+}
+
+/// Someone used this device's own keyboard or mouse (call every few seconds
+/// while that goes on): peers report `peer_active`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_report_user_activity(core: *mut LcCore) -> bool {
+    send_command(core, Command::ReportUserActivity)
+}
+
+/// The user locked this device: peers report `lock_requested`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_lock_peers(core: *mut LcCore) -> bool {
+    send_command(core, Command::LockPeers)
+}
+
+/// A game or a pointer-lock page holds this device's pointer, or no longer
+/// does: peers driving it report `peer_pointer_lock`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_pointer_locked(core: *mut LcCore, locked: bool) -> bool {
+    send_command(core, Command::SetPointerLocked(locked))
 }
 
 /// Lets peers drive this device (the default), or stops them. Added within

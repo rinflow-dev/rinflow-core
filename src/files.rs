@@ -37,6 +37,24 @@ pub struct Manifest {
     pub entries: Vec<Entry>,
 }
 
+impl Manifest {
+    /// What people call the transfer: the name of its first top-level item
+    /// and how many top-level items (files and folders) it has.
+    pub fn summary(&self) -> (&str, usize) {
+        let mut tops = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.path.contains('/'));
+        let first = tops.next().map_or("", |entry| entry.path.as_str());
+        (first, usize::from(!first.is_empty()) + tops.count())
+    }
+
+    /// Files (not folders) it holds.
+    pub fn file_count(&self) -> usize {
+        self.entries.iter().filter(|entry| !entry.dir).count()
+    }
+}
+
 /// A file or folder, by its path relative to the transfer (`/` separated).
 /// Folders come before what they contain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

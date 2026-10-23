@@ -123,6 +123,11 @@ pub enum ConnectionEvent {
         writer: u64,
         outcome: Result<(), String>,
     },
+    /// A manually added address was looked up (see `runtime/manual.rs`).
+    ManualResolved {
+        address: String,
+        result: Result<Vec<SocketAddr>, String>,
+    },
 }
 
 pub struct ActiveConnection {

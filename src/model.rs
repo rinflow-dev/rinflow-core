@@ -33,13 +33,25 @@ pub const DATA_LINK_CAPABILITIES: u64 = CAPABILITY_CLIPBOARD | CAPABILITY_FILES;
 /// Gives control back when told to (`ControlRevoke`). Sent only to peers
 /// with this bit, for the same reason as the data-link messages.
 pub const CAPABILITY_CONTROL_REVOKE: u64 = 1 << 8;
+/// Understands `UserActive` and `LockScreen`: devices stay awake while
+/// another one is in use, and can lock together. Sent only to peers with
+/// this bit.
+pub const CAPABILITY_PRESENCE: u64 = 1 << 9;
+/// Understands `PointerLock`: a driven device whose pointer a game or a
+/// pointer-lock page holds says so, and the driving device stops crossing
+/// at its edges meanwhile. Sent only to peers with this bit.
+pub const CAPABILITY_POINTER_LOCK: u64 = 1 << 10;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_RELATIVE_POINTER
     | CAPABILITY_HIGH_RESOLUTION_SCROLL
     | CAPABILITY_HID_KEYBOARD
-    | CAPABILITY_CONTROL_REVOKE;
+    | CAPABILITY_CONTROL_REVOKE
+    | CAPABILITY_PRESENCE
+    | CAPABILITY_POINTER_LOCK;
+/// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
+pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
 pub const LC_INPUT_MOUSE_MOVE: u32 = 1;
 pub const LC_INPUT_MOUSE_BUTTON_DOWN: u32 = 2;
@@ -120,6 +132,11 @@ pub struct CoreConfig {
     /// and placed ones unless `require_pairing` (see `runtime/reconnect.rs`).
     /// On by default.
     pub auto_connect: bool,
+    /// Devices to look for by address as well as by multicast, for networks
+    /// that do not carry it (guest Wi-Fi, separate subnets, VPNs): host names
+    /// or IPv4 addresses, optionally with the discovery port (`host:port`).
+    /// See `runtime/manual.rs`.
+    pub manual_addresses: Vec<String>,
 }
 
 /// A paired peer: its device ID and the fingerprint of its certificate.
@@ -160,6 +177,7 @@ impl Default for CoreConfig {
             trusted_peers: Vec::new(),
             require_pairing: false,
             auto_connect: true,
+            manual_addresses: Vec::new(),
         }
     }
 }
@@ -212,6 +230,11 @@ impl CoreConfig {
         }) {
             return Err("trusted peer fingerprints must be 64 hex digits".to_owned());
         }
+        if self.manual_addresses.len() > MAX_MANUAL_ADDRESSES {
+            return Err(format!(
+                "at most {MAX_MANUAL_ADDRESSES} manual addresses are allowed"
+            ));
+        }
         Ok(())
     }
 }
@@ -234,6 +257,11 @@ pub struct Announcement {
     /// announce anything): connections check the certificate itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Sent straight to an address the user added by hand: answer with an
+    /// announcement to the sender, which multicast may not reach. Older
+    /// cores ignore the field (and do not answer).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reply: bool,
 }
 
 impl Announcement {
@@ -254,6 +282,7 @@ impl Announcement {
             control_port: config.control_port,
             displays: displays.to_vec(),
             fingerprint: Some(fingerprint.to_owned()),
+            reply: false,
         }
     }
 
@@ -476,6 +505,20 @@ pub enum WireMessage {
     /// receiver). Paired once both sides have sent it. A user who declines
     /// closes the connection with `CloseCode::PairingDeclined` instead.
     PairAccept,
+    /// Someone uses the sender's keyboard or mouse (at most every few
+    /// seconds): the receiver stays awake meanwhile if its user wants that.
+    /// Only to peers with `CAPABILITY_PRESENCE`.
+    UserActive,
+    /// The sender's user locked it: the receiver locks too if its user wants
+    /// that. Only to peers with `CAPABILITY_PRESENCE`.
+    LockScreen,
+    /// From a driven device: a game or a pointer-lock page holds its pointer
+    /// (`locked`), or no longer does. The driving device keeps the pointer
+    /// there meanwhile instead of crossing at the edges. Only to peers with
+    /// `CAPABILITY_POINTER_LOCK`.
+    PointerLock {
+        locked: bool,
+    },
 }
 
 impl WireMessage {

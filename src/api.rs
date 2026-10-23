@@ -128,6 +128,37 @@ impl Core {
         self.thread.send(Command::NetworkChanged)
     }
 
+    /// Looks for devices at these addresses too (host names or IPv4, with an
+    /// optional discovery port), replacing the earlier list. Reported as
+    /// `manual_addresses`; see `CoreConfig::manual_addresses`.
+    pub fn set_manual_addresses(&self, addresses: Vec<String>) -> Result<(), String> {
+        self.thread.send(Command::SetManualAddresses(addresses))
+    }
+
+    /// Translates Command and Control shortcuts from peers that use the other
+    /// platform convention (`CoreConfig::shortcut_remap`).
+    pub fn set_shortcut_remap(&self, enabled: bool) -> Result<(), String> {
+        self.thread.send(Command::SetShortcutRemap(enabled))
+    }
+
+    /// Someone used this device's own keyboard or mouse. Call it while that
+    /// goes on (every few seconds is plenty): peers then report
+    /// `peer_active` and can stay awake.
+    pub fn report_user_activity(&self) -> Result<(), String> {
+        self.thread.send(Command::ReportUserActivity)
+    }
+
+    /// The user locked this device: peers report `lock_requested`.
+    pub fn lock_peers(&self) -> Result<(), String> {
+        self.thread.send(Command::LockPeers)
+    }
+
+    /// A game or a pointer-lock page holds this device's pointer (or no
+    /// longer does): peers driving it report `peer_pointer_lock`.
+    pub fn set_pointer_locked(&self, locked: bool) -> Result<(), String> {
+        self.thread.send(Command::SetPointerLocked(locked))
+    }
+
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {
         self.thread.send(Command::SendInput(event))
     }

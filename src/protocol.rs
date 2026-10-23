@@ -25,6 +25,9 @@ const MESSAGE_FILE_CANCEL: u8 = 13;
 const MESSAGE_CONTROL_REVOKE: u8 = 14;
 const MESSAGE_PAIR_REQUEST: u8 = 15;
 const MESSAGE_PAIR_ACCEPT: u8 = 16;
+const MESSAGE_USER_ACTIVE: u8 = 17;
+const MESSAGE_LOCK_SCREEN: u8 = 18;
+const MESSAGE_POINTER_LOCK: u8 = 19;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -45,6 +48,9 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::ControlRevoke { .. } => MESSAGE_CONTROL_REVOKE,
         WireMessage::PairRequest => MESSAGE_PAIR_REQUEST,
         WireMessage::PairAccept => MESSAGE_PAIR_ACCEPT,
+        WireMessage::UserActive => MESSAGE_USER_ACTIVE,
+        WireMessage::LockScreen => MESSAGE_LOCK_SCREEN,
+        WireMessage::PointerLock { .. } => MESSAGE_POINTER_LOCK,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -171,7 +177,11 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.bytes.extend_from_slice(reason.as_bytes());
         }
         WireMessage::ControlRevoke { handoff } => encoder.u8(u8::from(*handoff)),
-        WireMessage::PairRequest | WireMessage::PairAccept => {}
+        WireMessage::PairRequest
+        | WireMessage::PairAccept
+        | WireMessage::UserActive
+        | WireMessage::LockScreen => {}
+        WireMessage::PointerLock { locked } => encoder.u8(u8::from(*locked)),
     }
     Ok(encoder.bytes)
 }
@@ -353,6 +363,15 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
         },
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,
+        MESSAGE_USER_ACTIVE => WireMessage::UserActive,
+        MESSAGE_LOCK_SCREEN => WireMessage::LockScreen,
+        MESSAGE_POINTER_LOCK => WireMessage::PointerLock {
+            locked: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid_data("invalid pointer lock flag")),
+            },
+        },
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;

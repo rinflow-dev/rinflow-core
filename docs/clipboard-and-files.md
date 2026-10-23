@@ -251,11 +251,19 @@ macOS app 没有开沙盒（需要辅助功能权限），核心库可以直接�
 | 事件 | 字段 | 外壳该做的 |
 | --- | --- | --- |
 | `files_offered` | `peer_id`、`transfer`、`count`、`total_size` | 超过自动接收上限时才发：弹窗确认，同意后调用 `lc_core_accept_files(core, transfer)` |
-| `files_progress` | `transfer`、`received`、`total` | 显示进度 |
+| `files_receiving` | `peer_id`、`transfer`、`name`（第一个顶层项的名字）、`items`（顶层项数）、`count`（文件数）、`total_size` | 开始接收（ABI 9）：显示进度卡片 |
+| `files_progress` | `peer_id`（ABI 9）、`transfer`、`received`、`total` | 显示进度 |
 | `files_received` | `transfer`、`paths` | 完成；随后还会收到一个 `clipboard` 事件（`text/uri-list`），照常写入剪贴板 |
-| `files_failed` | `transfer`、`reason` | 提示失败原因 |
+| `files_failed` | `transfer`、`reason` | 提示失败原因（`cancelled`、`replaced by a newer copy` 不算失败） |
 
-新调用：`lc_core_accept_files(core, transfer)`、`lc_core_cancel_files(core, transfer)`。
+发送方的事件（ABI 9）：
+
+| 事件 | 字段 | 外壳该做的 |
+| --- | --- | --- |
+| `files_sending` | `peer_id`、`transfer`、`name`、`items`、`count`、`sent`、`total` | 对方正在取本机的文件：显示进度（约每 250 ms 一次） |
+| `files_send_ended` | `peer_id`、`transfer`、`reason` | `done` 表示发完；其他原因（取消、断线、读文件出错）表示中断 |
+
+新调用：`lc_core_accept_files(core, transfer)`、`lc_core_cancel_files(core, transfer)`。ABI 9 起 `lc_core_cancel_files` 用本机正在发送的 `transfer` 调用时，会停止发送并告诉接收方。
 
 ### 3.6 安全规则（接收方必须做到）
 

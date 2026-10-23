@@ -9,7 +9,7 @@
 //! the session. It must show the same certificate as the session. When the
 //! data link drops, the accepting side invites again from `maintenance`.
 
-use super::{Runtime, random_u64};
+use super::{Runtime, Session, random_u64};
 use crate::clipboard::{self, Clipboard, ClipboardFormat};
 use crate::files::{self, FILE_CHUNK_SIZE, FileWriter, MIME_FILES, MIME_URI_LIST, Manifest, Offer};
 use crate::model::{CAPABILITY_CLIPBOARD, DATA_LINK_CAPABILITIES, WireMessage};
@@ -34,6 +34,14 @@ pub(super) struct DataLink {
     /// The control connection (session) this link belongs to.
     pub session: u64,
     pub connection: ActiveConnection,
+}
+
+/// An entry of this device's offer being sent on a data link. The receiver
+/// asks for one entry after another, each a task of its own.
+pub(super) struct Upload {
+    task: JoinHandle<()>,
+    transfer: u32,
+    peer_id: String,
 }
 
 /// Files this device is receiving: one transfer at a time.
@@ -330,9 +338,7 @@ impl Runtime<'_> {
             return;
         };
         link.connection.abort();
-        if let Some(upload) = self.uploads.remove(&id) {
-            upload.abort();
-        }
+        self.end_upload(id, reason);
         if let Some(session) = self.sessions.get_mut(&link.session) {
             session.data = None;
             session.data_token = None;
@@ -384,8 +390,12 @@ impl Runtime<'_> {
                 {
                     self.fail_download(&reason, false);
                 }
-                if let Some(upload) = self.uploads.remove(&id) {
-                    upload.abort();
+                if self
+                    .uploads
+                    .get(&id)
+                    .is_some_and(|upload| upload.transfer == transfer)
+                {
+                    self.end_upload(id, &reason);
                 }
             }
             _ => self.close_data_link(id, "unexpected message on the data link"),
@@ -608,15 +618,49 @@ impl Runtime<'_> {
             }
         };
         let chunks = connection.file_sender();
+        // Progress across the whole transfer: the entries before this one
+        // are sent (the receiver asks for them in order).
+        let Some(offer) = self.offer.clone() else {
+            return;
+        };
+        let before: u64 = offer.manifest.entries[..entry.min(offer.manifest.entries.len())]
+            .iter()
+            .map(|entry| entry.size)
+            .sum();
+        let total = offer.manifest.total_size;
+        let (name, items) = offer.manifest.summary();
+        let (name, count) = (name.to_owned(), offer.manifest.file_count());
+        let peer_id = self
+            .sessions
+            .get(&data_link.session)
+            .and_then(Session::peer_id)
+            .unwrap_or_default()
+            .to_owned();
+        // The receiver moved on to the next entry: the one before is done.
         if let Some(previous) = self.uploads.remove(&link) {
-            previous.abort();
+            previous.task.abort();
         }
-        let upload: JoinHandle<()> = tokio::spawn(async move {
+        let sink = self.sink.clone();
+        let progress_peer = peer_id.clone();
+        let task: JoinHandle<()> = tokio::spawn(async move {
+            let progress = |sent: u64| {
+                sink.emit_value(json!({
+                    "event": "files_sending",
+                    "peer_id": progress_peer,
+                    "transfer": transfer,
+                    "name": name,
+                    "items": items,
+                    "count": count,
+                    "sent": sent,
+                    "total": total
+                }));
+            };
             let sent = async {
                 let mut file = tokio::fs::File::open(&path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 let mut position = offset;
                 let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
+                let mut reported = Instant::now();
                 while position < size {
                     let wanted = FILE_CHUNK_SIZE.min((size - position) as usize);
                     let read = file.read(&mut buffer[..wanted]).await?;
@@ -630,22 +674,72 @@ impl Runtime<'_> {
                         data: buffer[..read].to_vec(),
                     };
                     if chunks.send(chunk).await.is_err() {
-                        return Ok(()); // The link is gone.
+                        return Ok(false); // The link is gone.
                     }
                     position += read as u64;
+                    if reported.elapsed() >= PROGRESS_INTERVAL {
+                        reported = Instant::now();
+                        progress(before + position);
+                    }
                 }
-                Ok(())
+                Ok(true)
             };
-            if let Err(error) = sent.await {
-                let _ = control
-                    .send(WireMessage::FileCancel {
-                        transfer,
-                        reason: error.to_string(),
-                    })
-                    .await;
+            match sent.await {
+                Ok(true) => {
+                    progress(before + size);
+                    if before + size >= total {
+                        sink.emit_value(json!({
+                            "event": "files_send_ended",
+                            "peer_id": progress_peer,
+                            "transfer": transfer,
+                            "reason": "done"
+                        }));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = control
+                        .send(WireMessage::FileCancel {
+                            transfer,
+                            reason: error.to_string(),
+                        })
+                        .await;
+                    sink.emit_value(json!({
+                        "event": "files_send_ended",
+                        "peer_id": progress_peer,
+                        "transfer": transfer,
+                        "reason": error.to_string()
+                    }));
+                }
             }
         });
-        self.uploads.insert(link, upload);
+        self.uploads.insert(
+            link,
+            Upload {
+                task,
+                transfer,
+                peer_id,
+            },
+        );
+    }
+
+    /// Stops what data link `link` is sending, if anything, and says why
+    /// (`files_send_ended`). One that already sent everything is only
+    /// dropped.
+    fn end_upload(&mut self, link: u64, reason: &str) {
+        let Some(upload) = self.uploads.remove(&link) else {
+            return;
+        };
+        if upload.task.is_finished() {
+            return;
+        }
+        upload.task.abort();
+        self.sink.emit_value(json!({
+            "event": "files_send_ended",
+            "peer_id": upload.peer_id,
+            "transfer": upload.transfer,
+            "reason": reason
+        }));
     }
 
     // ---- Receiving files ----------------------------------------------
@@ -696,6 +790,7 @@ impl Runtime<'_> {
             rest,
         });
         if accepted {
+            self.announce_receiving();
             self.advance_download();
         } else {
             self.sink.emit_value(json!({
@@ -719,10 +814,30 @@ impl Runtime<'_> {
         };
         if download.manifest.transfer == transfer && !download.accepted {
             download.accepted = true;
+            self.announce_receiving();
             self.advance_download();
         }
     }
 
+    /// Files start to come in (`files_receiving`).
+    fn announce_receiving(&self) {
+        let Some(download) = &self.download else {
+            return;
+        };
+        let (name, items) = download.manifest.summary();
+        self.sink.emit_value(json!({
+            "event": "files_receiving",
+            "peer_id": download.peer_id,
+            "transfer": download.manifest.transfer,
+            "name": name,
+            "items": items,
+            "count": download.manifest.file_count(),
+            "total_size": download.manifest.total_size
+        }));
+    }
+
+    /// Stops a transfer: one being received (or offered), or this device's
+    /// own files being sent, which the receivers are told.
     pub(super) fn cancel_files(&mut self, transfer: u32) {
         if self
             .download
@@ -730,6 +845,21 @@ impl Runtime<'_> {
             .is_some_and(|d| d.manifest.transfer == transfer)
         {
             self.fail_download("cancelled", true);
+        }
+        let sending: Vec<u64> = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.transfer == transfer && !upload.task.is_finished())
+            .map(|(link, _)| *link)
+            .collect();
+        for link in sending {
+            if let Some(data_link) = self.data_links.get(&link) {
+                let _ = data_link.connection.send_control(WireMessage::FileCancel {
+                    transfer,
+                    reason: "cancelled".to_owned(),
+                });
+            }
+            self.end_upload(link, "cancelled");
         }
     }
 
@@ -837,6 +967,7 @@ impl Runtime<'_> {
             download.last_progress = Instant::now();
             self.sink.emit_value(json!({
                 "event": "files_progress",
+                "peer_id": download.peer_id,
                 "transfer": transfer,
                 "received": download.received,
                 "total": download.manifest.total_size
