@@ -86,6 +86,13 @@
 - 注册失败（被其他程序占用）时在设置里提示。
 - 参照：`agent/src/arrangement.rs`（`World::toward`、`World::landing`，有单元测试）、`agent/src/edge.rs`。
 
-## 11. 语言
+## 11. 其他设备离开后隐藏光标（被控端，可选）
+
+- 和 Universal Control、Deskflow、Mouse Without Borders 一致：光标不在哪台设备上，那台设备就不显示光标。
+- 收到 `remote_control_ended` 且 `reason` 为 `"remote reset"`（对方的光标移走了），并且没有别的设备在控制本机时，调用 `NSCursor.setHiddenUntilMouseMoves(true)`：光标原地隐藏，本机鼠标或触控板一动就自动出现。断线（其他 `reason`）时不隐藏。
+- 设置项 `hide_cursor_on_leave`，默认打开。
+- Windows 参照：`agent/src/hider.rs`（Windows 没有现成的 API，用 1×1 隐藏窗口加 `ShowCursor` 实现，第一次点击会按原顺序回放，不会丢）。
+
+## 12. 语言
 
 - 设置项 `language`：`system` / `zh-CN` / `en-US`。macOS 用 `Localizable.strings`（en、zh-Hans），覆盖语言时设置 `AppleLanguages`，重启 app 后生效。

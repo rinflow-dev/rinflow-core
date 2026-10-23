@@ -52,7 +52,7 @@ mod tests {
         LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES, LcInputEvent,
         PROTOCOL_MAX_VERSION, WireMessage,
     };
-    use super::model::{PlacementRecord, TrustedPeer};
+    use super::model::{CAPABILITY_PAIRING_V2, PlacementRecord, TrustedPeer};
     use super::protocol::{decode_message, encode_message};
     use super::remap::ShortcutRemap;
     use super::runtime::trust as runtime_reason;
@@ -264,6 +264,11 @@ mod tests {
             },
             WireMessage::PairRequest,
             WireMessage::PairAccept,
+            WireMessage::PairCommit {
+                commitment: [7; 32],
+            },
+            WireMessage::PairNonce { nonce: [8; 32] },
+            WireMessage::PairReveal { nonce: [9; 32] },
             WireMessage::DataHello {
                 device_id: "dev".into(),
                 token: 7,
@@ -1100,6 +1105,47 @@ mod tests {
     }
 
     #[test]
+    fn a_stranger_gets_one_stream_and_nothing_more_to_fill() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut core = test_core("streams", discovery_port);
+        let runtime = tokio::runtime::Runtime::new().expect("stranger runtime");
+        runtime.block_on(async {
+            let identity = crate::secure::Identity::load_or_create(None, "stranger").unwrap();
+            let endpoints = crate::quic::QuicEndpoints::bind(0, &identity).unwrap();
+            let connection = endpoints
+                .control
+                .connect(
+                    ([127, 0, 0, 1], core.port).into(),
+                    crate::secure::SERVER_NAME,
+                )
+                .unwrap()
+                .await
+                .expect("connect to the core");
+            let _stream = connection.open_bi().await.expect("the one stream");
+            // QUIC would buffer whatever is sent on more streams until read,
+            // and nothing reads them: the core does not let them open.
+            let wait = Duration::from_millis(300);
+            assert!(
+                tokio::time::timeout(wait, connection.open_bi())
+                    .await
+                    .is_err(),
+                "a second stream opened"
+            );
+            assert!(
+                tokio::time::timeout(wait, connection.open_uni())
+                    .await
+                    .is_err(),
+                "a unidirectional stream opened"
+            );
+            assert_eq!(connection.max_datagram_size(), None, "datagrams accepted");
+            connection.close(0u32.into(), b"");
+            drop(endpoints);
+        });
+        core.thread.stop_and_join();
+    }
+
+    #[test]
     fn peers_dialing_each_other_at_once_keep_exactly_one_session() {
         let _network = network_test();
         let discovery_port = free_udp_port();
@@ -1369,6 +1415,83 @@ mod tests {
         wait_connected_event(&a, "ask-b");
         a.thread.send(Command::SendInput(motion(4.0))).unwrap();
         assert_eq!(received(&b, Duration::from_millis(400)), vec![4.0]);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_device_that_already_trusts_its_peer_still_shows_the_code() {
+        let _network = network_test();
+        let (directory, a_fingerprint, _) =
+            paired_identities("one-sided", "one-sided-a", "one-sided-b");
+        let discovery_port = free_udp_port();
+        // B remembers A; A forgot B (its user unpaired it there).
+        let mut a = test_core_with("one-sided-a", discovery_port, {
+            let identity_path = directory.join("one-sided-a").to_string_lossy().into_owned();
+            move |config: &mut CoreConfig| {
+                config.require_pairing = true;
+                config.identity_path = Some(identity_path);
+            }
+        });
+        let mut b = test_core_with("one-sided-b", discovery_port, {
+            let trusting = paired_with(&directory, "one-sided-b", "one-sided-a", &a_fingerprint);
+            move |config: &mut CoreConfig| {
+                trusting(config);
+                config.require_pairing = true;
+            }
+        });
+        wait_for_peers(&a, &["one-sided-b"]);
+        a.thread
+            .send(Command::Connect("one-sided-b".into()))
+            .unwrap();
+
+        // A's user can only check its code against B's screen, so B shows
+        // it too instead of accepting on its own.
+        let request = |event: &Value| event["event"] == "pairing_requested";
+        let on_a = wait_for_event(&a.events, Duration::from_secs(6), request);
+        let on_b = wait_for_event(&b.events, Duration::from_secs(6), request);
+        assert_eq!(on_a["code"], on_b["code"]);
+        a.thread
+            .send(Command::AcceptPairing("one-sided-b".into()))
+            .unwrap();
+        assert!(events_named(&a, "paired").is_empty());
+        b.thread
+            .send(Command::AcceptPairing("one-sided-a".into()))
+            .unwrap();
+        wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "paired"
+        });
+        let connected = wait_connected_event(&a, "one-sided-b");
+        assert_eq!(connected["paired"], true);
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_older_device_cannot_pair_but_nothing_else_breaks() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core_with("outdated-a", discovery_port, |config| {
+            config.require_pairing = true;
+        });
+        // An older build: it pairs with a code a device in the middle can
+        // forge.
+        let mut b = test_core_with("outdated-b", discovery_port, |config| {
+            config.capabilities = LOCAL_CAPABILITIES & !CAPABILITY_PAIRING_V2;
+        });
+        wait_for_peers(&a, &["outdated-b"]);
+        a.thread
+            .send(Command::Connect("outdated-b".into()))
+            .unwrap();
+        let ended = wait_for_event(&a.events, Duration::from_secs(6), |event| {
+            event["event"] == "disconnected" && event["peer_id"] == "outdated-b"
+        });
+        assert_eq!(ended["reason"], runtime_reason::PAIRING_OUTDATED);
+        assert!(events_named(&a, "pairing_requested").is_empty());
+        assert!(events_named(&a, "connected").is_empty());
 
         a.thread.stop_and_join();
         b.thread.stop_and_join();

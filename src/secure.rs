@@ -8,8 +8,14 @@
 //! compares with the peers the user paired (see `runtime/trust.rs`).
 //!
 //! Pairing shows the same six-digit code on both devices, derived from both
-//! fingerprints. A device in the middle would have to show each side its own
-//! certificate, and the two codes would then differ.
+//! fingerprints and a random value from each side. A device in the middle
+//! has to show each side its own certificate, so it runs two pairings and
+//! needs their codes to match. Codes from fingerprints alone let it search
+//! offline for a certificate that does that. So the dialer commits to its
+//! random value (`pairing_commitment`) before it sees the other side's, and
+//! the other side sends its own before it learns the dialer's: nobody can
+//! steer a code, and a device in the middle gets matching codes one time
+//! in a million.
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::DigitallySignedStruct;
@@ -32,6 +38,9 @@ pub const SERVER_NAME: &str = "linkcursor";
 /// ping every second and give up after 8 s).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
+/// How much of its one stream a peer may send ahead of what this side read
+/// (quinn's default per stream), and the most the whole connection may.
+const RECEIVE_WINDOW: u32 = 1_250_000;
 
 /// This device's key pair and certificate.
 pub struct Identity {
@@ -105,7 +114,7 @@ impl Identity {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = QuicServerConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(transport());
+        config.transport_config(transport(true));
         Ok(config)
     }
 
@@ -122,7 +131,7 @@ impl Identity {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = QuicClientConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(transport());
+        config.transport_config(transport(false));
         Ok(config)
     }
 }
@@ -131,10 +140,23 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn transport() -> Arc<quinn::TransportConfig> {
+/// A connection carries one bidirectional stream, which the dialer opens,
+/// and nothing else. QUIC buffers whatever a peer sends on streams it opens,
+/// up to their windows, until the application reads it; quinn's defaults
+/// let a peer open 200 streams with no limit for the connection as a whole,
+/// and anyone can get this far: certificates are checked after the
+/// handshake. So the peer may open only the one stream (`accepts_stream`:
+/// the side that accepts connections), the connection gets no more window
+/// than that stream, and there are no datagrams.
+fn transport(accepts_stream: bool) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(IDLE_TIMEOUT.try_into().ok());
     transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(u32::from(accepts_stream)));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.stream_receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW));
+    transport.receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW));
+    transport.datagram_receive_buffer_size(None);
     Arc::new(transport)
 }
 
@@ -157,19 +179,64 @@ pub fn peer_fingerprint(connection: &quinn::Connection) -> Option<String> {
         .map(|certificate| fingerprint(certificate))
 }
 
-/// The six digits both devices show while pairing: the same on both sides,
-/// whichever is which.
-pub fn pairing_code(a: &str, b: &str) -> String {
-    let (low, high) = if a <= b { (a, b) } else { (b, a) };
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    context.update(b"linkcursor pairing v1\0");
-    context.update(low.as_bytes());
-    context.update(b"\0");
-    context.update(high.as_bytes());
-    let digest = context.finish();
+/// One side's random part of a pairing code. `None` only if the system has
+/// no randomness to give.
+pub fn pairing_nonce() -> Option<[u8; 32]> {
+    use ring::rand::SecureRandom;
+    let mut nonce = [0; 32];
+    ring::rand::SystemRandom::new().fill(&mut nonce).ok()?;
+    Some(nonce)
+}
+
+/// What the dialer of a connection sends first while pairing: a hash of its
+/// nonce and both fingerprints (`dialer`'s, then `acceptor`'s), which it
+/// cannot change once the other side has answered.
+pub fn pairing_commitment(nonce: &[u8; 32], dialer: &str, acceptor: &str) -> [u8; 32] {
+    let digest = pairing_digest(
+        b"linkcursor pairing commitment v2\0",
+        dialer,
+        acceptor,
+        &[nonce],
+    );
+    digest.as_ref().try_into().expect("SHA-256 is 32 bytes")
+}
+
+/// The six digits both devices show while pairing (0 to 999999): from both
+/// fingerprints and both nonces, each in the role its device has on the
+/// connection.
+pub fn pairing_code(
+    dialer: &str,
+    acceptor: &str,
+    dialer_nonce: &[u8; 32],
+    acceptor_nonce: &[u8; 32],
+) -> u32 {
+    let digest = pairing_digest(
+        b"linkcursor pairing code v2\0",
+        dialer,
+        acceptor,
+        &[dialer_nonce, acceptor_nonce],
+    );
     let bytes = digest.as_ref();
-    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    format!("{:06}", value % 1_000_000)
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000
+}
+
+fn pairing_digest(
+    label: &[u8],
+    dialer: &str,
+    acceptor: &str,
+    nonces: &[&[u8; 32]],
+) -> ring::digest::Digest {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(label);
+    // Fingerprints are 64 hex digits; the separator keeps them apart anyway.
+    context.update(dialer.as_bytes());
+    context.update(b"\0");
+    context.update(acceptor.as_bytes());
+    context.update(b"\0");
+    for nonce in nonces {
+        context.update(&nonce[..]);
+    }
+    context.finish()
 }
 
 /// Accepts any certificate whose holder proves its key; who the holder is
@@ -310,11 +377,37 @@ mod tests {
     }
 
     #[test]
-    fn pairing_codes_agree_on_both_sides_and_differ_otherwise() {
-        let code = pairing_code("aa", "bb");
-        assert_eq!(code, pairing_code("bb", "aa"));
-        assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
-        assert_ne!(code, pairing_code("aa", "cc"));
+    fn pairing_codes_depend_on_both_certificates_and_both_nonces() {
+        assert_ne!(pairing_nonce().unwrap(), pairing_nonce().unwrap());
+        let (dialer, acceptor) = ("aa".repeat(32), "bb".repeat(32));
+        let (mine, theirs) = ([1; 32], [2; 32]);
+        let code = pairing_code(&dialer, &acceptor, &mine, &theirs);
+        assert!(code < 1_000_000);
+        assert_eq!(code, pairing_code(&dialer, &acceptor, &mine, &theirs));
+        // Roles count: the same values the other way round give another
+        // code (each side computes it with the roles of the connection).
+        assert_ne!(code, pairing_code(&acceptor, &dialer, &mine, &theirs));
+        assert_ne!(code, pairing_code(&dialer, &acceptor, &theirs, &mine));
+        assert_ne!(
+            code,
+            pairing_code(&dialer, &"cc".repeat(32), &mine, &theirs)
+        );
+        assert_ne!(code, pairing_code(&dialer, &acceptor, &mine, &[3; 32]));
+    }
+
+    #[test]
+    fn a_commitment_binds_the_nonce_and_both_certificates() {
+        let (dialer, acceptor) = ("aa".repeat(32), "bb".repeat(32));
+        let nonce = pairing_nonce().unwrap();
+        let commitment = pairing_commitment(&nonce, &dialer, &acceptor);
+        assert_eq!(commitment, pairing_commitment(&nonce, &dialer, &acceptor));
+        let mut other = nonce;
+        other[0] ^= 1;
+        assert_ne!(commitment, pairing_commitment(&other, &dialer, &acceptor));
+        assert_ne!(commitment, pairing_commitment(&nonce, &acceptor, &dialer));
+        assert_ne!(
+            commitment,
+            pairing_commitment(&nonce, &dialer, &"cc".repeat(32))
+        );
     }
 }

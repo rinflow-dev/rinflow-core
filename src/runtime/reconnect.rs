@@ -88,6 +88,8 @@ fn ends_for_good(reason: &str) -> bool {
             | trust::IDENTITY_CHANGED
             | trust::UNPAIRED
             | trust::PAIRING_REQUIRED
+            | trust::PAIRING_OUTDATED
+            | trust::PAIRING_FAILED
     )
 }
 

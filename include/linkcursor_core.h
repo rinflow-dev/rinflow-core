@@ -303,6 +303,11 @@ bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
  *       first.
  *
  * Pairing: both devices show the same six digits; each user compares them.
+ * The code arrives once the two cores have exchanged their random parts of
+ * it, a moment after the connection, and also on a device that already
+ * trusts the other one: that device's user confirms too. A peer with an
+ * older core cannot pair ("disconnected" with the reason "the other device
+ * needs a newer LinkCursor to pair"); peers paired before still connect.
  *   {"event":"pairing_requested","peer_id":…,"name":…,"platform":…,
  *    "code":"482917","fingerprint":…}   show the code; then
  *   lc_core_accept_pairing(core, peer_id) or lc_core_reject_pairing.

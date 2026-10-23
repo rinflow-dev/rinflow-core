@@ -41,6 +41,12 @@ pub const CAPABILITY_PRESENCE: u64 = 1 << 9;
 /// pointer-lock page holds says so, and the driving device stops crossing
 /// at its edges meanwhile. Sent only to peers with this bit.
 pub const CAPABILITY_POINTER_LOCK: u64 = 1 << 10;
+/// Pairs with a committed code (`PairCommit` / `PairNonce` / `PairReveal`,
+/// see `runtime/trust.rs`): each side fixes its random part of the code
+/// before it learns the other's, so a device in the middle cannot pick
+/// certificates that give both sides the same code. New pairings need it
+/// on both sides; devices paired before connect without it.
+pub const CAPABILITY_PAIRING_V2: u64 = 1 << 11;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -49,7 +55,8 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_HID_KEYBOARD
     | CAPABILITY_CONTROL_REVOKE
     | CAPABILITY_PRESENCE
-    | CAPABILITY_POINTER_LOCK;
+    | CAPABILITY_POINTER_LOCK
+    | CAPABILITY_PAIRING_V2;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
@@ -501,10 +508,26 @@ pub enum WireMessage {
     /// and asks to pair. Both users compare the code their devices show and
     /// accept.
     PairRequest,
-    /// The sender's user accepted pairing (or the sender already trusts the
-    /// receiver). Paired once both sides have sent it. A user who declines
-    /// closes the connection with `CloseCode::PairingDeclined` instead.
+    /// The sender's user checked the code and accepted pairing. Paired once
+    /// both sides have sent it. A user who declines closes the connection
+    /// with `CloseCode::PairingDeclined` instead.
     PairAccept,
+    /// Pairing, from the side that dialed the connection: a hash of its
+    /// random part of the code, sent before it sees the other side's part.
+    /// Only to peers with `CAPABILITY_PAIRING_V2`.
+    PairCommit {
+        commitment: [u8; 32],
+    },
+    /// Pairing, from the side that accepted the connection: its random part
+    /// of the code, sent once it holds the dialer's commitment.
+    PairNonce {
+        nonce: [u8; 32],
+    },
+    /// Pairing, from the dialer: the random part it committed to. The
+    /// receiver checks it against the commitment.
+    PairReveal {
+        nonce: [u8; 32],
+    },
     /// Someone uses the sender's keyboard or mouse (at most every few
     /// seconds): the receiver stays awake meanwhile if its user wants that.
     /// Only to peers with `CAPABILITY_PRESENCE`.

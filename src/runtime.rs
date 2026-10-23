@@ -1497,7 +1497,10 @@ impl Runtime<'_> {
                 WireMessage::Ping { .. }
                 | WireMessage::Pong { .. }
                 | WireMessage::PairRequest
-                | WireMessage::PairAccept => {}
+                | WireMessage::PairAccept
+                | WireMessage::PairCommit { .. }
+                | WireMessage::PairNonce { .. }
+                | WireMessage::PairReveal { .. } => {}
                 WireMessage::ScreenInfo { .. }
                 | WireMessage::Placement { .. }
                 | WireMessage::DataInvite { .. } => {
@@ -1586,6 +1589,9 @@ impl Runtime<'_> {
             WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
             WireMessage::PairRequest => self.pair_requested(id),
             WireMessage::PairAccept => self.pair_accepted(id),
+            WireMessage::PairCommit { commitment } => self.pair_committed(id, commitment),
+            WireMessage::PairNonce { nonce } => self.pair_nonce(id, nonce),
+            WireMessage::PairReveal { nonce } => self.pair_revealed(id, nonce),
             // The shell decides, by its user's settings (see `CoreConfig`
             // and the header's "Presence" section).
             WireMessage::UserActive => {

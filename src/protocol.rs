@@ -28,6 +28,9 @@ const MESSAGE_PAIR_ACCEPT: u8 = 16;
 const MESSAGE_USER_ACTIVE: u8 = 17;
 const MESSAGE_LOCK_SCREEN: u8 = 18;
 const MESSAGE_POINTER_LOCK: u8 = 19;
+const MESSAGE_PAIR_COMMIT: u8 = 20;
+const MESSAGE_PAIR_NONCE: u8 = 21;
+const MESSAGE_PAIR_REVEAL: u8 = 22;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -51,6 +54,9 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::UserActive => MESSAGE_USER_ACTIVE,
         WireMessage::LockScreen => MESSAGE_LOCK_SCREEN,
         WireMessage::PointerLock { .. } => MESSAGE_POINTER_LOCK,
+        WireMessage::PairCommit { .. } => MESSAGE_PAIR_COMMIT,
+        WireMessage::PairNonce { .. } => MESSAGE_PAIR_NONCE,
+        WireMessage::PairReveal { .. } => MESSAGE_PAIR_REVEAL,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -182,6 +188,9 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         | WireMessage::UserActive
         | WireMessage::LockScreen => {}
         WireMessage::PointerLock { locked } => encoder.u8(u8::from(*locked)),
+        WireMessage::PairCommit { commitment: value }
+        | WireMessage::PairNonce { nonce: value }
+        | WireMessage::PairReveal { nonce: value } => encoder.bytes.extend_from_slice(value),
     }
     Ok(encoder.bytes)
 }
@@ -372,6 +381,15 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 _ => return Err(invalid_data("invalid pointer lock flag")),
             },
         },
+        MESSAGE_PAIR_COMMIT => WireMessage::PairCommit {
+            commitment: decoder.array()?,
+        },
+        MESSAGE_PAIR_NONCE => WireMessage::PairNonce {
+            nonce: decoder.array()?,
+        },
+        MESSAGE_PAIR_REVEAL => WireMessage::PairReveal {
+            nonce: decoder.array()?,
+        },
         _ => return Err(invalid_data("unknown wire message type")),
     };
     decoder.finish()?;
@@ -500,6 +518,10 @@ impl<'a> Decoder<'a> {
 
     fn f64(&mut self) -> io::Result<f64> {
         Ok(f64::from_bits(self.u64()?))
+    }
+
+    fn array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        Ok(self.take(N)?.try_into().expect("length checked"))
     }
 
     fn string(&mut self) -> io::Result<String> {

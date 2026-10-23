@@ -10,18 +10,31 @@
 //!   it, let in (encrypted, but anyone on the network could be on the other
 //!   end).
 //!
-//! Pairing: the side that wants it sends `PairRequest`. Both sides show the
-//! same six-digit code (`pairing_requested`, computed from both
-//! certificates); each user checks it and accepts (`accept_pairing` →
-//! `PairAccept`). Once a side has both its own and the peer's acceptance it
-//! trusts the peer (`paired`, which the shell saves for
-//! `CoreConfig::trusted_peers`) and lets it in. A side that already trusts
-//! the requester accepts at once. Declining or two minutes without an answer
-//! closes the connection; a decline travels in the QUIC close frame
-//! (`CloseCode::PairingDeclined`), so the other side can say so.
+//! Pairing: the side that wants it sends `PairRequest`, and both sides
+//! pair, also one that already trusts the other: a user can only check a
+//! code against the other device's screen. Then the two build the code
+//! together (`secure.rs` says why it takes three messages):
+//!
+//! 1. The dialer of the connection sends `PairCommit`: a hash of its random
+//!    nonce and both certificates.
+//! 2. The other side answers `PairNonce` with its own nonce.
+//! 3. The dialer reveals its nonce (`PairReveal`), and the other side checks
+//!    it against the commitment.
+//!
+//! Each side then shows the six-digit code (`pairing_requested`, from both
+//! certificates and both nonces); each user checks it and accepts
+//! (`accept_pairing` → `PairAccept`). Once a side has both its own and the
+//! peer's acceptance it trusts the peer (`paired`, which the shell saves for
+//! `CoreConfig::trusted_peers`) and lets it in. Declining or two minutes
+//! without an answer closes the connection; a decline travels in the QUIC
+//! close frame (`CloseCode::PairingDeclined`), so the other side can say
+//! so. A pairing message out of turn, or a reveal that does not match its
+//! commitment, ends the connection (`PAIRING_FAILED`). A peer without
+//! `CAPABILITY_PAIRING_V2` (an older build) cannot pair: its code could be
+//! forged (`PAIRING_OUTDATED`).
 
 use super::Runtime;
-use crate::model::WireMessage;
+use crate::model::{CAPABILITY_PAIRING_V2, WireMessage};
 use crate::secure;
 use crate::transport::CloseCode;
 use serde_json::json;
@@ -36,6 +49,12 @@ pub const UNPAIRED: &str = "unpaired";
 pub const PAIRING_REQUIRED: &str = "pairing required";
 /// Another device is pairing with this one right now.
 pub const PAIRING_BUSY: &str = "another pairing is in progress";
+/// The peer runs a build whose pairing code a device in the middle could
+/// forge; it has to be updated before it can pair.
+pub const PAIRING_OUTDATED: &str = "the other device needs a newer LinkCursor to pair";
+/// The peer broke the pairing exchange: a message out of turn, or a nonce
+/// that does not match its commitment. Possibly a device in the middle.
+pub const PAIRING_FAILED: &str = "pairing failed";
 
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -54,6 +73,14 @@ pub struct Pairing {
     /// The peer accepted (`PairAccept`).
     pub remote: bool,
     pub since: Instant,
+    /// This side dialed the connection: it commits to its nonce first.
+    dialer: bool,
+    /// This side's random part of the code.
+    nonce: [u8; 32],
+    /// The side that did not dial: the dialer's commitment, once received.
+    commitment: Option<[u8; 32]>,
+    /// The code, once both nonces are known. Shown, and accepted, only then.
+    code: Option<u32>,
 }
 
 impl Runtime<'_> {
@@ -78,8 +105,9 @@ impl Runtime<'_> {
         }
     }
 
-    /// Starts pairing on a session: asks the peer (`request`) and shows the
-    /// code here.
+    /// Starts pairing on a session: asks the peer (`request`), and as the
+    /// dialer commits to this side's nonce. The code shows once both nonces
+    /// are in (`pair_nonce` on the dialer, `pair_revealed` on the other side).
     fn start_pairing(&mut self, id: u64, request: bool) {
         // One pairing at a time: the code the user is comparing must not be
         // swapped for another device's under the same dialog.
@@ -94,29 +122,157 @@ impl Runtime<'_> {
             self.close_session(id, PAIRING_BUSY, true);
             return;
         }
-        let Some(session) = self.sessions.get_mut(&id) else {
+        let Some(session) = self.sessions.get(&id) else {
             return;
         };
         if session.pairing.is_some() {
             return;
         }
+        if session.connection.capabilities & CAPABILITY_PAIRING_V2 == 0 {
+            // It may still connect once paired, but its pairing code could
+            // be forged by a device in the middle.
+            let peer_id = session.peer_id().unwrap_or("a device").to_owned();
+            self.sink.emit_error(format!(
+                "{peer_id} runs an older LinkCursor and has to be updated before it can pair"
+            ));
+            self.refuse_session(id, PAIRING_OUTDATED);
+            return;
+        }
+        let Some(nonce) = secure::pairing_nonce() else {
+            self.sink
+                .emit_error("no randomness for a pairing code; cannot pair".to_owned());
+            self.refuse_session(id, PAIRING_FAILED);
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let dialer = session.outgoing;
         session.pairing = Some(Pairing {
             local: false,
             remote: false,
             since: Instant::now(),
+            dialer,
+            nonce,
+            commitment: None,
+            code: None,
         });
+        // The request first: the peer pairs from then on, so it expects the
+        // commitment that follows on the same stream.
         if request {
             let _ = session.connection.send_control(WireMessage::PairRequest);
         }
+        if dialer {
+            let commitment = secure::pairing_commitment(
+                &nonce,
+                &self.fingerprint,
+                &session.connection.fingerprint,
+            );
+            let _ = session
+                .connection
+                .send_control(WireMessage::PairCommit { commitment });
+        }
+    }
+
+    /// `PairCommit` from the dialer, to the side that accepted the
+    /// connection: keep it, and answer with this side's nonce.
+    pub(super) fn pair_committed(&mut self, id: u64, commitment: [u8; 32]) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Some(pairing) = session
+            .pairing
+            .as_mut()
+            .filter(|pairing| !pairing.dialer && pairing.commitment.is_none())
+        else {
+            return self.pairing_failed(id, "an unexpected pairing commitment");
+        };
+        pairing.commitment = Some(commitment);
+        let nonce = pairing.nonce;
+        let _ = session
+            .connection
+            .send_control(WireMessage::PairNonce { nonce });
+    }
+
+    /// `PairNonce` from the other side, to the dialer: both nonces are in,
+    /// so reveal this side's and show the code.
+    pub(super) fn pair_nonce(&mut self, id: u64, theirs: [u8; 32]) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Some(pairing) = session
+            .pairing
+            .as_mut()
+            .filter(|pairing| pairing.dialer && pairing.code.is_none())
+        else {
+            return self.pairing_failed(id, "an unexpected pairing nonce");
+        };
+        let nonce = pairing.nonce;
+        pairing.code = Some(secure::pairing_code(
+            &self.fingerprint,
+            &session.connection.fingerprint,
+            &nonce,
+            &theirs,
+        ));
+        let _ = session
+            .connection
+            .send_control(WireMessage::PairReveal { nonce });
         self.announce_pairing(id);
     }
 
-    /// Tells the shell to show the pairing code for this session.
+    /// `PairReveal` from the dialer: the nonce it committed to. It has to
+    /// match the commitment; then show the code.
+    pub(super) fn pair_revealed(&mut self, id: u64, theirs: [u8; 32]) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Some(pairing) = session
+            .pairing
+            .as_mut()
+            .filter(|pairing| !pairing.dialer && pairing.code.is_none())
+        else {
+            return self.pairing_failed(id, "an unexpected pairing reveal");
+        };
+        let dialer = &session.connection.fingerprint;
+        let Some(commitment) = pairing.commitment else {
+            return self.pairing_failed(id, "a pairing reveal before its commitment");
+        };
+        if secure::pairing_commitment(&theirs, dialer, &self.fingerprint) != commitment {
+            return self.pairing_failed(id, "a pairing nonce that does not match its commitment");
+        }
+        pairing.code = Some(secure::pairing_code(
+            dialer,
+            &self.fingerprint,
+            &theirs,
+            &pairing.nonce,
+        ));
+        self.announce_pairing(id);
+    }
+
+    /// The peer broke the pairing exchange: whatever it is, it is not let in
+    /// and not asked again by itself.
+    fn pairing_failed(&mut self, id: u64, what: &str) {
+        let peer_id = self
+            .sessions
+            .get(&id)
+            .and_then(|session| session.peer_id())
+            .unwrap_or("a device")
+            .to_owned();
+        self.sink
+            .emit_error(format!("{peer_id} sent {what}; pairing refused"));
+        self.refuse_session(id, PAIRING_FAILED);
+    }
+
+    /// Tells the shell to show the pairing code for this session, once it is
+    /// known.
     pub(super) fn announce_pairing(&self, id: u64) {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let (Some(peer_id), true) = (session.peer_id(), session.pairing.is_some()) else {
+        let (Some(peer_id), Some(code)) = (
+            session.peer_id(),
+            session.pairing.and_then(|pairing| pairing.code),
+        ) else {
             return;
         };
         let theirs = &session.connection.fingerprint;
@@ -135,29 +291,27 @@ impl Runtime<'_> {
             "peer_id": peer_id,
             "name": name,
             "platform": platform,
-            "code": secure::pairing_code(&self.fingerprint, theirs),
+            "code": format!("{code:06}"),
             "fingerprint": theirs
         }));
     }
 
-    /// `PairRequest` from the peer: it does not trust this device yet.
+    /// `PairRequest` from the peer: it does not trust this device yet. This
+    /// side pairs too, also if it trusts the peer already: the peer's user
+    /// can only check its code against the code shown here.
     pub(super) fn pair_requested(&mut self, id: u64) {
-        let Some(session) = self.sessions.get(&id) else {
-            return;
-        };
-        let Some(peer_id) = session.peer_id() else {
-            return;
-        };
-        if self.trusted.get(peer_id) == Some(&session.connection.fingerprint) {
-            // Paired on this side already: the peer's user decides.
-            let _ = session.connection.send_control(WireMessage::PairAccept);
+        if !self
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.peer_id().is_some())
+        {
             return;
         }
-        // Not paired here either: this side's user has to check the code too.
         self.start_pairing(id, false);
     }
 
-    /// `PairAccept` from the peer.
+    /// `PairAccept` from the peer. Its user can only have accepted a code,
+    /// so it comes after the exchange that makes one.
     pub(super) fn pair_accepted(&mut self, id: u64) {
         let Some(pairing) = self
             .sessions
@@ -166,6 +320,9 @@ impl Runtime<'_> {
         else {
             return;
         };
+        if pairing.code.is_none() {
+            return self.pairing_failed(id, "a pairing acceptance before the code");
+        }
         pairing.remote = true;
         self.finish_pairing(id);
     }
@@ -178,7 +335,9 @@ impl Runtime<'_> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        // Accepting means the user checked the code, so there must be one.
         if let Some(pairing) = session.pairing.as_mut()
+            && pairing.code.is_some()
             && !pairing.local
         {
             pairing.local = true;
