@@ -70,8 +70,6 @@ pub struct Entry {
 #[derive(Debug, Clone)]
 pub struct Offer {
     pub manifest: Manifest,
-    /// The paths the shell reported, to recognise the same copy again.
-    pub roots: Vec<PathBuf>,
     sources: Vec<Source>,
 }
 
@@ -83,16 +81,49 @@ struct Source {
 }
 
 impl Offer {
+    /// Bounded positional read. Validate the opened handle before AND after
+    /// reading, rather than checking one path then opening a different file.
+    pub fn read_range(&self, entry: usize, offset: u64, length: usize) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        if length == 0 || length > crate::file_stream::MAX_READ_SIZE {
+            return Err("invalid file read size".into());
+        }
+        let source = self.sources.get(entry).ok_or("no such file")?;
+        if self.manifest.entries[entry].dir || offset > source.size {
+            return Err("invalid file read".into());
+        }
+        let mut file = fs::File::open(&source.path).map_err(|e| e.to_string())?;
+        let check = |file: &fs::File| -> Result<(), String> {
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.len() != source.size
+                || metadata.modified().ok() != source.modified
+            {
+                return Err("file changed since it was copied".into());
+            }
+            Ok(())
+        };
+        check(&file)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; (source.size - offset).min(length as u64) as usize];
+        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        check(&file)?;
+        Ok(bytes)
+    }
     /// Lists `roots` (files and folders, recursively; symbolic links are
     /// left out) as transfer `transfer`.
-    pub fn build(transfer: u32, roots: &[PathBuf]) -> Result<Self, String> {
+    pub fn build_cancellable(
+        transfer: u32,
+        roots: &[PathBuf],
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self, String> {
         let mut offer = Self {
             manifest: Manifest {
                 transfer,
                 total_size: 0,
                 entries: Vec::new(),
             },
-            roots: roots.to_vec(),
             sources: Vec::new(),
         };
         for root in roots {
@@ -100,7 +131,7 @@ impl Offer {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("unsupported file name: {}", root.display()))?;
-            offer.add(root, name.to_owned(), 0)?;
+            offer.add(root, name.to_owned(), 0, stop)?;
         }
         if offer.manifest.entries.is_empty() {
             return Err("no files to offer".to_owned());
@@ -108,7 +139,16 @@ impl Offer {
         Ok(offer)
     }
 
-    fn add(&mut self, path: &Path, relative: String, depth: usize) -> Result<(), String> {
+    fn add(
+        &mut self,
+        path: &Path,
+        relative: String,
+        depth: usize,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         if self.manifest.entries.len() >= MAX_ENTRIES || depth > MAX_DEPTH {
             return Err("too many files".to_owned());
         }
@@ -120,16 +160,24 @@ impl Offer {
             self.push(path, relative.clone(), 0, true, None);
             let mut children: Vec<_> = fs::read_dir(path)
                 .map_err(|error| error.to_string())?
-                .filter_map(Result::ok)
-                .collect();
+                .take(MAX_ENTRIES + 1)
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())?;
+            if children.len() > MAX_ENTRIES {
+                return Err("too many files".into());
+            }
             children.sort_by_key(|child| child.file_name());
             for child in children {
-                if let Some(name) = child.file_name().to_str() {
-                    self.add(&child.path(), format!("{relative}/{name}"), depth + 1)?;
-                }
+                let child_name = child.file_name();
+                let name = child_name.to_str().ok_or("unsupported file name")?;
+                self.add(&child.path(), format!("{relative}/{name}"), depth + 1, stop)?;
             }
         } else if metadata.is_file() {
-            self.manifest.total_size += metadata.len();
+            self.manifest.total_size = self
+                .manifest
+                .total_size
+                .checked_add(metadata.len())
+                .ok_or("file sizes overflow")?;
             self.push(
                 path,
                 relative,
@@ -359,6 +407,9 @@ impl FileWriter {
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
         // Something may have appeared at the target meanwhile: never overwrite.
+        #[cfg(windows)]
+        let target = self.target.clone();
+        #[cfg(not(windows))]
         let target = if fs::symlink_metadata(&self.target).is_ok() {
             let parent = self.target.parent().unwrap_or(Path::new(""));
             let name = self
@@ -370,6 +421,27 @@ impl FileWriter {
         } else {
             self.target.clone()
         };
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let from: Vec<u16> = self
+                .partial
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Unlike std::fs::rename on Windows, MoveFileW never replaces
+            // an existing target. A race fails instead of overwriting it or
+            // silently moving to a path different from the manifest plan.
+            if unsafe {
+                windows_sys::Win32::Storage::FileSystem::MoveFileW(from.as_ptr(), to.as_ptr())
+            } == 0
+            {
+                return Err(io::Error::last_os_error().to_string());
+            }
+        }
+        #[cfg(not(windows))]
         fs::rename(&self.partial, &target).map_err(|error| error.to_string())?;
         self.target = target;
         Ok(())

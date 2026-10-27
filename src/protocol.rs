@@ -31,6 +31,12 @@ const MESSAGE_POINTER_LOCK: u8 = 19;
 const MESSAGE_PAIR_COMMIT: u8 = 20;
 const MESSAGE_PAIR_NONCE: u8 = 21;
 const MESSAGE_PAIR_REVEAL: u8 = 22;
+const MESSAGE_FILE_STREAM_OPEN: u8 = 23;
+const MESSAGE_FILE_STREAM_OPENED: u8 = 24;
+const MESSAGE_FILE_STREAM_READ: u8 = 25;
+const MESSAGE_FILE_STREAM_DATA: u8 = 26;
+const MESSAGE_FILE_STREAM_CLOSE: u8 = 27;
+const MESSAGE_FILE_OFFER_REVOKE: u8 = 28;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -57,6 +63,12 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::PairCommit { .. } => MESSAGE_PAIR_COMMIT,
         WireMessage::PairNonce { .. } => MESSAGE_PAIR_NONCE,
         WireMessage::PairReveal { .. } => MESSAGE_PAIR_REVEAL,
+        WireMessage::FileStreamOpen { .. } => MESSAGE_FILE_STREAM_OPEN,
+        WireMessage::FileStreamOpened { .. } => MESSAGE_FILE_STREAM_OPENED,
+        WireMessage::FileStreamRead { .. } => MESSAGE_FILE_STREAM_READ,
+        WireMessage::FileStreamData { .. } => MESSAGE_FILE_STREAM_DATA,
+        WireMessage::FileStreamClose { .. } => MESSAGE_FILE_STREAM_CLOSE,
+        WireMessage::FileOfferRevoke { .. } => MESSAGE_FILE_OFFER_REVOKE,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -181,6 +193,53 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.u32(*transfer);
             encoder.u16(reason.len() as u16);
             encoder.bytes.extend_from_slice(reason.as_bytes());
+        }
+        WireMessage::FileOfferRevoke { transfer } => encoder.u32(*transfer),
+        WireMessage::FileStreamOpen { transfer, lease } => {
+            encoder.u32(*transfer);
+            encoder.u64(*lease);
+        }
+        WireMessage::FileStreamOpened { lease, reason } => {
+            encoder.u64(*lease);
+            encoder.reason(reason);
+        }
+        WireMessage::FileStreamClose {
+            lease,
+            from_source,
+            reason,
+        } => {
+            encoder.u64(*lease);
+            encoder.u8(u8::from(*from_source));
+            encoder.reason(reason);
+        }
+        WireMessage::FileStreamRead {
+            lease,
+            request,
+            entry,
+            offset,
+            length,
+        } => {
+            if *length == 0 || *length as usize > crate::file_stream::MAX_READ_SIZE {
+                return Err(invalid_data("invalid file read size"));
+            }
+            encoder.u64(*lease);
+            encoder.u64(*request);
+            encoder.u32(*entry);
+            encoder.u64(*offset);
+            encoder.u32(*length);
+        }
+        WireMessage::FileStreamData {
+            request,
+            data,
+            reason,
+        } => {
+            if data.len() > crate::file_stream::MAX_READ_SIZE {
+                return Err(invalid_data("file read response too large"));
+            }
+            encoder.u64(*request);
+            encoder.reason(reason);
+            encoder.u32(data.len() as u32);
+            encoder.bytes.extend_from_slice(data);
         }
         WireMessage::ControlRevoke { handoff } => encoder.u8(u8::from(*handoff)),
         WireMessage::PairRequest
@@ -363,6 +422,56 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 .map_err(|_| invalid_data("cancel reason is not UTF-8"))?;
             WireMessage::FileCancel { transfer, reason }
         }
+        MESSAGE_FILE_OFFER_REVOKE => WireMessage::FileOfferRevoke {
+            transfer: decoder.u32()?,
+        },
+        MESSAGE_FILE_STREAM_OPEN => WireMessage::FileStreamOpen {
+            transfer: decoder.u32()?,
+            lease: decoder.u64()?,
+        },
+        MESSAGE_FILE_STREAM_OPENED => WireMessage::FileStreamOpened {
+            lease: decoder.u64()?,
+            reason: decoder.reason()?,
+        },
+        MESSAGE_FILE_STREAM_CLOSE => WireMessage::FileStreamClose {
+            lease: decoder.u64()?,
+            from_source: match decoder.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid_data("invalid stream close direction")),
+            },
+            reason: decoder.reason()?,
+        },
+        MESSAGE_FILE_STREAM_READ => {
+            let lease = decoder.u64()?;
+            let request = decoder.u64()?;
+            let entry = decoder.u32()?;
+            let offset = decoder.u64()?;
+            let length = decoder.u32()?;
+            if length == 0 || length as usize > crate::file_stream::MAX_READ_SIZE {
+                return Err(invalid_data("invalid file read size"));
+            }
+            WireMessage::FileStreamRead {
+                lease,
+                request,
+                entry,
+                offset,
+                length,
+            }
+        }
+        MESSAGE_FILE_STREAM_DATA => {
+            let request = decoder.u64()?;
+            let reason = decoder.reason()?;
+            let length = decoder.u32()? as usize;
+            if length > crate::file_stream::MAX_READ_SIZE {
+                return Err(invalid_data("file read response too large"));
+            }
+            WireMessage::FileStreamData {
+                request,
+                reason,
+                data: decoder.take(length)?.to_vec(),
+            }
+        }
         MESSAGE_CONTROL_REVOKE => WireMessage::ControlRevoke {
             handoff: match decoder.u8()? {
                 0 => false,
@@ -413,6 +522,11 @@ struct Encoder {
 }
 
 impl Encoder {
+    fn reason(&mut self, reason: &str) {
+        let reason: String = reason.chars().take(MAX_REASON_LENGTH / 4).collect();
+        self.u16(reason.len() as u16);
+        self.bytes.extend_from_slice(reason.as_bytes());
+    }
     fn with_header(message_type: u8) -> Self {
         let mut encoder = Self {
             bytes: Vec::with_capacity(128),
@@ -480,6 +594,14 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
+    fn reason(&mut self) -> io::Result<String> {
+        let length = self.u16()? as usize;
+        if length > MAX_REASON_LENGTH {
+            return Err(invalid_data("file stream reason too long"));
+        }
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| invalid_data("invalid file stream reason"))
+    }
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }

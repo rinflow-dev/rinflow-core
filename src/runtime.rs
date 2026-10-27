@@ -1,4 +1,5 @@
 mod data;
+mod file_streams;
 pub mod manual;
 pub(crate) mod reconnect;
 pub(crate) mod trust;
@@ -98,6 +99,7 @@ pub enum Command {
     },
     /// The system clipboard changed; empty when it holds nothing shared.
     SetClipboard(Clipboard),
+    FileStream(crate::file_stream::StreamCommand),
     /// Receive the offered files of this transfer (`files_offered`).
     AcceptFiles(u32),
     /// Stop receiving this transfer.
@@ -139,6 +141,9 @@ pub struct CoreThread {
 }
 
 impl CoreThread {
+    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<Command> {
+        self.commands.clone()
+    }
     pub fn spawn(config: CoreConfig, sink: EventSink) -> Result<Self, String> {
         config.validate()?;
         let (commands, receiver) = mpsc::unbounded_channel();
@@ -323,6 +328,8 @@ async fn run(
         pending_disconnects: Vec::new(),
         portals: Vec::new(),
         clipboard: None,
+        clipboard_generation: 0,
+        offer_scan: None,
         next_clipboard_id: 0,
         controlling: None,
         input_suspended: false,
@@ -335,6 +342,7 @@ async fn run(
         download: None,
         download_failures: Vec::new(),
         uploads: HashMap::new(),
+        streams: file_streams::StreamState::default(),
     };
 
     sink.emit_value(json!({
@@ -360,6 +368,7 @@ async fn run(
                     Some(Command::SetPlacement { peer_id, offset }) => state.set_placement(&peer_id, offset),
                     Some(Command::PlaceBeside { peer_id, side }) => state.place_beside(&peer_id, side),
                     Some(Command::SetClipboard(clipboard)) => state.set_clipboard(clipboard),
+                    Some(Command::FileStream(command)) => state.stream_command(command),
                     Some(Command::AcceptFiles(transfer)) => state.accept_files(transfer),
                     Some(Command::CancelFiles(transfer)) => state.cancel_files(transfer),
                     Some(Command::SetRemoteControlAllowed(allowed)) => state.set_remote_control_allowed(allowed),
@@ -560,6 +569,8 @@ struct Runtime<'a> {
     portals: Vec<Value>,
     /// This device's clipboard, encoded, with its digest.
     clipboard: Option<(u64, Arc<Vec<u8>>)>,
+    clipboard_generation: u64,
+    offer_scan: Option<Arc<std::sync::atomic::AtomicBool>>,
     next_clipboard_id: u32,
     /// The peer this device's input is driving, from the first event sent
     /// after a target change or reset until the next one.
@@ -586,6 +597,7 @@ struct Runtime<'a> {
     download_failures: Vec<(u64, Value)>,
     /// File uploads in progress, by data link.
     uploads: HashMap<u64, Upload>,
+    streams: file_streams::StreamState,
 }
 
 /// How long a disconnect may be held back while a duplicate connection that
@@ -1419,6 +1431,18 @@ impl Runtime<'_> {
 
     fn connection_event(&mut self, event: ConnectionEvent) {
         match event {
+            ConnectionEvent::FileStreamServed {
+                session,
+                lease,
+                entry,
+                offset,
+                length,
+            } => self.stream_served(session, lease, entry, offset, length),
+            ConnectionEvent::ClipboardPrepared {
+                generation,
+                clipboard,
+                offer,
+            } => self.clipboard_prepared(generation, clipboard, offer),
             ConnectionEvent::ConnectResult { peer_id, result } => {
                 let Some(automatic) = self.dialing.remove(&peer_id) else {
                     // Cancelled by a disconnect while the connect was in flight.
@@ -1444,7 +1468,8 @@ impl Runtime<'_> {
             ConnectionEvent::Message {
                 connection_id,
                 message,
-            } => self.message(connection_id, message),
+                budget,
+            } => self.message(connection_id, message, budget),
             ConnectionEvent::DataConnectResult {
                 session,
                 token,
@@ -1473,9 +1498,14 @@ impl Runtime<'_> {
         }
     }
 
-    fn message(&mut self, id: u64, message: WireMessage) {
+    fn message(
+        &mut self,
+        id: u64,
+        message: WireMessage,
+        budget: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         if self.data_links.contains_key(&id) {
-            return self.data_message(id, message);
+            return self.data_message(id, message, budget);
         }
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
@@ -1614,7 +1644,13 @@ impl Runtime<'_> {
             | WireMessage::ClipboardChunk { .. }
             | WireMessage::FileRequest { .. }
             | WireMessage::FileChunk { .. }
-            | WireMessage::FileCancel { .. } => {}
+            | WireMessage::FileCancel { .. }
+            | WireMessage::FileStreamOpen { .. }
+            | WireMessage::FileStreamOpened { .. }
+            | WireMessage::FileStreamRead { .. }
+            | WireMessage::FileStreamData { .. }
+            | WireMessage::FileStreamClose { .. } => {}
+            WireMessage::FileOfferRevoke { .. } => {}
         }
     }
 
@@ -1815,7 +1851,7 @@ impl Runtime<'_> {
         self.invite_data_link(id);
         // What the peer sent while it waited for this side.
         for message in held {
-            self.message(id, message);
+            self.message(id, message, None);
         }
         // A disconnect held back for this peer is moot now.
         self.flush_disconnects(false);
@@ -1959,6 +1995,7 @@ impl Runtime<'_> {
     }
 
     fn maintenance(&mut self) {
+        self.expire_streams();
         self.flush_disconnects(false);
         let expired: Vec<String> = self
             .peers

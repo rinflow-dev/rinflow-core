@@ -46,9 +46,10 @@ pub(super) struct Upload {
 
 /// Files this device is receiving: one transfer at a time.
 pub(super) struct Download {
+    generation: u64,
     session: u64,
     peer_id: String,
-    manifest: Manifest,
+    pub(super) manifest: Manifest,
     accepted: bool,
     /// Destination of each entry, and the top-level ones for the clipboard.
     targets: Vec<PathBuf>,
@@ -85,6 +86,7 @@ enum DiskJob {
     Write {
         offset: u64,
         data: Vec<u8>,
+        _budget: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     /// Everything is queued: report once it is written.
     Done,
@@ -121,17 +123,19 @@ impl DiskWriter {
                                 Err(error) => Err(error.to_string()),
                             }
                         }
-                        DiskJob::Write { offset, data } => {
-                            match file.as_mut().map(|writer| writer.write(offset, &data)) {
-                                Some(Ok(true)) => {
-                                    file = None;
-                                    Ok(())
-                                }
-                                Some(Ok(false)) => Ok(()),
-                                Some(Err(reason)) => Err(reason),
-                                None => Err("no file to write to".to_owned()),
+                        DiskJob::Write {
+                            offset,
+                            data,
+                            _budget,
+                        } => match file.as_mut().map(|writer| writer.write(offset, &data)) {
+                            Some(Ok(true)) => {
+                                file = None;
+                                Ok(())
                             }
-                        }
+                            Some(Ok(false)) => Ok(()),
+                            Some(Err(reason)) => Err(reason),
+                            None => Err("no file to write to".to_owned()),
+                        },
                         DiskJob::Done => break Ok(()),
                     };
                     if let Err(reason) = result {
@@ -163,7 +167,7 @@ impl Runtime<'_> {
         self.config.advertised_capabilities() & peer_capabilities & DATA_LINK_CAPABILITIES != 0
     }
 
-    fn data_link(&self, session: u64) -> Option<&ActiveConnection> {
+    pub(super) fn data_link(&self, session: u64) -> Option<&ActiveConnection> {
         let id = self.sessions.get(&session)?.data?;
         self.data_links.get(&id).map(|link| &link.connection)
     }
@@ -338,6 +342,7 @@ impl Runtime<'_> {
             return;
         };
         link.connection.abort();
+        self.close_session_streams(link.session, reason);
         self.end_upload(id, reason);
         if let Some(session) = self.sessions.get_mut(&link.session) {
             session.data = None;
@@ -357,11 +362,22 @@ impl Runtime<'_> {
     }
 
     /// A message on data link `id`.
-    pub(super) fn data_message(&mut self, id: u64, message: WireMessage) {
+    pub(super) fn data_message(
+        &mut self,
+        id: u64,
+        message: WireMessage,
+        budget: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let Some(session) = self.data_links.get(&id).map(|link| link.session) else {
             return;
         };
         match message {
+            message @ (WireMessage::FileStreamOpen { .. }
+            | WireMessage::FileStreamOpened { .. }
+            | WireMessage::FileStreamRead { .. }
+            | WireMessage::FileStreamData { .. }
+            | WireMessage::FileStreamClose { .. }
+            | WireMessage::FileOfferRevoke { .. }) => self.stream_message(session, message),
             // The accepting side greets every connection; a data link
             // learns nothing from it.
             WireMessage::Hello { .. } => {}
@@ -381,7 +397,7 @@ impl Runtime<'_> {
                 entry,
                 offset,
                 data,
-            } => self.file_chunk(session, transfer, entry as usize, offset, data),
+            } => self.file_chunk(session, transfer, entry as usize, offset, data, budget),
             WireMessage::FileCancel { transfer, reason } => {
                 if self
                     .download
@@ -408,7 +424,73 @@ impl Runtime<'_> {
     /// (`text/uri-list`) become an offer. Sent to a peer when control moves
     /// to it or comes back from it (see `clipboard.rs`).
     pub(super) fn set_clipboard(&mut self, mut clipboard: Clipboard) {
-        self.offer_files(&mut clipboard);
+        self.replace_clipboard_snapshot();
+        self.clipboard = None;
+        if let Some(index) = clipboard
+            .formats
+            .iter()
+            .position(|f| f.mime == MIME_URI_LIST)
+        {
+            let roots = files::parse_uri_list(&clipboard.formats.remove(index).data);
+            if self.config.files && !roots.is_empty() {
+                self.next_transfer = self.next_transfer.wrapping_add(1);
+                let transfer = self.next_transfer;
+                let generation = self.clipboard_generation;
+                let events = self.connection_events.clone();
+                let stop = Arc::new(AtomicBool::new(false));
+                self.offer_scan = Some(stop.clone());
+                tokio::task::spawn_blocking(move || {
+                    let offer = Offer::build_cancellable(transfer, &roots, &stop);
+                    let _ = events.send(ConnectionEvent::ClipboardPrepared {
+                        generation,
+                        clipboard,
+                        offer,
+                    });
+                });
+                return;
+            }
+        }
+        self.store_clipboard(clipboard);
+    }
+
+    pub(super) fn replace_clipboard_snapshot(&mut self) {
+        self.revoke_current_file_offer();
+        self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
+        if let Some(stop) = self.offer_scan.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.offered_to.clear();
+        self.offer = None;
+        self.streams.offers.clear();
+    }
+
+    pub(super) fn clipboard_prepared(
+        &mut self,
+        generation: u64,
+        mut clipboard: Clipboard,
+        offer: Result<Offer, String>,
+    ) {
+        if self.clipboard_generation != generation {
+            return;
+        }
+        self.offer_scan = None;
+        match offer {
+            Ok(offer) => {
+                clipboard.formats.insert(
+                    0,
+                    ClipboardFormat {
+                        mime: MIME_FILES.to_owned(),
+                        data: serde_json::to_vec(&offer.manifest).expect("manifest serialises"),
+                    },
+                );
+                self.offer = Some(Arc::new(offer));
+            }
+            Err(reason) => self.sink.emit_error(format!("files not shared: {reason}")),
+        }
+        self.store_clipboard(clipboard);
+    }
+
+    fn store_clipboard(&mut self, clipboard: Clipboard) {
         if clipboard.is_empty() {
             self.clipboard = None;
             return;
@@ -421,6 +503,22 @@ impl Runtime<'_> {
         }
         let encoded = clipboard.encode();
         self.clipboard = Some((clipboard::digest(&encoded), Arc::new(encoded)));
+        let ids: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.clipboard_pending
+                    || session.remote_input.is_controlling()
+                    || self
+                        .controlling
+                        .as_deref()
+                        .is_some_and(|peer| session.peer_id() == Some(peer))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            self.sync_clipboard(id);
+        }
     }
 
     /// Hands the peer of session `id` this device's clipboard, unless it has
@@ -428,6 +526,11 @@ impl Runtime<'_> {
     /// when it is not up yet.
     pub(super) fn sync_clipboard(&mut self, id: u64) {
         let Some((digest, encoded)) = &self.clipboard else {
+            if self.offer_scan.is_some()
+                && let Some(session) = self.sessions.get_mut(&id)
+            {
+                session.clipboard_pending = true;
+            }
             return;
         };
         let Some(session) = self.sessions.get_mut(&id) else {
@@ -490,6 +593,10 @@ impl Runtime<'_> {
                 return;
             }
         };
+        self.replace_clipboard_snapshot();
+        let Some(owner) = self.sessions.get_mut(&session) else {
+            return;
+        };
         let (manifests, rest): (Vec<ClipboardFormat>, Vec<ClipboardFormat>) = clipboard
             .formats
             .into_iter()
@@ -524,7 +631,12 @@ impl Runtime<'_> {
                         .map(|()| manifest)
                         .map_err(str::to_owned)
                 }) {
-                Ok(manifest) => return self.start_download(session, peer_id, manifest, rest),
+                Ok(manifest) => {
+                    if self.publish_stream_offer(session, &peer_id, manifest.clone()) {
+                        return;
+                    }
+                    return self.start_download(session, peer_id, manifest, rest);
+                }
                 Err(error) => self.sink.emit_error(format!("files not received: {error}")),
             }
         }
@@ -542,53 +654,6 @@ impl Runtime<'_> {
     }
 
     // ---- Sending files ------------------------------------------------
-
-    /// Replaces a `text/uri-list` of local files with their manifest, and
-    /// remembers where they are.
-    fn offer_files(&mut self, clipboard: &mut Clipboard) {
-        // A new clipboard: no peer has been offered its files yet.
-        self.offered_to.clear();
-        let Some(index) = clipboard
-            .formats
-            .iter()
-            .position(|format| format.mime == MIME_URI_LIST)
-        else {
-            self.offer = None;
-            return;
-        };
-        // Local paths never leave this device.
-        let roots = files::parse_uri_list(&clipboard.formats.remove(index).data);
-        if !self.config.files || roots.is_empty() {
-            self.offer = None;
-            return;
-        }
-        // The same copy again keeps its number, so its clipboard digest stays
-        // the same and a peer that has it gets nothing new.
-        let transfer = match &self.offer {
-            Some(offer) if offer.roots == roots => offer.manifest.transfer,
-            _ => {
-                self.next_transfer = self.next_transfer.wrapping_add(1);
-                self.next_transfer
-            }
-        };
-        match Offer::build(transfer, &roots) {
-            Ok(offer) => {
-                let manifest = serde_json::to_vec(&offer.manifest).expect("manifest serialises");
-                clipboard.formats.insert(
-                    0,
-                    ClipboardFormat {
-                        mime: MIME_FILES.to_owned(),
-                        data: manifest,
-                    },
-                );
-                self.offer = Some(Arc::new(offer));
-            }
-            Err(error) => {
-                self.sink.emit_error(format!("files not shared: {error}"));
-                self.offer = None;
-            }
-        }
-    }
 
     /// A peer asks for an entry of this device's offer on data link `link`.
     fn file_requested(&mut self, link: u64, transfer: u32, entry: usize, offset: u64) {
@@ -771,10 +836,14 @@ impl Runtime<'_> {
                 return;
             }
         };
-        let accepted = manifest.total_size <= self.config.max_auto_receive_bytes;
+        let accepted = !self.config.on_demand_files
+            && manifest.total_size <= self.config.max_auto_receive_bytes;
+        let (name, items) = manifest.summary();
+        let name = name.to_owned();
         let count = manifest.entries.iter().filter(|entry| !entry.dir).count();
         let total_size = manifest.total_size;
         self.download = Some(Download {
+            generation: self.clipboard_generation,
             session,
             peer_id: peer_id.clone(),
             manifest,
@@ -798,7 +867,8 @@ impl Runtime<'_> {
                 "peer_id": peer_id,
                 "transfer": transfer,
                 "count": count,
-                "total_size": total_size
+                "total_size": total_size,
+                "name": name, "items": items
             }));
         }
     }
@@ -839,6 +909,7 @@ impl Runtime<'_> {
     /// Stops a transfer: one being received (or offered), or this device's
     /// own files being sent, which the receivers are told.
     pub(super) fn cancel_files(&mut self, transfer: u32) {
+        self.cancel_stream_job(transfer);
         if self
             .download
             .as_ref()
@@ -931,6 +1002,7 @@ impl Runtime<'_> {
         entry: usize,
         offset: u64,
         data: Vec<u8>,
+        budget: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         let Some(download) = self.download.as_mut() else {
             return;
@@ -959,7 +1031,11 @@ impl Runtime<'_> {
             return;
         };
         // Written on the disk writer's thread; the writer checks again.
-        disk.send(DiskJob::Write { offset, data });
+        disk.send(DiskJob::Write {
+            offset,
+            data,
+            _budget: budget,
+        });
         download.entry_received += length;
         download.received += length;
         let done = download.entry_received == size;
@@ -1027,7 +1103,11 @@ impl Runtime<'_> {
                 data: files::uri_list(&download.tops),
             },
         );
-        self.emit_clipboard(&download.peer_id, &clipboard);
+        if download.generation == self.clipboard_generation {
+            self.sink
+                .emit_value(json!({ "event": "clipboard", "peer_id": download.peer_id,
+                "transfer": download.manifest.transfer, "formats": clipboard.to_json() }));
+        }
     }
 
     /// Stops the transfer being received; its partial file is removed.

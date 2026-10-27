@@ -81,6 +81,48 @@ impl Core {
         self.thread.send(Command::AcceptFiles(transfer))
     }
 
+    /// Pins an on-demand offer for a native clipboard copy operation.
+    /// This blocks for at most 15 seconds; use on the provider's worker.
+    pub fn open_remote_files(
+        &self,
+        peer: &str,
+        transfer: u32,
+    ) -> Result<crate::RemoteFileLease, String> {
+        use crate::file_stream::{READ_TIMEOUT, StreamCommand, next_id};
+        let lease = next_id();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.thread.send(Command::FileStream(StreamCommand::Open {
+            peer: peer.to_owned(),
+            transfer,
+            lease,
+            reply,
+        }))?;
+        match result.recv_timeout(READ_TIMEOUT) {
+            Ok(Ok(())) => Ok(crate::RemoteFileLease {
+                commands: self.thread.sender(),
+                id: lease,
+            }),
+            outcome => {
+                let _ = self.thread.send(Command::FileStream(StreamCommand::Close {
+                    lease,
+                    reason: "open failed".to_owned(),
+                }));
+                Err(outcome
+                    .ok()
+                    .and_then(Result::err)
+                    .unwrap_or_else(|| "remote file open timed out".to_owned()))
+            }
+        }
+    }
+
+    /// Disables file providers and active leases immediately, for a sharing
+    /// switch being turned off. Ordinary clipboard replacement keeps leases.
+    pub fn revoke_file_streams(&self) -> Result<(), String> {
+        self.thread.send(Command::FileStream(
+            crate::file_stream::StreamCommand::Revoke,
+        ))
+    }
+
     /// Stops receiving a transfer (offered or under way).
     pub fn cancel_files(&self, transfer: u32) -> Result<(), String> {
         self.thread.send(Command::CancelFiles(transfer))

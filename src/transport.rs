@@ -93,9 +93,22 @@ impl std::fmt::Debug for Link {
 
 #[derive(Debug)]
 pub enum ConnectionEvent {
+    FileStreamServed {
+        session: u64,
+        lease: u64,
+        entry: usize,
+        offset: u64,
+        length: usize,
+    },
+    ClipboardPrepared {
+        generation: u64,
+        clipboard: crate::clipboard::Clipboard,
+        offer: Result<crate::files::Offer, String>,
+    },
     Message {
         connection_id: u64,
         message: WireMessage,
+        budget: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Closed {
         connection_id: u64,
@@ -347,6 +360,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: R,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) -> io::Result<()> {
+    // Held through runtime dispatch and (for legacy file chunks) disk write.
+    // A slow disk stops this data connection without blocking input sockets.
+    let budget = Arc::new(tokio::sync::Semaphore::new(4 * 1024 * 1024));
     loop {
         let length = match reader.read_u32().await {
             Ok(length) => length as usize,
@@ -361,6 +377,11 @@ async fn read_loop<R: AsyncRead + Unpin>(
             ));
         }
 
+        let permit = budget
+            .clone()
+            .acquire_many_owned(length as u32)
+            .await
+            .map_err(|_| io::Error::other("receive budget closed"))?;
         let mut payload = vec![0_u8; length];
         reader.read_exact(&mut payload).await?;
         let message = decode_message(&payload)?;
@@ -369,6 +390,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
             .send(ConnectionEvent::Message {
                 connection_id,
                 message,
+                budget: Some(permit),
             })
             .is_err()
         {
@@ -510,4 +532,49 @@ pub fn accept_in_background(
             let _ = events.send(ConnectionEvent::Accepted { link, bulk });
         }
     });
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn receive_budget_is_held_until_the_disk_consumer_releases_chunks() {
+        let (mut sender, receiver) = tokio::io::duplex(64 * 1024);
+        let (events, mut received) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(read_loop(1, receiver, events));
+        let writer = tokio::spawn(async move {
+            for index in 0..100 {
+                write_frame(
+                    &mut sender,
+                    &WireMessage::FileChunk {
+                        transfer: 1,
+                        entry: 0,
+                        offset: index * 65536,
+                        data: vec![0; 65536],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut held = vec![];
+        while let Ok(event) = received.try_recv() {
+            held.push(event);
+        }
+        assert!(!held.is_empty());
+        assert!(held.len() <= 64, "unbounded receive queue: {}", held.len());
+        assert!(
+            !writer.is_finished(),
+            "producer ran past the receive budget"
+        );
+        let count = held.len();
+        drop(held);
+        for _ in count..100 {
+            drop(received.recv().await.unwrap());
+        }
+        writer.await.unwrap();
+        reader.await.unwrap().unwrap();
+    }
 }

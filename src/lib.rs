@@ -1,6 +1,7 @@
 mod api;
 mod clipboard;
 mod ffi;
+mod file_stream;
 mod files;
 mod input;
 pub mod layout;
@@ -22,7 +23,9 @@ pub use clipboard::{
     MIME_TEXT,
 };
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
+pub use file_stream::{MAX_READ_SIZE, RemoteFileLease};
 pub use files::MIME_URI_LIST;
+pub use files::{Entry as FileEntry, Manifest as FileManifest};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -269,6 +272,32 @@ mod tests {
             },
             WireMessage::PairNonce { nonce: [8; 32] },
             WireMessage::PairReveal { nonce: [9; 32] },
+            WireMessage::FileStreamOpen {
+                transfer: 7,
+                lease: 123,
+            },
+            WireMessage::FileOfferRevoke { transfer: 7 },
+            WireMessage::FileStreamOpened {
+                lease: 123,
+                reason: String::new(),
+            },
+            WireMessage::FileStreamRead {
+                lease: 123,
+                request: 456,
+                entry: 2,
+                offset: 1 << 40,
+                length: 262144,
+            },
+            WireMessage::FileStreamData {
+                request: 456,
+                data: vec![1, 2, 3],
+                reason: String::new(),
+            },
+            WireMessage::FileStreamClose {
+                lease: 123,
+                from_source: true,
+                reason: "cancelled".into(),
+            },
             WireMessage::DataHello {
                 device_id: "dev".into(),
                 token: 7,
@@ -1884,6 +1913,14 @@ mod tests {
 
     /// Two cores with clipboard and files, B receiving into its own folder.
     fn file_cores(name: &str, limit: u64) -> (TestCore, TestCore, PathBuf, PathBuf) {
+        file_cores_with(name, limit, false)
+    }
+
+    fn file_cores_with(
+        name: &str,
+        limit: u64,
+        on_demand: bool,
+    ) -> (TestCore, TestCore, PathBuf, PathBuf) {
         let discovery_port = free_udp_port();
         let source = temp_dir(&format!("{name}-src"));
         let downloads = temp_dir(&format!("{name}-dst"));
@@ -1899,6 +1936,7 @@ mod tests {
             config.files = true;
             config.download_directory = Some(dst);
             config.max_auto_receive_bytes = limit;
+            config.on_demand_files = on_demand;
         });
         wait_for_peers(&a, &[&format!("{name}-b")]);
         a.thread
@@ -1913,6 +1951,245 @@ mod tests {
         (0..length)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
             .collect()
+    }
+
+    fn stream_lease(core: &TestCore, peer: &str, transfer: u32) -> crate::RemoteFileLease {
+        let lease = crate::file_stream::next_id();
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        core.thread
+            .send(Command::FileStream(
+                crate::file_stream::StreamCommand::Open {
+                    peer: peer.into(),
+                    transfer,
+                    lease,
+                    reply,
+                },
+            ))
+            .unwrap();
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        crate::RemoteFileLease {
+            id: lease,
+            commands: core.thread.sender(),
+        }
+    }
+
+    #[test]
+    fn on_demand_files_wait_for_reads_and_survive_clipboard_replacement() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores_with("stream", u64::MAX, true);
+        let content = pattern(700_003, 9);
+        let file = source.join("video.bin");
+        std::fs::write(&file, &content).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[file])))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_available"
+        });
+        assert!(events_named(&b, "files_receiving").is_empty());
+        assert!(events_named(&a, "files_sending").is_empty());
+        assert!(walk(&downloads).is_empty());
+        let lease = stream_lease(
+            &b,
+            "stream-a",
+            offered["manifest"]["transfer"].as_u64().unwrap() as u32,
+        );
+        assert_eq!(
+            lease.read(0, 0, usize::MAX).unwrap(),
+            content[..crate::MAX_READ_SIZE]
+        );
+        // Both sides copy something else; the already pinned operation
+        // still supplies bytes, and finishing must not write the clipboard.
+        a.thread
+            .send(Command::SetClipboard(text_clipboard("new source copy")))
+            .unwrap();
+        b.thread
+            .send(Command::SetClipboard(text_clipboard("new local copy")))
+            .unwrap();
+        assert_eq!(
+            lease.read(0, 400_000, 12345).unwrap(),
+            content[400_000..412_345]
+        );
+        assert_eq!(lease.read(0, 700_000, 100).unwrap(), content[700_000..]);
+        assert!(lease.read(0, content.len() as u64, 1).unwrap().is_empty());
+        assert!(walk(&downloads).is_empty());
+        lease.finish("delivered");
+        wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_stream_ended"
+        });
+        assert!(lease.read(0, 0, 1).is_err());
+        assert!(events_named(&b, "files_received").is_empty());
+        assert!(events_named(&b, "clipboard").iter().all(|e| {
+            e["formats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["mime"] != MIME_URI_LIST)
+        }));
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    #[test]
+    fn on_demand_reads_support_large_offsets_and_detect_source_changes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores_with("stream-large", 0, true);
+        let path = source.join("large.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Sparse allocation: this test never transfers or allocates 4 GiB.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            let mut returned = 0;
+            unsafe extern "system" {
+                fn DeviceIoControl(
+                    h: *mut std::ffi::c_void,
+                    code: u32,
+                    input: *const u8,
+                    input_len: u32,
+                    output: *mut u8,
+                    output_len: u32,
+                    returned: *mut u32,
+                    overlapped: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            assert_ne!(
+                unsafe {
+                    DeviceIoControl(
+                        file.as_raw_handle(),
+                        0x000900c4,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut returned,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        }
+        let offset = (1u64 << 32) + 27;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(b"large-offset-data").unwrap();
+        drop(file);
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(std::slice::from_ref(
+                &path,
+            ))))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_available"
+        });
+        let lease = stream_lease(
+            &b,
+            "stream-large-a",
+            offered["manifest"]["transfer"].as_u64().unwrap() as u32,
+        );
+        assert_eq!(lease.read(0, offset, 17).unwrap(), b"large-offset-data");
+        assert!(lease.read(0, offset + 18, 1).is_err());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert!(lease.read(0, 0, 1).unwrap_err().contains("changed"));
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    #[test]
+    fn file_stream_wire_limits_reject_oversized_reads_and_responses() {
+        for length in [0, crate::MAX_READ_SIZE as u32 + 1] {
+            assert!(
+                encode_message(&WireMessage::FileStreamRead {
+                    lease: 1,
+                    request: 1,
+                    entry: 0,
+                    offset: 0,
+                    length
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            encode_message(&WireMessage::FileStreamData {
+                request: 1,
+                data: vec![0; crate::MAX_READ_SIZE + 1],
+                reason: String::new()
+            })
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_commit_does_not_overwrite_a_target_created_during_transfer() {
+        let root = temp_dir("commit-race");
+        let target = root.join("file.bin");
+        let mut writer = transfer_files::FileWriter::create(target.clone(), 3, 1).unwrap();
+        std::fs::write(&target, b"keep this").unwrap();
+        assert!(writer.write(0, b"new").is_err());
+        drop(writer);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn on_demand_source_cancellation_and_disabled_sharing_revoke_leases() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores_with("stream-cancel", 0, true);
+        let path = source.join("file.bin");
+        std::fs::write(&path, b"content").unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[path])))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_available"
+        });
+        let transfer = offered["manifest"]["transfer"].as_u64().unwrap() as u32;
+        let lease = stream_lease(&b, "stream-cancel-a", transfer);
+        let sending = wait_for_event(&a.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_sending"
+        });
+        a.thread
+            .send(Command::CancelFiles(
+                sending["transfer"].as_u64().unwrap() as u32
+            ))
+            .unwrap();
+        let ended = wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_stream_ended"
+        });
+        assert_eq!(ended["reason"], "cancelled");
+        assert!(lease.read(0, 0, 7).is_err());
+        let lease = stream_lease(&b, "stream-cancel-a", transfer);
+        b.thread
+            .send(Command::FileStream(
+                crate::file_stream::StreamCommand::Revoke,
+            ))
+            .unwrap();
+        wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_stream_ended"
+        });
+        assert!(lease.read(0, 0, 7).is_err());
+        assert!(!downloads.join("file.bin").exists());
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
     }
 
     #[test]

@@ -47,6 +47,9 @@ pub const CAPABILITY_POINTER_LOCK: u64 = 1 << 10;
 /// certificates that give both sides the same code. New pairings need it
 /// on both sides; devices paired before connect without it.
 pub const CAPABILITY_PAIRING_V2: u64 = 1 << 11;
+/// Bounded, seekable file reads from a pinned clipboard offer. Never sent
+/// to older peers. Receiving shells opt in with `on_demand_files`.
+pub const CAPABILITY_FILE_STREAMS: u64 = 1 << 12;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -119,6 +122,9 @@ pub struct CoreConfig {
     /// The shell reports copied files (`text/uri-list`) and takes received
     /// ones (see `files.rs`). Needs `clipboard` and `download_directory`.
     pub files: bool,
+    /// Publish file offers to the shell without downloading their contents.
+    /// The shell uses `Core::open_remote_files` to supply native file streams.
+    pub on_demand_files: bool,
     /// Where received files go, e.g. `~/Downloads/LinkCursor`.
     pub download_directory: Option<String>,
     /// Larger transfers wait for `lc_core_accept_files`.
@@ -176,6 +182,7 @@ impl Default for CoreConfig {
             shortcut_remap: false,
             clipboard: false,
             files: false,
+            on_demand_files: false,
             download_directory: None,
             max_auto_receive_bytes: DEFAULT_MAX_AUTO_RECEIVE_BYTES,
             displays: Vec::new(),
@@ -197,12 +204,15 @@ impl CoreConfig {
             capabilities |= CAPABILITY_CLIPBOARD;
         }
         if self.files {
-            capabilities |= CAPABILITY_FILES;
+            capabilities |= CAPABILITY_FILES | CAPABILITY_FILE_STREAMS;
         }
         capabilities
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.on_demand_files && !self.files {
+            return Err("on_demand_files needs files".to_owned());
+        }
         if self.files && (!self.clipboard || self.download_directory.is_none()) {
             return Err("files needs clipboard and download_directory".to_owned());
         }
@@ -497,6 +507,34 @@ pub enum WireMessage {
     FileCancel {
         transfer: u32,
         reason: String,
+    },
+    FileStreamOpen {
+        transfer: u32,
+        lease: u64,
+    },
+    FileStreamOpened {
+        lease: u64,
+        reason: String,
+    },
+    FileStreamRead {
+        lease: u64,
+        request: u64,
+        entry: u32,
+        offset: u64,
+        length: u32,
+    },
+    FileStreamData {
+        request: u64,
+        data: Vec<u8>,
+        reason: String,
+    },
+    FileStreamClose {
+        lease: u64,
+        from_source: bool,
+        reason: String,
+    },
+    FileOfferRevoke {
+        transfer: u32,
     },
     /// Control connection: stop driving the sender, which someone else now
     /// controls. The receiver gives control back with an `InputReset`. With
