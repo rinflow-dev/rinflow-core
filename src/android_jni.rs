@@ -1,22 +1,37 @@
+//! JNI bindings for the Android shell (`RustLinkCursorCore.kt`).
+//!
+//! The same commands and JSON events as the C ABI in `ffi.rs`, limited to
+//! what a device that is driven (never drives) needs. Events reach Kotlin as
+//! `onNativeEvent(json)` and a controlling peer's input as
+//! `onNativeInput(…)`, both on the core's thread, in the order the core
+//! produced them.
+//!
+//! Kotlin owns the handle: `nativeCreate` hands it out, `nativeDestroy` takes
+//! it back exactly once, and no other call runs with that handle after it.
+
+use crate::layout::Display;
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
+use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{Global, JObject, JString};
 use jni::strings::JNIString;
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jdouble, jint, jlong};
-use jni::{EnvUnowned, JValue, JavaVM, jni_sig, jni_str};
+use jni::sys::{jboolean, jdouble, jint, jlong};
+use jni::{Env, EnvUnowned, JValue, JavaVM, jni_mangle, jni_sig, jni_str};
 use std::sync::Arc;
 
 struct AndroidCore {
     thread: CoreThread,
 }
 
-struct AndroidCallbacks {
+/// The Kotlin object that receives events and input.
+struct Callbacks {
     vm: JavaVM,
     owner: Global<JObject<'static>>,
 }
 
-impl AndroidCallbacks {
+impl Callbacks {
     fn event(&self, message: String) {
+        // Attaches the core's thread once; later calls are cheap.
         let _ = self.vm.attach_current_thread(|env| {
             let message = env.new_string(message)?;
             env.call_method(
@@ -57,191 +72,216 @@ impl AndroidCallbacks {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeCreate<
-    'caller,
->(
-    mut unowned_env: EnvUnowned<'caller>,
-    owner: JObject<'caller>,
-    config_json: JString<'caller>,
+/// Starts the core with a `CoreConfig` as JSON. Throws
+/// `IllegalArgumentException` for a configuration it cannot read and
+/// `IllegalStateException` when the core cannot start.
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_create<'local>(
+    mut env: EnvUnowned<'local>,
+    owner: JObject<'local>,
+    config_json: JString<'local>,
 ) -> jlong {
-    unowned_env
-        .with_env(|env| -> jni::errors::Result<jlong> {
-            let config_json = config_json.to_string();
-            let config = match serde_json::from_str::<CoreConfig>(&config_json) {
-                Ok(config) => config,
-                Err(error) => {
-                    env.throw_new(
-                        jni_str!("java/lang/IllegalArgumentException"),
-                        JNIString::from(format!("invalid LinkCursor configuration: {error}")),
-                    )?;
-                    return Ok(0);
-                }
-            };
-
-            let callbacks = Arc::new(AndroidCallbacks {
-                vm: env.get_java_vm()?,
-                owner: env.new_global_ref(owner)?,
-            });
-            let event_callbacks = Arc::clone(&callbacks);
-            let input_callbacks = Arc::clone(&callbacks);
-            let sink = EventSink::new(
-                move |message| event_callbacks.event(message),
-                move |event| input_callbacks.input(event),
-            );
-            let thread = match CoreThread::spawn(config, sink) {
-                Ok(thread) => thread,
-                Err(error) => {
-                    env.throw_new(
-                        jni_str!("java/lang/IllegalStateException"),
-                        JNIString::from(format!("could not start LinkCursor Core: {error}")),
-                    )?;
-                    return Ok(0);
-                }
-            };
-            Ok(Box::into_raw(Box::new(AndroidCore { thread })) as jlong)
-        })
-        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeDestroy<
-    'caller,
->(
-    mut unowned_env: EnvUnowned<'caller>,
-    _owner: JObject<'caller>,
-    handle: jlong,
-) {
-    unowned_env
-        .with_env(|_env| -> jni::errors::Result<()> {
-            if handle != 0 {
-                // SAFETY: Kotlin transfers each non-zero handle exactly once and clears it
-                // before invoking this method, so this reconstructs the originating Box.
-                let mut core = unsafe { Box::from_raw(handle as *mut AndroidCore) };
-                core.thread.stop_and_join();
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        let config_json = config_json.try_to_string(env)?;
+        let config = match serde_json::from_str::<CoreConfig>(&config_json) {
+            Ok(config) => config,
+            Err(error) => {
+                env.throw_new(
+                    jni_str!("java/lang/IllegalArgumentException"),
+                    JNIString::from(format!("invalid LinkCursor configuration: {error}")),
+                )?;
+                return Ok(0);
             }
-            Ok(())
+        };
+        let callbacks = Arc::new(Callbacks {
+            vm: env.get_java_vm()?,
+            owner: env.new_global_ref(owner)?,
+        });
+        let event_callbacks = Arc::clone(&callbacks);
+        let sink = EventSink::new(
+            move |message| event_callbacks.event(message),
+            move |event| callbacks.input(event),
+        );
+        match CoreThread::spawn(config, sink) {
+            Ok(thread) => Ok(Box::into_raw(Box::new(AndroidCore { thread })) as jlong),
+            Err(error) => {
+                env.throw_new(
+                    jni_str!("java/lang/IllegalStateException"),
+                    JNIString::from(format!("could not start LinkCursor Core: {error}")),
+                )?;
+                Ok(0)
+            }
+        }
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// Stops the core and waits for it: peers see a clean disconnect, and the
+/// releases of whatever a peer still held arrive as input before this
+/// returns.
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_destroy<'local>(mut env: EnvUnowned<'local>, _owner: JObject<'local>, handle: jlong) {
+    env.with_env(|_| -> jni::errors::Result<()> {
+        if handle != 0 {
+            // SAFETY: Kotlin hands each handle from nativeCreate back exactly
+            // once and makes no other call with it afterwards.
+            let mut core = unsafe { Box::from_raw(handle as *mut AndroidCore) };
+            core.thread.stop_and_join();
+        }
+        Ok(())
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_connect<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::Connect(peer_id))
+    })
+}
+
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_disconnect_peer<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::DisconnectPeer(peer_id))
+    })
+}
+
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_accept_pairing<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::AcceptPairing(peer_id))
+    })
+}
+
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_reject_pairing<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::RejectPairing(peer_id))
+    })
+}
+
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_unpair<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::Unpair(peer_id))
+    })
+}
+
+/// `displays_json`: `[{"x","y","width","height","scale"}, …]` in logical
+/// points (dp on Android).
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_set_local_displays<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    displays_json: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &displays_json, |json| {
+        serde_json::from_str::<Vec<Display>>(&json)
+            .ok()
+            .map(Command::SetLocalDisplays)
+    })
+}
+
+/// Removes the peer's placement here and on the peer (the peers place this
+/// device; it never places them).
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_remove_placement<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
+    handle: jlong,
+    peer_id: JString<'local>,
+) -> jboolean {
+    string_command(env, handle, &peer_id, |peer_id| {
+        Some(Command::SetPlacement {
+            peer_id,
+            offset: None,
         })
-        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+    })
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeConnect<
-    'caller,
->(
-    mut unowned_env: EnvUnowned<'caller>,
-    _owner: JObject<'caller>,
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_set_require_pairing<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
     handle: jlong,
-    peer_id: JString<'caller>,
+    required: jboolean,
 ) -> jboolean {
-    unowned_env
-        .with_env(|_env| -> jni::errors::Result<jboolean> {
-            let result = with_core(handle, |core| {
-                core.thread.send(Command::Connect(peer_id.to_string()))
-            });
-            Ok(boolean(result.is_ok()))
-        })
-        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+    command(env, handle, Command::SetRequirePairing(required))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeDisconnect<
-    'caller,
->(
-    unowned_env: EnvUnowned<'caller>,
-    _owner: JObject<'caller>,
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_set_remote_control_allowed<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
     handle: jlong,
+    allowed: jboolean,
 ) -> jboolean {
-    command(unowned_env, handle, Command::Disconnect)
+    command(env, handle, Command::SetRemoteControlAllowed(allowed))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeResetInput<
-    'caller,
->(
-    unowned_env: EnvUnowned<'caller>,
-    _owner: JObject<'caller>,
+/// The network changed (or the device woke): announce, rejoin discovery and
+/// reconnect now.
+#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+pub fn native_network_changed<'local>(
+    env: EnvUnowned<'local>,
+    _owner: JObject<'local>,
     handle: jlong,
 ) -> jboolean {
-    command(unowned_env, handle, Command::ResetInput)
+    command(env, handle, Command::NetworkChanged)
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_linkcursor_android_core_runtime_RustLinkCursorCore_nativeSendInput<
-    'caller,
->(
-    mut unowned_env: EnvUnowned<'caller>,
-    _owner: JObject<'caller>,
+/// Sends the command `build` makes of a string argument. False when the
+/// core is not running or `build` refuses the argument (invalid JSON).
+fn string_command(
+    mut env: EnvUnowned<'_>,
     handle: jlong,
-    kind: jint,
-    flags: jint,
-    code: jint,
-    key_symbol: jint,
-    repeat_count: jint,
-    modifiers: jint,
-    buttons: jint,
-    timestamp_micros: jlong,
-    x: jdouble,
-    y: jdouble,
-    delta_x: jdouble,
-    delta_y: jdouble,
-    scroll_x: jdouble,
-    scroll_y: jdouble,
+    argument: &JString<'_>,
+    build: impl FnOnce(String) -> Option<Command>,
 ) -> jboolean {
-    unowned_env
-        .with_env(|_env| -> jni::errors::Result<jboolean> {
-            let event = LcInputEvent {
-                kind: kind as u32,
-                flags: flags as u32,
-                code: code as u32,
-                key_symbol: key_symbol as u32,
-                repeat_count: repeat_count as u32,
-                modifiers: modifiers as u32,
-                buttons: buttons as u32,
-                reserved: 0,
-                sequence: 0,
-                timestamp_micros: timestamp_micros as u64,
-                x,
-                y,
-                delta_x,
-                delta_y,
-                scroll_x,
-                scroll_y,
-            };
-            Ok(boolean(
-                with_core(handle, |core| core.thread.send(Command::SendInput(event))).is_ok(),
-            ))
-        })
-        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+    env.with_env(|env: &mut Env<'_>| -> jni::errors::Result<jboolean> {
+        Ok(build(argument.try_to_string(env)?).is_some_and(|command| send(handle, command)))
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-fn command<'caller>(
-    mut unowned_env: EnvUnowned<'caller>,
-    handle: jlong,
-    command: Command,
-) -> jboolean {
-    unowned_env
-        .with_env(|_env| -> jni::errors::Result<jboolean> {
-            Ok(boolean(
-                with_core(handle, |core| core.thread.send(command)).is_ok(),
-            ))
-        })
-        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
+fn command(mut env: EnvUnowned<'_>, handle: jlong, command: Command) -> jboolean {
+    env.with_env(|_| -> jni::errors::Result<jboolean> { Ok(send(handle, command)) })
+        .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-fn with_core<T>(
-    handle: jlong,
-    action: impl FnOnce(&AndroidCore) -> Result<T, String>,
-) -> Result<T, String> {
+fn send(handle: jlong, command: Command) -> jboolean {
     if handle == 0 {
-        return Err("native core is not running".to_owned());
+        return false;
     }
-    // SAFETY: handles are created by nativeCreate and remain owned by Kotlin until
-    // nativeDestroy. Public Kotlin operations serialize access with a Mutex.
+    // SAFETY: a non-zero handle came from nativeCreate and Kotlin has not
+    // passed it to nativeDestroy yet.
     let core = unsafe { &*(handle as *const AndroidCore) };
-    action(core)
-}
-
-fn boolean(value: bool) -> jboolean {
-    if value { JNI_TRUE } else { JNI_FALSE }
+    core.thread.send(command).is_ok()
 }
