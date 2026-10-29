@@ -25,9 +25,16 @@ pub const MIME_URI_LIST: &str = "text/uri-list";
 pub const MIME_FILES: &str = "application/x-linkcursor-files";
 /// Bytes per `FileChunk`.
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
-/// Entries (files and folders) one transfer may hold.
+/// Entries (files and folders) one transfer may hold. More is not shared:
+/// the shell asks the user to zip them (`files_not_shared`). Pasting goes
+/// file by file, a few milliseconds each, so this is also about how long a
+/// paste may reasonably take.
 pub const MAX_ENTRIES: usize = 10_000;
-const MAX_DEPTH: usize = 32;
+/// Folders inside folders one transfer may go down.
+pub const MAX_DEPTH: usize = 32;
+/// The scan's reasons for the two limits (`files_not_shared`).
+pub const TOO_MANY_FILES: &str = "too many files";
+pub const TOO_DEEP: &str = "folders nested too deep";
 const MAX_PATH_LENGTH: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,8 +156,11 @@ impl Offer {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        if self.manifest.entries.len() >= MAX_ENTRIES || depth > MAX_DEPTH {
-            return Err("too many files".to_owned());
+        if self.manifest.entries.len() >= MAX_ENTRIES {
+            return Err(TOO_MANY_FILES.to_owned());
+        }
+        if depth > MAX_DEPTH {
+            return Err(TOO_DEEP.to_owned());
         }
         let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
         if metadata.file_type().is_symlink() {
@@ -164,7 +174,7 @@ impl Offer {
                 .collect::<Result<_, _>>()
                 .map_err(|error| error.to_string())?;
             if children.len() > MAX_ENTRIES {
-                return Err("too many files".into());
+                return Err(TOO_MANY_FILES.to_owned());
             }
             children.sort_by_key(|child| child.file_name());
             for child in children {
@@ -248,45 +258,64 @@ impl Manifest {
 }
 
 /// A relative manifest path made safe for this device's file system, or
-/// `None` when it cannot be. Rejects absolute paths, drive or UNC prefixes,
-/// `.` and `..`; strips control characters; replaces characters Windows does
-/// not allow (everywhere, so names stay portable); renames reserved device
-/// names (`CON`, `NUL`, `COM1`…) and drops trailing dots and spaces.
+/// `None` when it cannot be. Refuses only what could leave the destination:
+/// absolute paths (a leading `/`), empty components, `.` and `..`. Names
+/// another system allows but Windows does not are translated, never
+/// refused, so one such file does not stop a whole folder (a Mac folder with
+/// a custom icon holds `Icon\r`; a `/` typed in Finder is a `:` on disk):
+/// control characters go; `<>:"|?*\` become `_` (everywhere, so names stay
+/// portable; with `:` and `\` gone there is no drive, stream or other
+/// separator left); trailing dots and spaces go; a name left empty is `_`;
+/// reserved device names (`CON`, `NUL`, `COM1`…) get a `_` in front.
 pub fn sanitize(path: &str) -> Option<PathBuf> {
-    if path.is_empty() || path.len() > MAX_PATH_LENGTH || path.contains('\\') {
+    if path.is_empty() || path.len() > MAX_PATH_LENGTH {
         return None;
     }
     let mut clean = PathBuf::new();
     for part in path.split('/') {
-        if part.is_empty() || part == "." || part == ".." || part.contains(':') {
+        if part.is_empty() || part == "." || part == ".." {
             return None;
         }
-        let mut name: String = part
-            .chars()
-            .filter(|c| !c.is_control())
-            .map(|c| if "<>\"|?*".contains(c) { '_' } else { c })
-            .collect();
-        while name.ends_with('.') || name.ends_with(' ') {
-            name.pop();
-        }
-        if name.is_empty() {
-            return None;
-        }
-        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.as_bytes()[3].is_ascii_digit());
-        if reserved {
-            name.insert(0, '_');
-        }
-        clean.push(name);
+        clean.push(sanitize_name(part));
     }
     // Belt and braces: the result must be plain relative components.
     clean
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
         .then_some(clean)
+}
+
+/// One file or folder name made valid on Windows (see [`sanitize`]).
+pub fn sanitize_name(part: &str) -> String {
+    let mut name: String = part
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if "<>:\"|?*\\/".contains(c) { '_' } else { c })
+        .collect();
+    while name.ends_with('.') || name.ends_with(' ') {
+        name.pop();
+    }
+    if name.is_empty() {
+        name.push('_');
+    }
+    let stem = name.split('.').next().unwrap_or("").to_uppercase();
+    let numbered = ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|rest| {
+            matches!(
+                rest,
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    });
+    let reserved = numbered
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+        );
+    if reserved {
+        name.insert(0, '_');
+    }
+    name
 }
 
 /// `dir/name`, or `dir/name (1).ext`, `(2)`… when that already exists.

@@ -27,7 +27,7 @@
 
 ## 3. Mac 快捷键映射（⌘ ↔ Ctrl）
 
-- 设置项"沿用 Mac 的快捷键"，启动时传 `shortcut_remap`，运行时 `lc_core_set_shortcut_remap(core, on)`。
+- ABI 10 起改为按键配置：启动时传 `modifier_map`，运行时 `lc_core_set_modifier_map(core, json)`，例如 `{"super":"control","control":"super","alt":"alt"}` 表示 ⌘/Win 与 Ctrl 互换。`shortcut_remap` 和 `lc_core_set_shortcut_remap` 已删除。
 - 它影响的是**本机收到**的按键：Mac 被 Windows 控制时，打开后 Windows 的 Ctrl 和 Win 互换，Ctrl+C 在 Mac 上就是 ⌘C。
 - Windows 端默认打开；macOS 端建议也默认打开。
 

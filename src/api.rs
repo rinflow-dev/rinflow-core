@@ -1,6 +1,7 @@
 use crate::clipboard::Clipboard;
 use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
+use crate::remap::ModifierMap;
 use crate::runtime::{Command, CoreThread, EventSink};
 
 /// Safe Rust entry point for platform shells that link the crate directly
@@ -177,10 +178,11 @@ impl Core {
         self.thread.send(Command::SetManualAddresses(addresses))
     }
 
-    /// Translates Command and Control shortcuts from peers that use the other
-    /// platform convention (`CoreConfig::shortcut_remap`).
-    pub fn set_shortcut_remap(&self, enabled: bool) -> Result<(), String> {
-        self.thread.send(Command::SetShortcutRemap(enabled))
+    /// How modifier keys from peers that use the other platform convention
+    /// play here (`CoreConfig::modifier_map`). Keys held meanwhile are
+    /// released.
+    pub fn set_modifier_map(&self, map: ModifierMap) -> Result<(), String> {
+        self.thread.send(Command::SetModifierMap(map))
     }
 
     /// Someone used this device's own keyboard or mouse. Call it while that

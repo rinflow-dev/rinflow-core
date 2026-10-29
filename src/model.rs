@@ -112,10 +112,10 @@ pub struct CoreConfig {
     pub control_port: u16,
     pub discovery_port: u16,
     pub capabilities: u64,
-    /// Translate Command and Control shortcuts when a controlling peer uses
-    /// the other platform convention (see `remap.rs`). Off by default: keys
-    /// keep their position, so a Mac's Command is the Windows key.
-    pub shortcut_remap: bool,
+    /// How the modifier keys of a controlling peer of the other platform
+    /// convention play here (see `remap.rs`). By default keys keep their
+    /// position, so a Mac's Command is the Windows key.
+    pub modifier_map: crate::remap::ModifierMap,
     /// The shell reads and writes the system clipboard: `lc_core_set_clipboard`
     /// and the `clipboard` event (see `clipboard.rs`). Off by default.
     pub clipboard: bool,
@@ -179,7 +179,7 @@ impl Default for CoreConfig {
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
             capabilities: LOCAL_CAPABILITIES,
-            shortcut_remap: false,
+            modifier_map: crate::remap::ModifierMap::KEEP,
             clipboard: false,
             files: false,
             on_demand_files: false,

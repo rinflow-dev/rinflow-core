@@ -25,7 +25,9 @@ pub use clipboard::{
 pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
 pub use file_stream::{MAX_READ_SIZE, RemoteFileLease};
 pub use files::MIME_URI_LIST;
-pub use files::{Entry as FileEntry, Manifest as FileManifest};
+pub use files::{
+    Entry as FileEntry, Manifest as FileManifest, sanitize_name as sanitize_file_name,
+};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -35,6 +37,7 @@ pub use model::{
     LC_MODIFIER_RIGHT_CONTROL, LC_MODIFIER_RIGHT_OPTION, LC_MODIFIER_RIGHT_SHIFT,
     LC_MODIFIER_SHIFT, LcInputEvent, PlacementRecord, TrustedPeer,
 };
+pub use remap::{Modifier, ModifierMap};
 pub use runtime::manual::parse_address;
 
 #[cfg(test)]
@@ -57,7 +60,7 @@ mod tests {
     };
     use super::model::{CAPABILITY_PAIRING_V2, PlacementRecord, TrustedPeer};
     use super::protocol::{decode_message, encode_message};
-    use super::remap::ShortcutRemap;
+    use super::remap::{Modifier, ModifierMap};
     use super::runtime::trust as runtime_reason;
     use super::runtime::{Command, CoreThread, EventSink};
     use serde_json::Value;
@@ -169,24 +172,28 @@ mod tests {
             transfer_files::sanitize(path).map(|p| p.to_string_lossy().replace('\\', "/"))
         };
         assert_eq!(clean("报告/第一章.pdf").as_deref(), Some("报告/第一章.pdf"));
-        assert_eq!(clean("a<b>:c").as_deref(), None); // ':' never: drive letters, streams
+        // Names a Mac allows are translated, never refused: one of them must
+        // not stop a whole folder.
         assert_eq!(clean("a<b>|c?.txt").as_deref(), Some("a_b__c_.txt"));
+        // ':' (a '/' typed in Finder) and '\' become '_': no drive letter,
+        // stream or separator is left.
+        assert_eq!(clean("2026:10:30.txt").as_deref(), Some("2026_10_30.txt"));
+        assert_eq!(clean("C:/x").as_deref(), Some("C_/x"));
+        assert_eq!(clean("a\\..\\..\\x").as_deref(), Some("a_.._.._x"));
+        // A folder with a custom icon holds "Icon\r".
+        assert_eq!(clean("相册/Icon\r").as_deref(), Some("相册/Icon"));
+        assert_eq!(clean("tab\there").as_deref(), Some("tabhere"));
+        assert_eq!(clean("trailing. . ").as_deref(), Some("trailing"));
+        // Left with no name: '_'.
+        assert_eq!(clean("...").as_deref(), Some("_"));
+        assert_eq!(clean("a/ /b").as_deref(), Some("a/_/b"));
+        // Device names, on any level and with superscript digits.
         assert_eq!(clean("CON.txt").as_deref(), Some("_CON.txt"));
         assert_eq!(clean("com1").as_deref(), Some("_com1"));
-        assert_eq!(clean("trailing. . ").as_deref(), Some("trailing"));
-        assert_eq!(clean("back\\slash").as_deref(), None); // backslash refused
-        assert_eq!(clean("tab\there").as_deref(), Some("tabhere")); // control characters go
-        for bad in [
-            "",
-            "/etc/passwd",
-            "../x",
-            "a/../b",
-            "a//b",
-            "./a",
-            "C:/x",
-            "...",
-            "a/ /b",
-        ] {
+        assert_eq!(clean("lpt²/aux").as_deref(), Some("_lpt²/_aux"));
+        assert_eq!(clean("conout$").as_deref(), Some("_conout$"));
+        // Only what could leave the destination is refused.
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "./a", "a/"] {
             assert_eq!(clean(bad), None, "{bad:?} must be refused");
         }
     }
@@ -565,95 +572,131 @@ mod tests {
         }));
     }
 
+    fn key_event(kind: u32, code: u32, modifiers: u32) -> LcInputEvent {
+        LcInputEvent {
+            kind,
+            code,
+            modifiers,
+            ..LcInputEvent::default()
+        }
+    }
+
     #[test]
     fn keys_keep_their_position_by_default() {
         // Command stays the GUI key (the Windows key on a PC), as in Deskflow.
-        assert!(!CoreConfig::default().shortcut_remap);
-        let mut command = LcInputEvent {
-            kind: LC_INPUT_KEY_DOWN,
-            code: 0xE3,
-            modifiers: LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND,
-            ..LcInputEvent::default()
-        };
+        assert_eq!(CoreConfig::default().modifier_map, ModifierMap::KEEP);
+        let mut command = key_event(
+            LC_INPUT_KEY_DOWN,
+            0xE3,
+            LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND,
+        );
         let sent = command;
-        ShortcutRemap::None.apply(&mut command);
+        assert!(ModifierMap::KEEP.apply(&mut command));
         assert_eq!(command, sent);
     }
 
     #[test]
-    fn shortcut_remap_depends_on_both_platforms() {
-        assert_eq!(
-            ShortcutRemap::between("macos", "windows"),
-            ShortcutRemap::AppleToPc
-        );
-        assert_eq!(
-            ShortcutRemap::between("linux", "macos"),
-            ShortcutRemap::PcToApple
-        );
-        assert_eq!(
-            ShortcutRemap::between("macos", "macos"),
-            ShortcutRemap::None
-        );
-        assert_eq!(
-            ShortcutRemap::between("windows", "linux"),
-            ShortcutRemap::None
-        );
-        assert_eq!(
-            ShortcutRemap::between("unknown", "windows"),
-            ShortcutRemap::None
-        );
+    fn the_modifier_map_applies_only_between_conventions() {
+        let swap = ModifierMap::SWAP;
+        assert_eq!(swap.between("macos", "windows"), swap);
+        assert_eq!(swap.between("linux", "macos"), swap);
+        assert_eq!(swap.between("macos", "macos"), ModifierMap::KEEP);
+        assert_eq!(swap.between("windows", "linux"), ModifierMap::KEEP);
+        assert_eq!(swap.between("unknown", "windows"), ModifierMap::KEEP);
     }
 
     #[test]
-    fn apple_to_pc_turns_command_into_control_and_keeps_control() {
-        let key = |code, modifiers| LcInputEvent {
-            kind: LC_INPUT_KEY_DOWN,
-            code,
-            modifiers,
-            ..LcInputEvent::default()
-        };
-        let mut command_c = key(0x06, LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND);
-        ShortcutRemap::AppleToPc.apply(&mut command_c);
+    fn swapping_makes_command_control_and_control_the_windows_key() {
+        let swap = ModifierMap::SWAP;
+        // ⌘C copies on a PC.
+        let mut command_c = key_event(
+            LC_INPUT_KEY_DOWN,
+            0x06,
+            LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND,
+        );
+        assert!(swap.apply(&mut command_c));
         assert_eq!(command_c.code, 0x06);
         assert_eq!(
             command_c.modifiers,
             LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL
         );
-
-        let mut right_command = key(0xE7, 0);
-        ShortcutRemap::AppleToPc.apply(&mut right_command);
+        // Sides are kept: right Command is right Control.
+        let mut right_command = key_event(LC_INPUT_KEY_DOWN, 0xE7, 0);
+        assert!(swap.apply(&mut right_command));
         assert_eq!(right_command.code, 0xE4);
-
-        let mut control = key(0xE0, LC_MODIFIER_CONTROL | LC_MODIFIER_SHIFT);
-        ShortcutRemap::AppleToPc.apply(&mut control);
-        assert_eq!(control.code, 0xE0);
-        assert_eq!(control.modifiers, LC_MODIFIER_CONTROL | LC_MODIFIER_SHIFT);
-    }
-
-    #[test]
-    fn pc_to_apple_swaps_control_and_super() {
-        let mut control = LcInputEvent {
-            kind: LC_INPUT_KEY_UP,
-            code: 0xE0,
-            modifiers: LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL,
-            ..LcInputEvent::default()
-        };
-        ShortcutRemap::PcToApple.apply(&mut control);
+        // The Mac's Control is the Windows key, Shift stays with it.
+        let mut control = key_event(
+            LC_INPUT_KEY_UP,
+            0xE0,
+            LC_MODIFIER_CONTROL | LC_MODIFIER_LEFT_CONTROL | LC_MODIFIER_SHIFT,
+        );
+        assert!(swap.apply(&mut control));
         assert_eq!(control.code, 0xE3);
         assert_eq!(
             control.modifiers,
-            LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND
+            LC_MODIFIER_COMMAND | LC_MODIFIER_LEFT_COMMAND | LC_MODIFIER_SHIFT
         );
+        // Both held: both come out, swapped.
+        let mut both = key_event(
+            LC_INPUT_KEY_DOWN,
+            0x04,
+            LC_MODIFIER_COMMAND | LC_MODIFIER_CONTROL,
+        );
+        assert!(swap.apply(&mut both));
+        assert_eq!(both.modifiers, LC_MODIFIER_COMMAND | LC_MODIFIER_CONTROL);
+    }
 
-        let mut super_key = LcInputEvent {
-            kind: LC_INPUT_KEY_DOWN,
-            code: 0xE3,
-            modifiers: LC_MODIFIER_COMMAND,
-            ..LcInputEvent::default()
+    #[test]
+    fn each_modifier_can_play_as_any_or_none() {
+        let map = ModifierMap {
+            super_key: Modifier::Control,
+            control: Modifier::None,
+            alt: Modifier::Shift,
         };
-        ShortcutRemap::PcToApple.apply(&mut super_key);
-        assert_eq!(super_key.code, 0xE0);
-        assert_eq!(super_key.modifiers, LC_MODIFIER_CONTROL);
+        // Mapped to nothing: the key is not played.
+        let mut control = key_event(LC_INPUT_KEY_DOWN, 0xE4, LC_MODIFIER_CONTROL);
+        assert!(!map.apply(&mut control));
+        // Its modifier bits go too; Option plays as Shift, on its side.
+        let mut option_a = key_event(
+            LC_INPUT_KEY_DOWN,
+            0x04,
+            LC_MODIFIER_CONTROL
+                | crate::model::LC_MODIFIER_OPTION
+                | crate::model::LC_MODIFIER_RIGHT_OPTION,
+        );
+        assert!(map.apply(&mut option_a));
+        assert_eq!(
+            option_a.modifiers,
+            crate::model::LC_MODIFIER_SHIFT | crate::model::LC_MODIFIER_RIGHT_SHIFT
+        );
+        let mut right_option = key_event(LC_INPUT_KEY_UP, 0xE6, 0);
+        assert!(map.apply(&mut right_option));
+        assert_eq!(right_option.code, 0xE5);
+        // Other keys and mouse input are untouched.
+        let mut letter = key_event(LC_INPUT_KEY_DOWN, 0x04, 0);
+        assert!(map.apply(&mut letter));
+        assert_eq!(letter.code, 0x04);
+    }
+
+    #[test]
+    fn modifier_maps_read_from_json() {
+        let map: ModifierMap =
+            serde_json::from_str(r#"{"super":"control","control":"super","alt":"alt"}"#).unwrap();
+        assert_eq!(map, ModifierMap::SWAP);
+        // Missing keys keep their position.
+        let map: ModifierMap = serde_json::from_str(r#"{"control":"none"}"#).unwrap();
+        assert_eq!(
+            map,
+            ModifierMap {
+                control: Modifier::None,
+                ..ModifierMap::KEEP
+            }
+        );
+        assert!(serde_json::from_str::<ModifierMap>(r#"{"super":"hyper"}"#).is_err());
+        let config: CoreConfig =
+            serde_json::from_str(r#"{"modifier_map":{"super":"control","control":"super"}}"#)
+                .unwrap();
+        assert_eq!(config.modifier_map, ModifierMap::SWAP);
     }
 
     #[test]
@@ -743,7 +786,7 @@ mod tests {
                 discovery_port,
                 // Opt in, to cover the translation end to end; by default
                 // keys keep their position.
-                shortcut_remap: true,
+                modifier_map: ModifierMap::SWAP,
                 ..CoreConfig::default()
             },
             second_sink,
@@ -801,7 +844,7 @@ mod tests {
             .expect("receive key down");
         assert_eq!(key_down.kind, LC_INPUT_KEY_DOWN);
 
-        // With shortcut_remap on, Mac Command arrives on Windows as Control.
+        // Swapped, Mac Command arrives on Windows as Control.
         first
             .send(Command::SendInput(LcInputEvent {
                 kind: LC_INPUT_KEY_DOWN,
@@ -2148,6 +2191,50 @@ mod tests {
     }
 
     #[test]
+    fn folders_past_the_limits_ask_to_zip_and_the_rest_still_travels() {
+        let _network = network_test();
+        let (mut a, mut b, source, _downloads) = file_cores_with("too-deep", 0, true);
+        // Folders inside folders, one level deeper than allowed.
+        let mut deep = source.join("deep");
+        for level in 0..=transfer_files::MAX_DEPTH {
+            deep = deep.join(level.to_string());
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[source.join("deep")])))
+            .unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        // The copying side hears why, with the limit, to say it its own way.
+        let refused = wait_for_event(&a.events, Duration::from_secs(5), |e| {
+            e["event"] == "files_not_shared"
+        });
+        assert_eq!(refused["reason"], "too_deep");
+        assert_eq!(refused["limit"], transfer_files::MAX_DEPTH);
+        // The rest of the clipboard (the names as text) still travels.
+        let clipboard = wait_for_event(&b.events, Duration::from_secs(5), |e| {
+            e["event"] == "clipboard"
+        });
+        assert_eq!(clipboard["formats"][0]["mime"], MIME_TEXT);
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn more_files_than_the_limit_are_not_offered() {
+        let root = temp_dir("too-many");
+        let folder = root.join("many");
+        std::fs::create_dir_all(&folder).unwrap();
+        for i in 0..=transfer_files::MAX_ENTRIES {
+            std::fs::File::create(folder.join(i.to_string())).unwrap();
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let offer = transfer_files::Offer::build_cancellable(1, &[folder], &stop);
+        assert_eq!(offer.err().as_deref(), Some(transfer_files::TOO_MANY_FILES));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn on_demand_source_cancellation_and_disabled_sharing_revoke_leases() {
         let _network = network_test();
         let (mut a, mut b, source, downloads) = file_cores_with("stream-cancel", 0, true);
@@ -2918,7 +3005,7 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_translation_can_be_switched_while_connected() {
+    fn the_modifier_map_can_be_changed_while_connected() {
         let _network = network_test();
         let discovery_port = free_udp_port();
         let mut mac = test_core_with("remap-mac", discovery_port, |config| {
@@ -2939,6 +3026,11 @@ mod tests {
             code: 0xE3, // left Command
             ..LcInputEvent::default()
         };
+        let control = |kind: u32| LcInputEvent {
+            kind,
+            code: 0xE0, // left Control
+            ..LcInputEvent::default()
+        };
         let next_key = |core: &TestCore| loop {
             let event = core
                 .input
@@ -2948,13 +3040,15 @@ mod tests {
                 return event.code;
             }
         };
-        // Off by default: Command stays the Windows key.
+        // Kept by default: Command stays the Windows key.
         mac.thread
             .send(Command::SendInput(key(LC_INPUT_KEY_DOWN)))
             .unwrap();
         assert_eq!(next_key(&pc), 0xE3);
-        // Turned on while Command is held: it is released, then translated.
-        pc.thread.send(Command::SetShortcutRemap(true)).unwrap();
+        // Swapped while Command is held: it is released, then swapped.
+        pc.thread
+            .send(Command::SetModifierMap(ModifierMap::SWAP))
+            .unwrap();
         assert_eq!(next_key(&pc), 0xE3);
         std::thread::sleep(Duration::from_millis(100));
         mac.thread
@@ -2965,6 +3059,11 @@ mod tests {
             .unwrap();
         let codes = [next_key(&pc), next_key(&pc)];
         assert_eq!(codes, [0xE0, 0xE0], "Command plays as Control now");
+        // And the Mac's Control is the Windows key.
+        mac.thread
+            .send(Command::SendInput(control(LC_INPUT_KEY_DOWN)))
+            .unwrap();
+        assert_eq!(next_key(&pc), 0xE3, "Control plays as the Windows key");
         mac.thread.stop_and_join();
         pc.thread.stop_and_join();
     }

@@ -5,7 +5,7 @@
 use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
 use crate::protocol::{decode_message, encode_message};
-use crate::remap::ShortcutRemap;
+use crate::remap::ModifierMap;
 use crate::secure;
 use std::collections::VecDeque;
 use std::io;
@@ -150,7 +150,7 @@ pub struct ActiveConnection {
     pub protocol_version: Option<u16>,
     pub capabilities: u64,
     /// Applied to input received from this peer; set once its platform is known.
-    pub shortcut_remap: ShortcutRemap,
+    pub modifier_map: ModifierMap,
     /// SHA-256 of the certificate the peer presented (64 hex digits).
     pub fingerprint: String,
     control: mpsc::Sender<WireMessage>,
@@ -267,7 +267,7 @@ pub fn spawn_connection(
         remote,
         protocol_version: None,
         capabilities: 0,
-        shortcut_remap: ShortcutRemap::None,
+        modifier_map: ModifierMap::KEEP,
         fingerprint,
         control: control_tx,
         input,

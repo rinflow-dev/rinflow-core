@@ -485,6 +485,22 @@ impl Runtime<'_> {
                 );
                 self.offer = Some(Arc::new(offer));
             }
+            // Past a limit the shell asks the user to zip the files, in its
+            // own words; the rest of the clipboard still travels.
+            Err(reason) if reason == files::TOO_MANY_FILES => {
+                self.sink.emit_value(json!({
+                    "event": "files_not_shared",
+                    "reason": "too_many_files",
+                    "limit": files::MAX_ENTRIES,
+                }));
+            }
+            Err(reason) if reason == files::TOO_DEEP => {
+                self.sink.emit_value(json!({
+                    "event": "files_not_shared",
+                    "reason": "too_deep",
+                    "limit": files::MAX_DEPTH,
+                }));
+            }
             Err(reason) => self.sink.emit_error(format!("files not shared: {reason}")),
         }
         self.store_clipboard(clipboard);

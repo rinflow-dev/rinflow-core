@@ -14,7 +14,7 @@ use crate::model::{
     WireMessage, negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
-use crate::remap::ShortcutRemap;
+use crate::remap::ModifierMap;
 use crate::secure::Identity;
 use crate::transport::{
     ActiveConnection, CloseCode, ConnectionEvent, Link, accept_in_background,
@@ -120,9 +120,9 @@ pub enum Command {
     NetworkChanged,
     /// Addresses to find devices at besides multicast (see `manual.rs`).
     SetManualAddresses(Vec<String>),
-    /// Translate Command and Control shortcuts from peers of the other
-    /// platform convention (`CoreConfig::shortcut_remap`).
-    SetShortcutRemap(bool),
+    /// How modifier keys from peers of the other platform convention play
+    /// here (`CoreConfig::modifier_map`).
+    SetModifierMap(ModifierMap),
     /// Someone used this device's own keyboard or mouse: peers that want to
     /// stay awake meanwhile hear so (`UserActive`).
     ReportUserActivity,
@@ -305,7 +305,7 @@ async fn run(
         manual: Vec::new(),
         manual_status: Value::Null,
         answered_probes: HashMap::new(),
-        shortcut_remap: config.shortcut_remap,
+        modifier_map: config.modifier_map,
         pointer_locked: false,
         refitting: false,
         capabilities,
@@ -387,9 +387,9 @@ async fn run(
                         announce_timer.reset_immediately();
                     }
                     Some(Command::SetManualAddresses(addresses)) => state.set_manual_addresses(addresses),
-                    Some(Command::SetShortcutRemap(enabled)) => {
-                        state.shortcut_remap = enabled;
-                        state.refresh_shortcut_remap();
+                    Some(Command::SetModifierMap(map)) => {
+                        state.modifier_map = map;
+                        state.refresh_modifier_map();
                     }
                     Some(Command::ReportUserActivity) => state.report_user_activity(),
                     Some(Command::LockPeers) => state.lock_peers(),
@@ -541,8 +541,8 @@ struct Runtime<'a> {
     manual_status: Value,
     /// When each sender's probe was last answered.
     answered_probes: HashMap<std::net::IpAddr, Instant>,
-    /// Translate shortcuts from peers of the other platform convention.
-    shortcut_remap: bool,
+    /// How modifier keys from peers of the other platform convention play.
+    modifier_map: ModifierMap,
     /// A game or a pointer-lock page holds this device's pointer.
     pointer_locked: bool,
     /// Placements are being fitted again after a change (`refit_others`);
@@ -1029,17 +1029,17 @@ impl Runtime<'_> {
             self.update_peer_displays(&message.device_id, message.displays);
         }
         if is_new {
-            // Its platform decides how shortcuts are translated.
-            self.refresh_shortcut_remap();
+            // Its platform decides how its modifier keys play.
+            self.refresh_modifier_map();
             // One of the user's devices came back: no need to wait.
             self.auto_connect();
         }
     }
 
-    /// Sets each session's shortcut translation from the peer's platform
-    /// and the setting. Keys held through a change were translated the old
-    /// way, so they are released first.
-    fn refresh_shortcut_remap(&mut self) {
+    /// Sets each session's modifier map from the peer's platform and the
+    /// setting. Keys held through a change were played the old way, so they
+    /// are released first.
+    fn refresh_modifier_map(&mut self) {
         let sink = self.sink;
         for session in self.sessions.values_mut() {
             let Some(peer_id) = session.peer_id().map(str::to_owned) else {
@@ -1049,21 +1049,17 @@ impl Runtime<'_> {
                 .peers
                 .get(&peer_id)
                 .map_or("unknown", |peer| peer.platform.as_str());
-            let remap = if self.shortcut_remap {
-                ShortcutRemap::between(platform, &self.config.platform)
-            } else {
-                ShortcutRemap::None
-            };
-            if session.connection.shortcut_remap == remap {
+            let map = self.modifier_map.between(platform, &self.config.platform);
+            if session.connection.modifier_map == map {
                 continue;
             }
             emit_release_events(
                 session.remote_input.release_events(),
                 sink,
-                "shortcut translation changed",
+                "modifier keys changed",
                 Some(&peer_id),
             );
-            session.connection.shortcut_remap = remap;
+            session.connection.modifier_map = map;
         }
     }
 
@@ -1720,11 +1716,14 @@ impl Runtime<'_> {
                     .send_control(WireMessage::PointerLock { locked: true });
             }
         }
-        let shortcut_remap = session.connection.shortcut_remap;
+        let modifier_map = session.connection.modifier_map;
         for mut event in events {
-            // Translate before observing, so the synthetic key-ups for held
-            // keys use the same codes the shell saw.
-            shortcut_remap.apply(&mut event);
+            // Mapped before observing, so the synthetic key-ups for held
+            // keys use the same codes the shell saw. A key mapped to nothing
+            // is not played at all.
+            if !modifier_map.apply(&mut event) {
+                continue;
+            }
             session.remote_input.observe(event);
             (sink.input)(event);
         }
@@ -1797,18 +1796,14 @@ impl Runtime<'_> {
             .get(&hello.device_id)
             .map(|peer| peer.platform.as_str())
             .unwrap_or("unknown");
-        let shortcut_remap = if self.shortcut_remap {
-            ShortcutRemap::between(peer_platform, &config.platform)
-        } else {
-            ShortcutRemap::None
-        };
+        let modifier_map = self.modifier_map.between(peer_platform, &config.platform);
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
         session.connection.peer_id = Some(hello.device_id.clone());
         session.connection.protocol_version = Some(protocol_version);
         session.connection.capabilities = hello.capabilities;
-        session.connection.shortcut_remap = shortcut_remap;
+        session.connection.modifier_map = modifier_map;
         session.last_seen = Instant::now();
         self.peer_names.insert(
             hello.device_id.clone(),

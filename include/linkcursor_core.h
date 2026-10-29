@@ -30,7 +30,7 @@
  *    connected" below.
  * 9: devices by address (config key "manual_addresses",
  *    lc_core_set_manual_addresses, event "manual_addresses");
- *    lc_core_set_shortcut_remap; presence (lc_core_report_user_activity,
+ *    shortcut translation at run time; presence (lc_core_report_user_activity,
  *    lc_core_lock_peers, events "peer_active", "lock_requested"); pointer
  *    lock (lc_core_set_pointer_locked, event "peer_pointer_lock"); file
  *    events "files_receiving", "files_sending", "files_send_ended", and
@@ -38,8 +38,13 @@
  *    device's own files being sent; placements may chain (a peer against
  *    another placed peer). The new messages go only to peers that announce
  *    them, so version 8 cores still connect.
+ * 10: the modifier keys of a peer of the other platform convention are
+ *    configurable key by key: config key "modifier_map" and
+ *    lc_core_set_modifier_map replace "shortcut_remap" and
+ *    lc_core_set_shortcut_remap. Nothing changes on the wire. Event
+ *    "files_not_shared" when copied files pass the limits (see Files).
  */
-#define LC_CORE_ABI_VERSION 9
+#define LC_CORE_ABI_VERSION 10
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,9 +71,9 @@ typedef struct LcCore LcCore;
  *
  * Keys keep their position by default: a Mac's Command arrives as the
  * Windows/Super key, Control as Control, Option as Alt, as with Deskflow.
- * With the config key "shortcut_remap" on, Command and Control are instead
- * translated when the controlling peer uses the other platform's shortcut
- * convention (see remap.rs).
+ * The config key "modifier_map" says instead what each modifier key of a
+ * controlling peer of the other platform convention plays as here (see
+ * remap.rs and lc_core_set_modifier_map).
  */
 typedef struct LcInputEvent {
     uint32_t kind;
@@ -167,10 +172,18 @@ bool lc_core_network_changed(LcCore *core);
 bool lc_core_set_manual_addresses(LcCore *core, const char *addresses_json);
 
 /*
- * Shortcut translation (config key "shortcut_remap", version 9 also at run
- * time): see LcInputEvent above. Keys held while it changes are released.
+ * Modifier keys of peers of the other platform convention (Mac <-> PC),
+ * also config key "modifier_map": a JSON object naming, for each of the
+ * peer's keys by position ("super" is Command on a Mac and the Windows key
+ * on a PC, "alt" is Option), what it plays as here: "control", "super",
+ * "alt", "shift" or "none" (not played). A missing key keeps its position.
+ * Swapping Command and Control, so that a Mac's Command copies on a PC and
+ * its Control is the Windows key:
+ *   {"super":"control","control":"super","alt":"alt"}
+ * Between two PCs or two Macs keys always keep their position. Keys held
+ * while it changes are released. False for invalid JSON.
  */
-bool lc_core_set_shortcut_remap(LcCore *core, bool enabled);
+bool lc_core_set_modifier_map(LcCore *core, const char *map_json);
 
 /*
  * Presence (version 9). While someone uses this device's own keyboard or
@@ -260,7 +273,12 @@ bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
  * lc_core_set_clipboard as "text/uri-list" (file:// URLs, one per line)
  * next to the other formats (their names as text, for example). The core
  * replaces the local paths with a manifest; a peer that receives it pulls
- * the files from this device while it runs.
+ * the files from this device while it runs. At most 10 000 files and
+ * folders, 32 folders deep; past that the files are not shared (the rest of
+ * the clipboard is) and the copying side hears (version 10):
+ *   {"event":"files_not_shared","reason":"too_many_files","limit":10000}
+ *   {"event":"files_not_shared","reason":"too_deep","limit":32}
+ *       tell the user, for example to zip them first
  *
  * Receiving: within the limit, files are fetched at once into the download
  * directory (folders kept, names cleaned, never overwriting). Events:

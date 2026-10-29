@@ -28,9 +28,14 @@ pub struct LcCore {
 /// `peer_active`, `lock_requested`) and pointer lock
 /// (`lc_core_set_pointer_locked`, event `peer_pointer_lock`), events for
 /// file transfers on both sides, and chained placements.
+/// Version 10 makes the modifier keys of a peer of the other platform
+/// convention configurable, key by key: config key `modifier_map` and
+/// `lc_core_set_modifier_map` replace `shortcut_remap` and
+/// `lc_core_set_shortcut_remap`; event `files_not_shared` when copied files
+/// pass the limits (10 000 entries, 32 folders deep).
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    9
+    10
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -348,11 +353,22 @@ pub unsafe extern "C" fn lc_core_set_manual_addresses(
     }
 }
 
-/// Translates Command and Control shortcuts from peers of the other
-/// platform convention (config key `shortcut_remap`).
+/// How the modifier keys of peers of the other platform convention play
+/// here (config key `modifier_map`): a JSON object such as
+/// `{"super":"control","control":"super","alt":"alt"}`. Keys held while it
+/// changes are released.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lc_core_set_shortcut_remap(core: *mut LcCore, enabled: bool) -> bool {
-    send_command(core, Command::SetShortcutRemap(enabled))
+pub unsafe extern "C" fn lc_core_set_modifier_map(
+    core: *mut LcCore,
+    map_json: *const c_char,
+) -> bool {
+    let Some(json) = (unsafe { string_argument(map_json) }) else {
+        return false;
+    };
+    match serde_json::from_str::<crate::remap::ModifierMap>(&json) {
+        Ok(map) => send_command(core, Command::SetModifierMap(map)),
+        Err(_) => false,
+    }
 }
 
 /// Someone used this device's own keyboard or mouse (call every few seconds
