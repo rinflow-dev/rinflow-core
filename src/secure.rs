@@ -54,19 +54,30 @@ impl Identity {
     /// The identity saved at `path`, created there on first use. Without a
     /// path a new one is made every start (tests, or shells that do not keep
     /// one; peers then see a new device each time).
+    ///
+    /// Only a file that does not exist is created. One that exists but
+    /// cannot be read now (locked by another program, no permission, a disk
+    /// error) is an error, never replaced: a new identity would make every
+    /// paired peer refuse this device as changed.
     pub fn load_or_create(path: Option<&Path>, device_id: &str) -> Result<Self, String> {
         let Some(path) = path else {
             return Self::generate(device_id).map(|(identity, _)| identity);
         };
-        if let Ok(pem) = std::fs::read(path) {
-            match Self::from_pem(&pem) {
-                Ok(identity) => return Ok(identity),
-                Err(error) => {
-                    return Err(format!(
+        match std::fs::read(path) {
+            Ok(pem) => {
+                return Self::from_pem(&pem).map_err(|error| {
+                    format!(
                         "identity file {} is unreadable ({error}); remove it to create a new identity",
                         path.display()
-                    ));
-                }
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot read identity file {} ({error}); it is kept, not replaced",
+                    path.display()
+                ));
             }
         }
         let (identity, pem) = Self::generate(device_id)?;
@@ -374,6 +385,25 @@ mod tests {
         assert_ne!(first.fingerprint, other.fingerprint);
         assert!(first.server_config().is_ok() && first.client_config().is_ok());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_identity_that_exists_but_cannot_be_read_is_not_replaced() {
+        // A directory where the file should be: it exists, and reading it
+        // fails with something other than "not found" (as a locked file or
+        // one without permission would).
+        let path = std::env::temp_dir().join(format!(
+            "linkcursor-identity-unreadable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let error = Identity::load_or_create(Some(&path), "device-a")
+            .err()
+            .expect("an unreadable identity must not be replaced");
+        assert!(error.contains("kept, not replaced"), "{error}");
+        assert!(path.is_dir());
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
