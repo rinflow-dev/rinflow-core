@@ -127,7 +127,8 @@ pub struct CoreConfig {
     pub on_demand_files: bool,
     /// Where received files go, e.g. `~/Downloads/LinkCursor`.
     pub download_directory: Option<String>,
-    /// Larger transfers wait for `lc_core_accept_files`.
+    /// Larger transfers wait for `lc_core_accept_files`. Zero requires
+    /// acceptance for every offer, including empty files and directories.
     pub max_auto_receive_bytes: u64,
     /// This device's displays in logical points (see `layout.rs`).
     pub displays: Vec<Display>,

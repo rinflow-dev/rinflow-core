@@ -2352,6 +2352,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_auto_receive_limit_requires_acceptance_even_for_empty_files() {
+        let _network = network_test();
+        let (mut a, mut b, source, downloads) = file_cores("empty-offer", 0);
+        let file = source.join("empty.txt");
+        let folder = source.join("empty-folder");
+        std::fs::write(&file, []).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        a.thread.send(Command::SetClipboard(uri_clipboard(&[file, folder]))).unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let offered = wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_offered" || event["event"] == "files_received"
+        });
+        assert_eq!(offered["event"], "files_offered");
+        assert_eq!(offered["total_size"], 0);
+        assert!(!downloads.join("empty.txt").exists());
+        assert!(!downloads.join("empty-folder").exists());
+        b.thread.send(Command::AcceptFiles(offered["transfer"].as_u64().unwrap() as u32)).unwrap();
+        wait_for_event(&b.events, Duration::from_secs(5), |event| event["event"] == "files_received");
+        assert_eq!(std::fs::read(downloads.join("empty.txt")).unwrap(), Vec::<u8>::new());
+        assert!(downloads.join("empty-folder").is_dir());
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(downloads);
+    }
+
+    #[test]
     fn large_transfers_wait_for_acceptance_and_changed_files_are_refused() {
         let _network = network_test();
         let (mut a, mut b, source, downloads) = file_cores("offer", 10);

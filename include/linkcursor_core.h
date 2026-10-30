@@ -267,6 +267,8 @@ bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
 /*
  * Files (config: "files": true, which needs "clipboard": true and
  * "download_directory"; optional "max_auto_receive_bytes", default 512 MiB).
+ * A zero limit requires explicit acceptance for every offer, including
+ * empty files and directories.
  * Desktop: files copied to the system clipboard travel with it.
  *
  * Sending: when the system clipboard holds files, report them in

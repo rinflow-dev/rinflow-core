@@ -853,6 +853,7 @@ impl Runtime<'_> {
             }
         };
         let accepted = !self.config.on_demand_files
+            && self.config.max_auto_receive_bytes > 0
             && manifest.total_size <= self.config.max_auto_receive_bytes;
         let (name, items) = manifest.summary();
         let name = name.to_owned();
