@@ -14,12 +14,12 @@ This repository is the Rust core: LAN discovery, the wire protocol, QUIC transpo
 | [rinflow-macos](https://github.com/rinflow-dev/rinflow-macos) | SwiftUI window and menu bar app for macOS 14 or newer. Captures input with a `CGEvent` tap, injects remote input and statically links the core. |
 | [rinflow-windows](https://github.com/rinflow-dev/rinflow-windows) | Windows client: a Rust background agent (core, input capture and injection, edge effect, tray icon, named-pipe IPC) and a C++/WinRT WinUI 3 settings window. |
 
-The clients build the core from source, from a folder named `rinflow-core` beside them, so name the folders when you clone:
+The clients build the core from source, from the `rinflow-core` folder beside them, so clone them side by side:
 
 ```sh
-git clone https://github.com/rinflow-dev/rinflow-core.git    rinflow-core
-git clone https://github.com/rinflow-dev/rinflow-macos.git   rinflow-macos
-git clone https://github.com/rinflow-dev/rinflow-windows.git rinflow-windows
+git clone https://github.com/rinflow-dev/rinflow-core.git
+git clone https://github.com/rinflow-dev/rinflow-macos.git
+git clone https://github.com/rinflow-dev/rinflow-windows.git
 ```
 
 ## How it works
