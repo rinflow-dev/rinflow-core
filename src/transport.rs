@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Connections to peers: QUIC with TLS 1.3 (see `quic.rs` and `secure.rs`).
 //! Each connection carries one bidirectional stream of length-prefixed
 //! frames (see `protocol.rs`), opened by the side that dialed.

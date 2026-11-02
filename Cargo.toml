@@ -3,6 +3,8 @@ name = "linkcursor-core"
 version = "0.1.0"
 edition = "2024"
 description = "Cross-platform discovery, protocol, and network I/O core for LinkCursor"
+license = "MPL-2.0"
+repository = "https://github.com/akarineren/linkcursor-core"
 publish = false
 
 [lib]

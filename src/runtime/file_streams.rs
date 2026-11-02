@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! A bounded request/response lane for native, seekable file providers.
 //! Leases pin offers, not whole-file buffers. No clipboard writes on finish.
 use super::{Runtime, random_u64};

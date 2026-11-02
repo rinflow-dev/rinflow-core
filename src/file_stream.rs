@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Blocking, bounded reads for native clipboard providers. Never call these
 //! methods from a core event callback or an input/UI event loop.
 use crate::runtime::Command;

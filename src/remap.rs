@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Modifier keys between Apple and PC conventions (`CoreConfig::modifier_map`).
 //!
 //! macOS uses Command for shortcuts (⌘C) where Windows, Linux and Android use
