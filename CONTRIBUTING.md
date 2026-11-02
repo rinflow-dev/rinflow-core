@@ -1,4 +1,4 @@
-# Contributing to LinkCursor Core
+# Contributing to Rinflow Core
 
 Thanks for your interest. This repository is the Rust library shared by the [macOS](https://github.com/rinflow-dev/rinflow-macos) and [Windows](https://github.com/rinflow-dev/rinflow-windows) clients.
 
@@ -24,11 +24,11 @@ If a dependency changes, regenerate the clients' third-party notices with [scrip
 
 ## Protocol and ABI changes
 
-The clients link `linkcursor-core` from source. A change to the wire protocol or the C ABI affects every client, so bump the versions as described in [the core README](https://github.com/rinflow-dev/rinflow-core#changing-the-protocol-or-abi) and update the clients in step.
+The clients link `rinflow-core` from source. A change to the wire protocol or the C ABI affects every client, so bump the versions as described in [the core README](https://github.com/rinflow-dev/rinflow-core#changing-the-protocol-or-abi) and update the clients in step.
 
 ## License
 
-LinkCursor is licensed under the [Mozilla Public License 2.0](LICENSE). Unless you state otherwise, your contribution is licensed the same way. New source files start with this notice, in the file's comment syntax:
+Rinflow is licensed under the [Mozilla Public License 2.0](LICENSE). Unless you state otherwise, your contribution is licensed the same way. New source files start with this notice, in the file's comment syntax:
 
 ```
 This Source Code Form is subject to the terms of the Mozilla Public

@@ -1615,7 +1615,7 @@ mod tests {
     fn paired_devices_reconnect_without_asking_and_a_changed_identity_is_refused() {
         let _network = network_test();
         let directory =
-            std::env::temp_dir().join(format!("linkcursor-trust-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rinflow-trust-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         let path = |name: &str| directory.join(name).to_string_lossy().into_owned();
         let identity = |name: &str| {
@@ -1934,7 +1934,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "linkcursor-test-{name}-{}-{}",
+            "rinflow-test-{name}-{}-{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos() ^ (name.len() as u128 * 7919)
         ));
@@ -2725,7 +2725,7 @@ mod tests {
     /// directory: (directory, fingerprint of `a`, fingerprint of `b`).
     fn paired_identities(test: &str, a: &str, b: &str) -> (PathBuf, String, String) {
         let directory =
-            std::env::temp_dir().join(format!("linkcursor-{test}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rinflow-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         let fingerprint = |id: &str| {
             crate::secure::Identity::load_or_create(Some(&directory.join(id)), id)

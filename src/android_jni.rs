@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! JNI bindings for the Android shell (`RustLinkCursorCore.kt`).
+//! JNI bindings for the Android shell (`RustRinflowCore.kt`).
 //!
 //! The same commands and JSON events as the C ABI in `ffi.rs`, limited to
 //! what a device that is driven (never drives) needs. Events reach Kotlin as
@@ -79,7 +79,7 @@ impl Callbacks {
 /// Starts the core with a `CoreConfig` as JSON. Throws
 /// `IllegalArgumentException` for a configuration it cannot read and
 /// `IllegalStateException` when the core cannot start.
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_create<'local>(
     mut env: EnvUnowned<'local>,
     owner: JObject<'local>,
@@ -92,7 +92,7 @@ pub fn native_create<'local>(
             Err(error) => {
                 env.throw_new(
                     jni_str!("java/lang/IllegalArgumentException"),
-                    JNIString::from(format!("invalid LinkCursor configuration: {error}")),
+                    JNIString::from(format!("invalid Rinflow configuration: {error}")),
                 )?;
                 return Ok(0);
             }
@@ -111,7 +111,7 @@ pub fn native_create<'local>(
             Err(error) => {
                 env.throw_new(
                     jni_str!("java/lang/IllegalStateException"),
-                    JNIString::from(format!("could not start LinkCursor Core: {error}")),
+                    JNIString::from(format!("could not start Rinflow Core: {error}")),
                 )?;
                 Ok(0)
             }
@@ -123,7 +123,7 @@ pub fn native_create<'local>(
 /// Stops the core and waits for it: peers see a clean disconnect, and the
 /// releases of whatever a peer still held arrive as input before this
 /// returns.
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_destroy<'local>(mut env: EnvUnowned<'local>, _owner: JObject<'local>, handle: jlong) {
     env.with_env(|_| -> jni::errors::Result<()> {
         if handle != 0 {
@@ -137,7 +137,7 @@ pub fn native_destroy<'local>(mut env: EnvUnowned<'local>, _owner: JObject<'loca
     .resolve::<ThrowRuntimeExAndDefault>()
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_connect<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -149,7 +149,7 @@ pub fn native_connect<'local>(
     })
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_disconnect_peer<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -161,7 +161,7 @@ pub fn native_disconnect_peer<'local>(
     })
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_accept_pairing<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -173,7 +173,7 @@ pub fn native_accept_pairing<'local>(
     })
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_reject_pairing<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -185,7 +185,7 @@ pub fn native_reject_pairing<'local>(
     })
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_unpair<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -199,7 +199,7 @@ pub fn native_unpair<'local>(
 
 /// `displays_json`: `[{"x","y","width","height","scale"}, …]` in logical
 /// points (dp on Android).
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_set_local_displays<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -215,7 +215,7 @@ pub fn native_set_local_displays<'local>(
 
 /// Removes the peer's placement here and on the peer (the peers place this
 /// device; it never places them).
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_remove_placement<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -230,7 +230,7 @@ pub fn native_remove_placement<'local>(
     })
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_set_require_pairing<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -240,7 +240,7 @@ pub fn native_set_require_pairing<'local>(
     command(env, handle, Command::SetRequirePairing(required))
 }
 
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_set_remote_control_allowed<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,
@@ -252,7 +252,7 @@ pub fn native_set_remote_control_allowed<'local>(
 
 /// The network changed (or the device woke): announce, rejoin discovery and
 /// reconnect now.
-#[jni_mangle("com.linkcursor.android.core.runtime.RustLinkCursorCore")]
+#[jni_mangle("com.rinflow.android.core.runtime.RustRinflowCore")]
 pub fn native_network_changed<'local>(
     env: EnvUnowned<'local>,
     _owner: JObject<'local>,

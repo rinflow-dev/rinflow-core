@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#ifndef LINKCURSOR_CORE_H
-#define LINKCURSOR_CORE_H
+#ifndef RINFLOW_CORE_H
+#define RINFLOW_CORE_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -331,7 +331,7 @@ bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
  * it, a moment after the connection, and also on a device that already
  * trusts the other one: that device's user confirms too. A peer with an
  * older core cannot pair ("disconnected" with the reason "the other device
- * needs a newer LinkCursor to pair"); peers paired before still connect.
+ * needs a newer Rinflow to pair"); peers paired before still connect.
  *   {"event":"pairing_requested","peer_id":…,"name":…,"platform":…,
  *    "code":"482917","fingerprint":…}   show the code; then
  *   lc_core_accept_pairing(core, peer_id) or lc_core_reject_pairing.

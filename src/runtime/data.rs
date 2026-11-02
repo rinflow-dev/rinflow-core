@@ -103,7 +103,7 @@ impl DiskWriter {
         let aborted = Arc::new(AtomicBool::new(false));
         let stop = aborted.clone();
         std::thread::Builder::new()
-            .name("linkcursor-files".to_owned())
+            .name("rinflow-files".to_owned())
             .spawn(move || {
                 // Dropped unfinished (cancelled, failed), it removes its
                 // partial file.

@@ -34,10 +34,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// ALPN of the LinkCursor protocol over QUIC.
-const ALPN: &[u8] = b"linkcursor/1";
+/// ALPN of the Rinflow protocol over QUIC.
+const ALPN: &[u8] = b"rinflow/1";
 /// The name a client asks for; certificates are not checked against it.
-pub const SERVER_NAME: &str = "linkcursor";
+pub const SERVER_NAME: &str = "rinflow";
 /// A connection that hears nothing for this long is gone (sessions also
 /// ping every second and give up after 8 s).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,7 +97,7 @@ impl Identity {
             .map_err(|error| error.to_string())?;
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, format!("LinkCursor {device_id}"));
+            .push(rcgen::DnType::CommonName, format!("Rinflow {device_id}"));
         let certificate = params
             .self_signed(&key)
             .map_err(|error| error.to_string())?;
@@ -208,7 +208,7 @@ pub fn pairing_nonce() -> Option<[u8; 32]> {
 /// cannot change once the other side has answered.
 pub fn pairing_commitment(nonce: &[u8; 32], dialer: &str, acceptor: &str) -> [u8; 32] {
     let digest = pairing_digest(
-        b"linkcursor pairing commitment v2\0",
+        b"rinflow pairing commitment v2\0",
         dialer,
         acceptor,
         &[nonce],
@@ -226,7 +226,7 @@ pub fn pairing_code(
     acceptor_nonce: &[u8; 32],
 ) -> u32 {
     let digest = pairing_digest(
-        b"linkcursor pairing code v2\0",
+        b"rinflow pairing code v2\0",
         dialer,
         acceptor,
         &[dialer_nonce, acceptor_nonce],
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn identities_persist_and_fingerprints_are_stable() {
         let directory =
-            std::env::temp_dir().join(format!("linkcursor-identity-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rinflow-identity-{}", std::process::id()));
         let path = directory.join("identity.pem");
         let _ = std::fs::remove_file(&path);
         let first = Identity::load_or_create(Some(&path), "device-a").unwrap();
@@ -397,7 +397,7 @@ mod tests {
         // fails with something other than "not found" (as a locked file or
         // one without permission would).
         let path = std::env::temp_dir().join(format!(
-            "linkcursor-identity-unreadable-{}",
+            "rinflow-identity-unreadable-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);

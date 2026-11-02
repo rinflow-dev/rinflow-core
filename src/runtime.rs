@@ -154,12 +154,12 @@ impl CoreThread {
         let platform_input = PlatformInputQueue::new();
         let runtime_input = platform_input.clone();
         let join = std::thread::Builder::new()
-            .name("linkcursor-core".to_owned())
+            .name("rinflow-core".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
-                    .thread_name("linkcursor-io")
+                    .thread_name("rinflow-io")
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -218,7 +218,7 @@ impl CoreThread {
     fn send_command(&self, command: Command) -> Result<(), String> {
         self.commands
             .send(command)
-            .map_err(|_| "LinkCursor core is not running".to_owned())
+            .map_err(|_| "Rinflow core is not running".to_owned())
     }
 
     pub fn stop_and_join(&mut self) {
@@ -279,7 +279,7 @@ async fn run(
         Ipv4Addr::BROADCAST,
         config.discovery_port,
     ));
-    // Not fatal: without a network yet (a PC that starts LinkCursor at
+    // Not fatal: without a network yet (a PC that starts Rinflow at
     // sign-in before Wi-Fi is up) the join fails, and is tried again with
     // every announcement. Broadcast works meanwhile.
     let mut joined = join_discovery_group(&udp, group);

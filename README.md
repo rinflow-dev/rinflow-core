@@ -1,9 +1,8 @@
-# LinkCursor Core
+# Rinflow Core
 
-[![CI](https://github.com/rinflow-dev/rinflow-core/actions/workflows/ci.yml/badge.svg)](https://github.com/rinflow-dev/rinflow-core/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
-LinkCursor lets several computers on the same local network share one keyboard and mouse. Tell LinkCursor which side of your screen the other machine is on, push the cursor past that edge, and your input goes to the other computer.
+Rinflow lets several computers on the same local network share one keyboard and mouse. Tell Rinflow which side of your screen the other machine is on, push the cursor past that edge, and your input goes to the other computer.
 
 This repository is the Rust core: LAN discovery, the wire protocol, QUIC transport with TLS 1.3 and pairing, input batching, clipboard and file transfer. It exposes a C ABI and Android JNI bindings. A thin native app on each platform captures and injects input.
 
@@ -15,12 +14,12 @@ This repository is the Rust core: LAN discovery, the wire protocol, QUIC transpo
 | [rinflow-macos](https://github.com/rinflow-dev/rinflow-macos) | SwiftUI window and menu bar app for macOS 14 or newer. Captures input with a `CGEvent` tap, injects remote input and statically links the core. |
 | [rinflow-windows](https://github.com/rinflow-dev/rinflow-windows) | Windows client: a Rust background agent (core, input capture and injection, edge effect, tray icon, named-pipe IPC) and a C++/WinRT WinUI 3 settings window. |
 
-The clients build the core from source, from a folder named `linkcursor-core` beside them, so name the folders when you clone:
+The clients build the core from source, from a folder named `rinflow-core` beside them, so name the folders when you clone:
 
 ```sh
-git clone https://github.com/rinflow-dev/rinflow-core.git    linkcursor-core
-git clone https://github.com/rinflow-dev/rinflow-macos.git   linkcursor-macos
-git clone https://github.com/rinflow-dev/rinflow-windows.git linkcursor-windows
+git clone https://github.com/rinflow-dev/rinflow-core.git    rinflow-core
+git clone https://github.com/rinflow-dev/rinflow-macos.git   rinflow-macos
+git clone https://github.com/rinflow-dev/rinflow-windows.git rinflow-windows
 ```
 
 ## How it works
@@ -31,7 +30,7 @@ git clone https://github.com/rinflow-dev/rinflow-windows.git linkcursor-windows
 │ CGEvent tap          │                              │ CGEvent injection    │
 │   │ LcInputEvent     │                              │   ▲ LcInputEvent     │
 │   ▼                  │    UDP 42420  discovery      │   │                  │
-│ linkcursor-core ─────┼──────────────────────────────┼─ linkcursor-core     │
+│ rinflow-core ─────┼──────────────────────────────┼─ rinflow-core     │
 │                      │   QUIC 42421  input/control  │                      │
 └──────────────────────┘                              └──────────────────────┘
 ```
@@ -75,7 +74,7 @@ Every device describes its displays in **logical points** (macOS points, or pixe
 ## Prerequisites
 
 - **Rust 1.88 or newer**, installed via [rustup](https://rustup.rs). The crate uses edition 2024 and `let` chains.
-- **Firewall:** allow UDP `42420` (discovery) and UDP `42421` (connections) on every machine, plus the UDP port the core binds for clipboard and file transfers, which the system picks. LinkCursor uses no TCP. A rule for the program rather than for ports covers all of them.
+- **Firewall:** allow UDP `42420` (discovery) and UDP `42421` (connections) on every machine, plus the UDP port the core binds for clipboard and file transfers, which the system picks. Rinflow uses no TCP. A rule for the program rather than for ports covers all of them.
 
 ## Building
 
@@ -85,15 +84,15 @@ cargo build --release   # optimized build (thin LTO, symbols stripped)
 cargo test
 ```
 
-Each build produces three outputs: a Rust library, a static library (`liblinkcursor_core.a` / `linkcursor_core.lib`) and a dynamic library (`.dylib` / `.so` / `.dll`), all under `target/`.
+Each build produces three outputs: a Rust library, a static library (`librinflow_core.a` / `rinflow_core.lib`) and a dynamic library (`.dylib` / `.so` / `.dll`), all under `target/`.
 
 Several tests, such as `two_cores_discover_connect_and_exchange_input` and the pairing tests, start two real cores that find each other over UDP multicast and connect over QUIC. They need a network interface that allows multicast loopback, and the first run may trigger an OS firewall prompt. Because they depend on the machine's network, they can occasionally time out with `peers not discovered`; rerun before treating that as a regression.
 
 ## Integrating the core on a new platform
 
-The C API lives in [include/linkcursor_core.h](include/linkcursor_core.h). The macOS app's [RustCore.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/LinkCursor/Core/RustCore.swift) is a complete example of how to use it.
+The C API lives in [include/rinflow_core.h](include/rinflow_core.h). The macOS app's [RustCore.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/Rinflow/Core/RustCore.swift) is a complete example of how to use it.
 
-Rust programs can skip the C ABI and use [`linkcursor_core::Core`](src/api.rs) with `CoreConfig` directly. Events arrive as the same JSON strings. The Windows agent's [main.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/main.rs) is an example.
+Rust programs can skip the C ABI and use [`rinflow_core::Core`](src/api.rs) with `CoreConfig` directly. Events arrive as the same JSON strings. The Windows agent's [main.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/main.rs) is an example.
 
 ```c
 if (lc_core_abi_version() != LC_CORE_ABI_VERSION) { /* mismatched library */ }
@@ -146,7 +145,7 @@ Every call except `lc_core_destroy` only queues a command and returns right away
 | Field | Default | Notes |
 | --- | --- | --- |
 | `device_id` | *(required)* | Stable and unique per install. The macOS app stores a UUID in `UserDefaults`. |
-| `device_name` | `"LinkCursor"` | Shown to peers. Set it to the computer's name. |
+| `device_name` | `"Rinflow"` | Shown to peers. Set it to the computer's name. |
 | `platform` | `"unknown"` | One of `android`, `macos`, `windows`, `linux`, `unknown`. |
 | `control_port` | `42421` | UDP port for connections. |
 | `discovery_port` | `42420` | UDP port for announcements. |
@@ -196,7 +195,7 @@ While remote control is not allowed (`lc_core_set_remote_control_allowed(core, f
 
 ### `LcInputEvent` conventions
 
-- Keyboard events: `code` is the **USB HID usage** (see [HIDKeyMap.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/LinkCursor/Input/HIDKeyMap.swift) for the macOS mapping and [keymap.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/keymap.rs) for Windows). `key_symbol` is an optional Unicode scalar. Keys are physical: receivers play them by key position, so the receiver's own layout and input method decide the character. Repeats are sent by the controlling side as further key-downs with `LC_INPUT_FLAG_KEY_REPEAT`.
+- Keyboard events: `code` is the **USB HID usage** (see [HIDKeyMap.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/Rinflow/Input/HIDKeyMap.swift) for the macOS mapping and [keymap.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/keymap.rs) for Windows). `key_symbol` is an optional Unicode scalar. Keys are physical: receivers play them by key position, so the receiver's own layout and input method decide the character. Repeats are sent by the controlling side as further key-downs with `LC_INPUT_FLAG_KEY_REPEAT`.
 - Mouse button events: `code` is a **1-based button number** (1 left, 2 right, 3 middle, 4 back, 5 forward; up to 32), and `buttons` has bit `n − 1` set while button `n` is held.
 - Motion: `delta_x` / `delta_y` are **logical points** (pixels at 100 % scale). The receiver multiplies them by its own display scale.
 - Arrival: a move with `LC_INPUT_FLAG_ABSOLUTE_POSITION` puts the pointer at `x` / `y` in the **receiver's** logical space, ignoring the deltas. The controlling side sends one when the pointer crosses a portal, so it appears at the matching point of the peer's edge. The core never merges it with other motion.
@@ -207,11 +206,11 @@ While remote control is not allowed (`lc_core_set_remote_control_allowed(core, f
 
 ### Android
 
-When built for Android, the crate also exports JNI functions for `com.linkcursor.android.core.runtime.RustLinkCursorCore`: `nativeCreate`, `nativeDestroy`, `nativeConnect`, `nativeDisconnect`, `nativeSendInput` and `nativeResetInput`. That class has to provide two callbacks: `onNativeEvent(String)` and `onNativeInput(int kind, int flags, int code, int keySymbol, int repeatCount, int modifiers, int buttons, long timestampMicros, double x, double y, double dx, double dy, double scrollX, double scrollY)`. The Android app is not part of this repository.
+When built for Android, the crate also exports JNI functions for `com.rinflow.android.core.runtime.RustRinflowCore`: `nativeCreate`, `nativeDestroy`, `nativeConnect`, `nativeDisconnect`, `nativeSendInput` and `nativeResetInput`. That class has to provide two callbacks: `onNativeEvent(String)` and `onNativeInput(int kind, int flags, int code, int keySymbol, int repeatCount, int modifiers, int buttons, long timestampMicros, double x, double y, double dx, double dy, double scrollX, double scrollY)`. The Android app is not part of this repository.
 
 ## Wire protocol (reference)
 
-- **Discovery** (UDP, JSON): `{"product":"linkcursor","min_protocol_version":4,"max_protocol_version":4,"capabilities":…,"device_id":…,"device_name":…,"platform":…,"control_port":42421,"displays":[{"x":0,"y":0,"width":1512,"height":982,"scale":2}],"fingerprint":"5803…"}`. `fingerprint` is only a hint: the handshake proves the real one.
+- **Discovery** (UDP, JSON): `{"product":"rinflow","min_protocol_version":4,"max_protocol_version":4,"capabilities":…,"device_id":…,"device_name":…,"platform":…,"control_port":42421,"displays":[{"x":0,"y":0,"width":1512,"height":982,"scale":2}],"fingerprint":"5803…"}`. `fingerprint` is only a hint: the handshake proves the real one.
 - **Session** (the QUIC stream; see below): each frame is a big-endian `u32` length (at most 1 MiB) followed by a payload. The payload starts with an 8-byte header: magic `"LC"`, format `1`, message type, then two zero `u16` fields. All fields after that are big-endian.
 
 | Type | Message | Payload after header |
@@ -226,13 +225,13 @@ When built for Android, the crate also exports JNI functions for `com.linkcursor
 | 15 / 16 | `PairRequest` / `PairAccept` | Empty. Declining closes the connection instead (application error code 1). |
 | 17 / 18 | `UserActive` / `LockScreen` | Empty. Only to peers with capability bit 9 (`PRESENCE`). |
 | 19 | `PointerLock` | `u8` locked (0 or 1), from a driven device to the one driving it. Only to peers with capability bit 10 (`POINTER_LOCK`). |
-| 20 | `PairCommit` | 32 bytes: SHA-256 of `"linkcursor pairing commitment v2\0"`, the dialer's fingerprint, `\0`, the other side's fingerprint, `\0`, then the dialer's 32-byte nonce. From the side that dialed the connection, while pairing. Capability bit 11 (`PAIRING_V2`). |
+| 20 | `PairCommit` | 32 bytes: SHA-256 of `"rinflow pairing commitment v2\0"`, the dialer's fingerprint, `\0`, the other side's fingerprint, `\0`, then the dialer's 32-byte nonce. From the side that dialed the connection, while pairing. Capability bit 11 (`PAIRING_V2`). |
 | 21 | `PairNonce` | 32 bytes: the other side's nonce, sent once it holds the commitment. |
 | 22 | `PairReveal` | 32 bytes: the dialer's nonce, sent once it holds the other side's. |
 
 Types 8–13 are the clipboard and file messages of the data link ([clipboard-and-files.md](docs/clipboard-and-files.md)). `DataInvite` (type 9) carries the token (`u64`) and the UDP port (`u16`, never 0) of the core's second endpoint, where the data link goes.
 
-**QUIC**: ALPN `linkcursor/1`, TLS 1.3 only, server name `linkcursor`. Both sides present a self-signed certificate; the TLS signatures are checked, the certificate chain is not, and the peer is identified by the SHA-256 of its certificate. The dialing side opens one bidirectional stream for the frames, and that is all a peer may open: the accepting side allows one incoming bidirectional stream, the dialing side none, neither allows unidirectional streams or datagrams, and the receive window is 1.25 MB for the stream and for the connection as a whole (anyone can complete the handshake, so nothing a peer sends may pile up unread). Idle timeout 10 s, keep-alive 2 s. A side that closes the connection because its user declined pairing closes it with application error code 1; code 0 is an ordinary close.
+**QUIC**: ALPN `rinflow/1`, TLS 1.3 only, server name `rinflow`. Both sides present a self-signed certificate; the TLS signatures are checked, the certificate chain is not, and the peer is identified by the SHA-256 of its certificate. The dialing side opens one bidirectional stream for the frames, and that is all a peer may open: the accepting side allows one incoming bidirectional stream, the dialing side none, neither allows unidirectional streams or datagrams, and the receive window is 1.25 MB for the stream and for the connection as a whole (anyone can complete the handshake, so nothing a peer sends may pile up unread). Idle timeout 10 s, keep-alive 2 s. A side that closes the connection because its user declined pairing closes it with application error code 1; code 0 is an ordinary close.
 
 Decoding is strict: truncated frames, extra bytes after a message, non-zero reserved fields or any message before `Hello` all close the connection. The encoder and decoder live in [protocol.rs](src/protocol.rs).
 
@@ -265,9 +264,9 @@ A connected peer can **inject keyboard and mouse input**, so the core encrypts a
   | Unknown, `require_pairing` on | Pairs first. |
   | Unknown, `require_pairing` off | Let in, encrypted but not authenticated. It can still ask to pair. |
 
-- **Pairing.** The side that wants it sends `PairRequest`, and both sides pair, also one that already trusts the other: a user can only check a code against the other screen. The code comes from both fingerprints and a random 32-byte nonce from each side. The side that dialed the connection commits to its nonce first (`PairCommit`), the other side answers with its own (`PairNonce`), and the dialer then reveals its nonce (`PairReveal`), which has to match the commitment. The code is SHA-256 of `"linkcursor pairing code v2\0"`, the dialer's fingerprint, `\0`, the other side's fingerprint, `\0`, the dialer's nonce and the other side's nonce; the first four bytes as a number modulo 10⁶. Since no side can change its nonce after seeing the other's, a device in the middle, which has to run a pairing with each side under its own certificate, gets the same code on both screens only one time in a million. Each shell shows the code (`pairing_requested`), and the user accepts once the other screen shows the same code. When both sides have accepted, each reports `paired` and lets the peer in. A peer without capability bit 11 (`PAIRING_V2`, an older build, whose code came from the fingerprints alone and could be forged) cannot pair (`"the other device needs a newer LinkCursor to pair"`), though devices paired before still connect. A pairing message out of turn or a reveal that does not match its commitment ends the connection (`"pairing failed"`). Declining (`"pairing declined"`, and `"pairing declined on the other device"` on the other side) or two minutes without an answer (`"pairing timed out"`) closes the connection. A device that sends input before it is let in is ignored.
+- **Pairing.** The side that wants it sends `PairRequest`, and both sides pair, also one that already trusts the other: a user can only check a code against the other screen. The code comes from both fingerprints and a random 32-byte nonce from each side. The side that dialed the connection commits to its nonce first (`PairCommit`), the other side answers with its own (`PairNonce`), and the dialer then reveals its nonce (`PairReveal`), which has to match the commitment. The code is SHA-256 of `"rinflow pairing code v2\0"`, the dialer's fingerprint, `\0`, the other side's fingerprint, `\0`, the dialer's nonce and the other side's nonce; the first four bytes as a number modulo 10⁶. Since no side can change its nonce after seeing the other's, a device in the middle, which has to run a pairing with each side under its own certificate, gets the same code on both screens only one time in a million. Each shell shows the code (`pairing_requested`), and the user accepts once the other screen shows the same code. When both sides have accepted, each reports `paired` and lets the peer in. A peer without capability bit 11 (`PAIRING_V2`, an older build, whose code came from the fingerprints alone and could be forged) cannot pair (`"the other device needs a newer Rinflow to pair"`), though devices paired before still connect. A pairing message out of turn or a reveal that does not match its commitment ends the connection (`"pairing failed"`). Declining (`"pairing declined"`, and `"pairing declined on the other device"` on the other side) or two minutes without an answer (`"pairing timed out"`) closes the connection. A device that sends input before it is let in is ignored.
 - **Turning `require_pairing` on** closes sessions with peers that are not paired (`"pairing required"`). With it on, `lc_core_unpair` closes the peer's session too (`"unpaired"`).
-- **What is still exposed.** Discovery announcements are plain UDP and tell the whole network each device's name, ID and fingerprint. With `require_pairing` off, any LinkCursor device on the LAN can connect (encrypted, but nobody checked who it is). The Windows client turns `require_pairing` on by default.
+- **What is still exposed.** Discovery announcements are plain UDP and tell the whole network each device's name, ID and fingerprint. With `require_pairing` off, any Rinflow device on the LAN can connect (encrypted, but nobody checked who it is). The Windows client turns `require_pairing` on by default.
 
 ## Not built yet
 
@@ -280,4 +279,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Please report security problems as descr
 
 ## License
 
-LinkCursor is licensed under the [Mozilla Public License 2.0](LICENSE).
+Rinflow is licensed under the [Mozilla Public License 2.0](LICENSE).

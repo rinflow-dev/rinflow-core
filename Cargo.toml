@@ -1,14 +1,14 @@
 [package]
-name = "linkcursor-core"
+name = "rinflow-core"
 version = "0.1.0"
 edition = "2024"
-description = "Cross-platform discovery, protocol, and network I/O core for LinkCursor"
+description = "Cross-platform discovery, protocol, and network I/O core for Rinflow"
 license = "MPL-2.0"
 repository = "https://github.com/rinflow-dev/rinflow-core"
 publish = false
 
 [lib]
-name = "linkcursor_core"
+name = "rinflow_core"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]

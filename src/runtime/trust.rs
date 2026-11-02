@@ -55,7 +55,7 @@ pub const PAIRING_REQUIRED: &str = "pairing required";
 pub const PAIRING_BUSY: &str = "another pairing is in progress";
 /// The peer runs a build whose pairing code a device in the middle could
 /// forge; it has to be updated before it can pair.
-pub const PAIRING_OUTDATED: &str = "the other device needs a newer LinkCursor to pair";
+pub const PAIRING_OUTDATED: &str = "the other device needs a newer Rinflow to pair";
 /// The peer broke the pairing exchange: a message out of turn, or a nonce
 /// that does not match its commitment. Possibly a device in the middle.
 pub const PAIRING_FAILED: &str = "pairing failed";
@@ -137,7 +137,7 @@ impl Runtime<'_> {
             // be forged by a device in the middle.
             let peer_id = session.peer_id().unwrap_or("a device").to_owned();
             self.sink.emit_error(format!(
-                "{peer_id} runs an older LinkCursor and has to be updated before it can pair"
+                "{peer_id} runs an older Rinflow and has to be updated before it can pair"
             ));
             self.refuse_session(id, PAIRING_OUTDATED);
             return;

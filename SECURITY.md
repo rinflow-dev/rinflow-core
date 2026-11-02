@@ -1,6 +1,6 @@
 # Security policy
 
-LinkCursor lets a connected device inject keyboard and mouse input and exchange clipboard contents and files, so security problems can have serious consequences. Thank you for reporting them responsibly.
+Rinflow lets a connected device inject keyboard and mouse input and exchange clipboard contents and files, so security problems can have serious consequences. Thank you for reporting them responsibly.
 
 ## Reporting a vulnerability
 
@@ -17,7 +17,7 @@ You can expect an acknowledgement within a week. This is a small project, so fix
 
 ## Supported versions
 
-Only the latest release receives security fixes. LinkCursor is at an early stage (0.x), and devices should run matching versions.
+Only the latest release receives security fixes. Rinflow is at an early stage (0.x), and devices should run matching versions.
 
 ## What is in scope
 

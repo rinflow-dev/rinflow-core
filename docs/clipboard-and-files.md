@@ -37,9 +37,9 @@ Windows 现在启用 `on_demand_files`：支持能力位 12 的对端只发布�
 | Linux / Android | `IP_TOS` = DSCP EF(46)，`SO_PRIORITY` 6 | DSCP CS1(8)，`SO_PRIORITY` 1 |
 
 - macOS 和 Linux 在套接字上设一次就覆盖所有对端。Windows 的 qWAVE 对未连接的 UDP 套接字要按目标地址加入流，所以每认识一个对端就加一次（`Qos::add_destination`，必须带 `QOS_NON_ADAPTIVE_FLOW`，否则报 50）。
-- 标记失败（例如 Windows 不给本机自己的地址设优先级，报 1168）只在 stderr 打一行 `linkcursor-core: no network priority for a peer: …`，连接照常工作。
+- 标记失败（例如 Windows 不给本机自己的地址设优先级，报 1168）只在 stderr 打一行 `rinflow-core: no network priority for a peer: …`，连接照常工作。
 - 优先级只管**发送方**：Mac 发给 Windows 的输入，要由 Mac 那边的核心库标记。路由器转发时是否照顾这个标记，取决于它是否开启 WMM（一般默认开启）。
-**写盘不占核心线程**：接收文件时，收到的数据块交给单独的 `linkcursor-files` 线程按顺序写入。之前写盘和输入处理在同一个线程里，大文件收尾时（刷盘、改名、杀毒软件扫描）会卡住输入。在本机用 300 MB 文件实测，传输期间鼠标事件最长间隔从 349 ms 降到 10–53 ms。写入出错或被取消时，等 `.partial` 文件删除后才发 `files_failed`。
+**写盘不占核心线程**：接收文件时，收到的数据块交给单独的 `rinflow-files` 线程按顺序写入。之前写盘和输入处理在同一个线程里，大文件收尾时（刷盘、改名、杀毒软件扫描）会卡住输入。在本机用 300 MB 文件实测，传输期间鼠标事件最长间隔从 349 ms 降到 10–53 ms。写入出错或被取消时，等 `.partial` 文件删除后才发 `files_failed`。
 
 能力位：`CAPABILITY_CLIPBOARD = 1 << 7`，`CAPABILITY_FILES = 1 << 6`。**第 5 位作废**：它曾表示"剪贴板走控制连接"（`512cb34`），新旧两种实现互相不发剪贴板，也就不会因为未知消息互相断开。
 
@@ -102,13 +102,13 @@ Windows 现在启用 `on_demand_files`：支持能力位 12 的对端只发布�
 - **只读需要的类型**：只取上表三种，不要把剪贴板里所有类型都读出来（大文件拷贝时剪贴板里可能有很大的表示）。
 - **线程**：核心库回调在它自己的线程上，按现有 `RustCore` 的做法转到主线程再操作 `NSPasteboard`。
 
-### 1.5 Windows 实现（已完成：`linkcursor-windows/agent/src/clipboard.rs`）
+### 1.5 Windows 实现（已完成：`rinflow-windows/agent/src/clipboard.rs`）
 
 - 在一个专用线程的仅消息窗口上用 `AddClipboardFormatListener` 收 `WM_CLIPBOARDUPDATE`。
 - 剪贴板包含 `ExcludeClipboardContentFromMonitorProcessing` 或 `Clipboard Viewer Ignore`，或者 `CanIncludeInClipboardHistory` 为 0 时，视为隐私内容，报告空。
 - 自己写入后会收到一次 `WM_CLIPBOARDUPDATE`：用 `GetClipboardSequenceNumber()` 记下写入后的序号，跳过这一次。
 - 读取顺序是 HTML（从 CF_HTML 头部的偏移取出片段）、PNG（没有时把 `CF_DIB` 转成 PNG）、文本。写入 PNG 时同时写一份 32 位 `CF_DIB`，写入 HTML 时生成 CF_HTML 头部。
-- 设置程序"设备"页有"同步剪贴板"开关，默认关闭，保存在 `%LOCALAPPDATA%\LinkCursor\settings.json`。agent 总是在配置里打开 `clipboard`，以便随时开关：
+- 设置程序"设备"页有"同步剪贴板"开关，默认关闭，保存在 `%LOCALAPPDATA%\Rinflow\settings.json`。agent 总是在配置里打开 `clipboard`，以便随时开关：
   - 关闭时报告空剪贴板，不写入收到的内容；
   - 收到对方的剪贴板时立刻再报告一次空，清掉核心库保存的那份，避免它被转发给第三台设备。
 - 用模拟 Mac 端到端测过：
@@ -122,7 +122,7 @@ Windows 现在启用 `on_demand_files`：支持能力位 12 的对端只发布�
 
 - **复制的文件（已完成）**：
   - **发送**：资源管理器复制的文件（`CF_HDROP`）报告为 `text/uri-list`，并附上文件名文字。
-  - **接收落地**：收到的文件放在 `下载\LinkCursor`，再以 `CF_HDROP` 加"复制"放置效果写入剪贴板，在资源管理器里 Ctrl+V 即可。
+  - **接收落地**：收到的文件放在 `下载\Rinflow`，再以 `CF_HDROP` 加"复制"放置效果写入剪贴板，在资源管理器里 Ctrl+V 即可。
   - **接收决定**：agent 把核心库的 `max_auto_receive_bytes` 设为 0，所以每次传输都会先发 `files_offered`，由 agent 决定：
     - 开关打开且不超过 512 MB：自动 `lc_core_accept_files`；
     - 超过 512 MB：弹窗询问；
@@ -215,7 +215,7 @@ macOS app 没有开沙盒（需要辅助功能权限），核心库可以直接�
 ### 3.4 协议草案
 
 - 新能力位 `CAPABILITY_FILES = 1 << 6`，只对宣告了这一位的对端发送文件相关消息（和剪贴板一样，旧版本收到未知消息类型会断开连接）。
-- 文件清单作为剪贴板里的一种格式 `application/x-linkcursor-files`，内容是 JSON：
+- 文件清单作为剪贴板里的一种格式 `application/x-rinflow-files`，内容是 JSON：
 
   ```json
   {"transfer": 17, "total_size": 4823311,
@@ -243,7 +243,7 @@ macOS app 没有开沙盒（需要辅助功能权限），核心库可以直接�
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `files` | `false` | 外壳实现了文件传输 |
-| `download_directory` | 无 | 接收文件的目录，例如 `~/Downloads/LinkCursor`、`%USERPROFILE%\Downloads\LinkCursor` |
+| `download_directory` | 无 | 接收文件的目录，例如 `~/Downloads/Rinflow`、`%USERPROFILE%\Downloads\Rinflow` |
 | `max_auto_receive_bytes` | `536870912`（512 MiB） | 不超过这个大小自动接收，超过时先问用户 |
 
 发送：沿用 `lc_core_set_clipboard`，格式里放 `text/uri-list`（`file://` URL，每行一个，`\r\n` 分隔）。
@@ -312,7 +312,7 @@ macOS app 没有开沙盒（需要辅助功能权限），核心库可以直接�
 
 ## 5. 待决定
 
-1. 下载目录和自动接收上限的默认值（建议 `下载/LinkCursor`、512 MiB）。
+1. 下载目录和自动接收上限的默认值（建议 `下载/Rinflow`、512 MiB）。
 2. v1 是否需要"接收完成后自动在 Finder/资源管理器中显示"，还是只放进剪贴板。
 3. RTF 是否现在就加。
 4. 加密完成之前，剪贴板和文件是否允许在设置里打开（建议允许，但默认关闭并提示风险）。

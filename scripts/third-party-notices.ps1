@@ -16,7 +16,7 @@ whenever Cargo.lock changes. The output does not depend on the machine.
 
 .EXAMPLE
 # From a PowerShell 7 prompt:
-../linkcursor-core/scripts/third-party-notices.ps1 `
+../rinflow-core/scripts/third-party-notices.ps1 `
     -Manifests agent/Cargo.toml, input/Cargo.toml `
     -Targets x86_64-pc-windows-msvc, aarch64-pc-windows-msvc `
     -Header installer/third-party-header.txt `

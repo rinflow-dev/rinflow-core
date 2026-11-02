@@ -129,7 +129,7 @@ pub struct CoreConfig {
     /// Publish file offers to the shell without downloading their contents.
     /// The shell uses `Core::open_remote_files` to supply native file streams.
     pub on_demand_files: bool,
-    /// Where received files go, e.g. `~/Downloads/LinkCursor`.
+    /// Where received files go, e.g. `~/Downloads/Rinflow`.
     pub download_directory: Option<String>,
     /// Larger transfers wait for `lc_core_accept_files`. Zero requires
     /// acceptance for every offer, including empty files and directories.
@@ -179,7 +179,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             device_id: String::new(),
-            device_name: "LinkCursor".to_owned(),
+            device_name: "Rinflow".to_owned(),
             platform: "unknown".to_owned(),
             control_port: DEFAULT_CONTROL_PORT,
             discovery_port: DEFAULT_DISCOVERY_PORT,
@@ -294,7 +294,7 @@ impl Announcement {
         fingerprint: &str,
     ) -> Self {
         Self {
-            product: "linkcursor".to_owned(),
+            product: "rinflow".to_owned(),
             min_protocol_version: PROTOCOL_MIN_VERSION,
             max_protocol_version: PROTOCOL_MAX_VERSION,
             capabilities,
@@ -309,7 +309,7 @@ impl Announcement {
     }
 
     pub fn negotiated_version(&self) -> Option<u16> {
-        (self.product == "linkcursor")
+        (self.product == "rinflow")
             .then(|| negotiate_protocol(self.min_protocol_version, self.max_protocol_version))
             .flatten()
     }

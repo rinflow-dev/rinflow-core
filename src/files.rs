@@ -6,7 +6,7 @@
 //!
 //! A shell that sees files on the system clipboard reports them as
 //! `text/uri-list` (`file://` URLs). The core replaces that with a manifest
-//! (`application/x-linkcursor-files`: relative paths and sizes, never local
+//! (`application/x-rinflow-files`: relative paths and sizes, never local
 //! paths), which travels with the clipboard. A receiver that accepts it pulls
 //! the files entry by entry over the data link (`FileRequest` / `FileChunk`),
 //! writes each to a `.partial` file next to its destination and renames it
@@ -26,7 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 pub const MIME_URI_LIST: &str = "text/uri-list";
-pub const MIME_FILES: &str = "application/x-linkcursor-files";
+pub const MIME_FILES: &str = "application/x-rinflow-files";
 /// Bytes per `FileChunk`.
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
 /// Entries (files and folders) one transfer may hold. More is not shared:

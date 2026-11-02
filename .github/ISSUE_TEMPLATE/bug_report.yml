@@ -9,7 +9,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: LinkCursor version
+      label: Rinflow version
       description: On each device, if they differ.
       placeholder: 0.1.0
     validations:
@@ -43,6 +43,6 @@ body:
     attributes:
       label: Logs
       description: >-
-        Windows: %LOCALAPPDATA%\LinkCursor\logs\agent.log. macOS: `make log`, or Console.app filtered by
-        com.linkcursor.mac. Please remove device names and addresses you do not want to share.
+        Windows: %LOCALAPPDATA%\Rinflow\logs\agent.log. macOS: `make log`, or Console.app filtered by
+        com.rinflow.mac. Please remove device names and addresses you do not want to share.
       render: text

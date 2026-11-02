@@ -202,7 +202,7 @@ mod platform {
             static REPORTED: std::sync::Once = std::sync::Once::new();
             let error = std::io::Error::last_os_error();
             REPORTED.call_once(|| {
-                eprintln!("linkcursor-core: no network priority for a peer: {error}");
+                eprintln!("rinflow-core: no network priority for a peer: {error}");
             });
         }
     }
