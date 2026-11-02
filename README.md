@@ -1,6 +1,6 @@
 # LinkCursor Core
 
-[![CI](https://github.com/akarineren/linkcursor-core/actions/workflows/ci.yml/badge.svg)](https://github.com/akarineren/linkcursor-core/actions/workflows/ci.yml)
+[![CI](https://github.com/rinflow-dev/rinflow-core/actions/workflows/ci.yml/badge.svg)](https://github.com/rinflow-dev/rinflow-core/actions/workflows/ci.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
 LinkCursor lets several computers on the same local network share one keyboard and mouse. Tell LinkCursor which side of your screen the other machine is on, push the cursor past that edge, and your input goes to the other computer.
@@ -11,17 +11,16 @@ This repository is the Rust core: LAN discovery, the wire protocol, QUIC transpo
 
 | Repository | What it is |
 | --- | --- |
-| [linkcursor-core](https://github.com/akarineren/linkcursor-core) | This library. |
-| [linkcursor-macos](https://github.com/akarineren/linkcursor-macos) | SwiftUI window and menu bar app for macOS 14 or newer. Captures input with a `CGEvent` tap, injects remote input and statically links the core. |
-| [linkcursor-windows](https://github.com/akarineren/linkcursor-windows) | Windows client: a Rust background agent (core, input capture and injection, edge effect, tray icon, named-pipe IPC) and a C++/WinRT WinUI 3 settings window. |
+| [rinflow-core](https://github.com/rinflow-dev/rinflow-core) | This library. |
+| [rinflow-macos](https://github.com/rinflow-dev/rinflow-macos) | SwiftUI window and menu bar app for macOS 14 or newer. Captures input with a `CGEvent` tap, injects remote input and statically links the core. |
+| [rinflow-windows](https://github.com/rinflow-dev/rinflow-windows) | Windows client: a Rust background agent (core, input capture and injection, edge effect, tray icon, named-pipe IPC) and a C++/WinRT WinUI 3 settings window. |
 
-The clients build the core from source, so clone them side by side:
+The clients build the core from source, from a folder named `linkcursor-core` beside them, so name the folders when you clone:
 
-```
-workspace/
-  linkcursor-core/
-  linkcursor-macos/
-  linkcursor-windows/
+```sh
+git clone https://github.com/rinflow-dev/rinflow-core.git    linkcursor-core
+git clone https://github.com/rinflow-dev/rinflow-macos.git   linkcursor-macos
+git clone https://github.com/rinflow-dev/rinflow-windows.git linkcursor-windows
 ```
 
 ## How it works
@@ -92,9 +91,9 @@ Several tests, such as `two_cores_discover_connect_and_exchange_input` and the p
 
 ## Integrating the core on a new platform
 
-The C API lives in [include/linkcursor_core.h](include/linkcursor_core.h). The macOS app's [RustCore.swift](https://github.com/akarineren/linkcursor-macos/blob/main/LinkCursor/Core/RustCore.swift) is a complete example of how to use it.
+The C API lives in [include/linkcursor_core.h](include/linkcursor_core.h). The macOS app's [RustCore.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/LinkCursor/Core/RustCore.swift) is a complete example of how to use it.
 
-Rust programs can skip the C ABI and use [`linkcursor_core::Core`](src/api.rs) with `CoreConfig` directly. Events arrive as the same JSON strings. The Windows agent's [main.rs](https://github.com/akarineren/linkcursor-windows/blob/main/agent/src/main.rs) is an example.
+Rust programs can skip the C ABI and use [`linkcursor_core::Core`](src/api.rs) with `CoreConfig` directly. Events arrive as the same JSON strings. The Windows agent's [main.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/main.rs) is an example.
 
 ```c
 if (lc_core_abi_version() != LC_CORE_ABI_VERSION) { /* mismatched library */ }
@@ -197,7 +196,7 @@ While remote control is not allowed (`lc_core_set_remote_control_allowed(core, f
 
 ### `LcInputEvent` conventions
 
-- Keyboard events: `code` is the **USB HID usage** (see [HIDKeyMap.swift](https://github.com/akarineren/linkcursor-macos/blob/main/LinkCursor/Input/HIDKeyMap.swift) for the macOS mapping and [keymap.rs](https://github.com/akarineren/linkcursor-windows/blob/main/agent/src/keymap.rs) for Windows). `key_symbol` is an optional Unicode scalar. Keys are physical: receivers play them by key position, so the receiver's own layout and input method decide the character. Repeats are sent by the controlling side as further key-downs with `LC_INPUT_FLAG_KEY_REPEAT`.
+- Keyboard events: `code` is the **USB HID usage** (see [HIDKeyMap.swift](https://github.com/rinflow-dev/rinflow-macos/blob/main/LinkCursor/Input/HIDKeyMap.swift) for the macOS mapping and [keymap.rs](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/src/keymap.rs) for Windows). `key_symbol` is an optional Unicode scalar. Keys are physical: receivers play them by key position, so the receiver's own layout and input method decide the character. Repeats are sent by the controlling side as further key-downs with `LC_INPUT_FLAG_KEY_REPEAT`.
 - Mouse button events: `code` is a **1-based button number** (1 left, 2 right, 3 middle, 4 back, 5 forward; up to 32), and `buttons` has bit `n − 1` set while button `n` is held.
 - Motion: `delta_x` / `delta_y` are **logical points** (pixels at 100 % scale). The receiver multiplies them by its own display scale.
 - Arrival: a move with `LC_INPUT_FLAG_ABSOLUTE_POSITION` puts the pointer at `x` / `y` in the **receiver's** logical space, ignoring the deltas. The controlling side sends one when the pointer crosses a portal, so it appears at the matching point of the peer's edge. The core never merges it with other motion.

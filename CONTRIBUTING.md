@@ -1,6 +1,6 @@
 # Contributing to LinkCursor Core
 
-Thanks for your interest. This repository is the Rust library shared by the [macOS](https://github.com/akarineren/linkcursor-macos) and [Windows](https://github.com/akarineren/linkcursor-windows) clients.
+Thanks for your interest. This repository is the Rust library shared by the [macOS](https://github.com/rinflow-dev/rinflow-macos) and [Windows](https://github.com/rinflow-dev/rinflow-windows) clients.
 
 ## Building and testing
 
@@ -24,7 +24,7 @@ If a dependency changes, regenerate the clients' third-party notices with [scrip
 
 ## Protocol and ABI changes
 
-The clients link `linkcursor-core` from source. A change to the wire protocol or the C ABI affects every client, so bump the versions as described in [the core README](https://github.com/akarineren/linkcursor-core#changing-the-protocol-or-abi) and update the clients in step.
+The clients link `linkcursor-core` from source. A change to the wire protocol or the C ABI affects every client, so bump the versions as described in [the core README](https://github.com/rinflow-dev/rinflow-core#changing-the-protocol-or-abi) and update the clients in step.
 
 ## License
 
