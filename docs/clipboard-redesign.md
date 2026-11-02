@@ -52,7 +52,7 @@
 
 不过本快照的 `IClipboard::Format` 是 Text、HTML、Bitmap，`Clipboard` 会把表示汇总到内存再序列化。它适合参考共享剪贴板的所有权管理，不能直接作为大文件按需粘贴的实现模板。
 
-依据：[Server.cpp](../../example/deskflow/src/lib/server/Server.cpp)、[IClipboard.h](../../example/deskflow/src/lib/deskflow/IClipboard.h)、[Clipboard.h](../../example/deskflow/src/lib/deskflow/Clipboard.h)。
+依据：[Server.cpp](https://github.com/deskflow/deskflow/blob/master/src/lib/server/Server.cpp)、[IClipboard.h](https://github.com/deskflow/deskflow/blob/master/src/lib/deskflow/IClipboard.h)、[Clipboard.h](https://github.com/deskflow/deskflow/blob/master/src/lib/deskflow/Clipboard.h)。
 
 ### Mouse Without Borders：借鉴轻量通知与独立取数
 
@@ -60,7 +60,7 @@
 
 但本快照也会在切换设备时调用 `GetRemoteClipboard`，不能描述成“全部等粘贴才传”。剪贴板单文件路径有 100 MiB 限制，接收后还会设置本地 FileDropList。照搬它仍会保留我们目前的一部分体验问题。
 
-依据：[Clipboard.cs](../../example/powertoys-mwb/src/modules/MouseWithoutBorders/App/Core/Clipboard.cs)、[Event.cs](../../example/powertoys-mwb/src/modules/MouseWithoutBorders/App/Core/Event.cs)、[Receiver.cs](../../example/powertoys-mwb/src/modules/MouseWithoutBorders/App/Core/Receiver.cs)。
+依据：[Clipboard.cs](https://github.com/microsoft/PowerToys/blob/main/src/modules/MouseWithoutBorders/App/Core/Clipboard.cs)、[Event.cs](https://github.com/microsoft/PowerToys/blob/main/src/modules/MouseWithoutBorders/App/Core/Event.cs)、[Receiver.cs](https://github.com/microsoft/PowerToys/blob/main/src/modules/MouseWithoutBorders/App/Core/Receiver.cs)。
 
 ### Chrome Remote Desktop：借鉴传输状态机与接收确认
 
@@ -68,13 +68,13 @@
 
 值得借鉴的是 Metadata → Data → End → Success/Error 的生命周期、取消处理、异步文件操作，以及限制发送侧排队块数。其缓冲写入器本身仍有队列，不能据此认定整条接收链路天然具有严格内存上限。
 
-依据：[clipboard_win.cc](../../example/chrome-remote-desktop/remoting/host/clipboard_win.cc)、[clipboard_mac.mm](../../example/chrome-remote-desktop/remoting/host/clipboard_mac.mm)、[file_transfer_message_handler.cc](../../example/chrome-remote-desktop/remoting/host/file_transfer/file_transfer_message_handler.cc)、[file_transfer.proto](../../example/chrome-remote-desktop/remoting/proto/file_transfer.proto)。
+依据：[clipboard_win.cc](https://source.chromium.org/chromium/chromium/src/+/main:remoting/host/clipboard_win.cc)、[clipboard_mac.mm](https://source.chromium.org/chromium/chromium/src/+/main:remoting/host/clipboard_mac.mm)、[file_transfer_message_handler.cc](https://source.chromium.org/chromium/chromium/src/+/main:remoting/host/file_transfer/file_transfer_message_handler.cc)、[file_transfer.proto](https://source.chromium.org/chromium/chromium/src/+/main:remoting/proto/file_transfer.proto)。
 
 ### Lan Mouse：本快照没有跨设备剪贴板可借鉴
 
 README 的 Clipboard support 仍未勾选；GTK 中出现的 clipboard 调用用于复制主机名和指纹，不是跨设备剪贴板协议。
 
-依据：[README.md](../../example/lan-mouse/README.md)。
+依据：[README.md](https://github.com/feschber/lan-mouse/blob/main/README.md)。
 
 ## 4. 用户交互与同步范围
 

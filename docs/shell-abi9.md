@@ -2,7 +2,7 @@
 
 核心库已经实现了下面所有协议层的工作（ABI 9，`lc_core_abi_version() == 9`）。这份清单列出 **每个外壳（macOS app）还要做的事**、用哪些 macOS API、以及 Windows 端可以参照的实现。新消息只发给声明了对应能力位的对端，所以 macOS 没跟上之前，两边照样能连。
 
-接口细节以 [include/linkcursor_core.h](../include/linkcursor_core.h) 为准，事件字段见根目录 [README](../../README.md) 的 Events 表。
+接口细节以 [include/linkcursor_core.h](../include/linkcursor_core.h) 为准，事件字段见根目录 [README](../README.md) 的 Events 表。
 
 ## 0. 先换库
 
