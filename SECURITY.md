@@ -27,4 +27,4 @@ Only the latest release receives security fixes. Rinflow is at an early stage (0
 - Reaching files or clipboard contents that were not offered
 - Privilege escalation through the Windows input helper and service
 
-Known limits, such as discovery announcements being plain UDP and unpaired connections being allowed while `require_pairing` is off, are documented in the [core README](https://github.com/rinflow-dev/rinflow-core#security).
+Known limits, such as discovery announcements being plain UDP and unpaired connections being allowed while `require_pairing` is off, are documented in the [core security design](https://github.com/rinflow-dev/rinflow-core/blob/main/docs/security.md).
