@@ -2359,7 +2359,9 @@ mod tests {
         let folder = source.join("empty-folder");
         std::fs::write(&file, []).unwrap();
         std::fs::create_dir(&folder).unwrap();
-        a.thread.send(Command::SetClipboard(uri_clipboard(&[file, folder]))).unwrap();
+        a.thread
+            .send(Command::SetClipboard(uri_clipboard(&[file, folder])))
+            .unwrap();
         a.thread.send(Command::SendInput(motion(1.0))).unwrap();
         let offered = wait_for_event(&b.events, Duration::from_secs(5), |event| {
             event["event"] == "files_offered" || event["event"] == "files_received"
@@ -2368,9 +2370,18 @@ mod tests {
         assert_eq!(offered["total_size"], 0);
         assert!(!downloads.join("empty.txt").exists());
         assert!(!downloads.join("empty-folder").exists());
-        b.thread.send(Command::AcceptFiles(offered["transfer"].as_u64().unwrap() as u32)).unwrap();
-        wait_for_event(&b.events, Duration::from_secs(5), |event| event["event"] == "files_received");
-        assert_eq!(std::fs::read(downloads.join("empty.txt")).unwrap(), Vec::<u8>::new());
+        b.thread
+            .send(Command::AcceptFiles(
+                offered["transfer"].as_u64().unwrap() as u32
+            ))
+            .unwrap();
+        wait_for_event(&b.events, Duration::from_secs(5), |event| {
+            event["event"] == "files_received"
+        });
+        assert_eq!(
+            std::fs::read(downloads.join("empty.txt")).unwrap(),
+            Vec::<u8>::new()
+        );
         assert!(downloads.join("empty-folder").is_dir());
         a.thread.stop_and_join();
         b.thread.stop_and_join();
