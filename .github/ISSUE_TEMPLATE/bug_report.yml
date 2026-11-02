@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security problems, please follow SECURITY.md instead of opening an issue.
+  - type: input
+    id: version
+    attributes:
+      label: LinkCursor version
+      description: On each device, if they differ.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: devices
+    attributes:
+      label: Devices
+      description: Operating system and version of each device involved.
+      placeholder: Windows 11 24H2 (controlling), macOS 15.1 (controlled)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Pair the two devices
+        2. Push the pointer through the right edge
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Windows: %LOCALAPPDATA%\LinkCursor\logs\agent.log. macOS: `make log`, or Console.app filtered by
+        com.linkcursor.mac. Please remove device names and addresses you do not want to share.
+      render: text
