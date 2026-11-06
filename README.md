@@ -48,6 +48,8 @@ flowchart LR
 - [Rinflow for macOS](https://github.com/rinflow-dev/rinflow-macos)
 - [Rinflow for Windows](https://github.com/rinflow-dev/rinflow-windows)
 
+Downloads: [macOS](https://github.com/rinflow-dev/rinflow-macos/releases/latest) · [Windows](https://github.com/rinflow-dev/rinflow-windows/releases/latest)
+
 Both build this library from source and expect it in a folder named `rinflow-core` next to their own.
 
 ## Building

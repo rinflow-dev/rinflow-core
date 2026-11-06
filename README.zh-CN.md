@@ -48,6 +48,8 @@ flowchart LR
 - [Rinflow for macOS](https://github.com/rinflow-dev/rinflow-macos)
 - [Rinflow for Windows](https://github.com/rinflow-dev/rinflow-windows)
 
+下载：[macOS](https://github.com/rinflow-dev/rinflow-macos/releases/latest) · [Windows](https://github.com/rinflow-dev/rinflow-windows/releases/latest)
+
 两者都从源码构建本库，并要求它放在同级目录下名为 `rinflow-core` 的文件夹中。
 
 ## 构建
