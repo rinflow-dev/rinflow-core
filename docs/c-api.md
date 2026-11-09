@@ -71,7 +71,9 @@ Every call except `lc_core_destroy` only queues a command and returns right away
 
 ## Events (the `json` passed to `LcEventCallback`)
 
-Every event is a JSON object with an `"event"` field:
+Every event is a JSON object with an `"event"` field.
+
+Every event with a `reason`, and every `error` event, also has `reason_code`: a stable snake_case word to show the user a message in their language (for example `heartbeat_timeout`, `peer_refused`, `pairing_timed_out`, `too_deep`, `control_port_unavailable`). `reason` and `message` stay English, for logs. A reason the core cannot classify (an I/O error, a newer peer's) has the code `other`; show a general message for it. The full list is in [`src/reason.rs`](../src/reason.rs).
 
 | `event` | Extra fields |
 | --- | --- |

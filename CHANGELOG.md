@@ -14,6 +14,7 @@ First public version.
 - Arrangement sync: placements, portals and chained devices
 - Clipboard and on-demand file transfer over a separate data link
 - C ABI (version 10) and Android JNI bindings
+- A stable `reason_code` beside every event `reason` and `error` message, so shells can show them in the user's language
 
 ### Known issues
 

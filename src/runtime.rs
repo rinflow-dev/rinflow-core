@@ -66,7 +66,9 @@ impl EventSink {
         }
     }
 
-    fn emit_value(&self, value: serde_json::Value) {
+    fn emit_value(&self, mut value: serde_json::Value) {
+        // Every reason and error leaves with its code (`reason.rs`).
+        crate::reason::annotate(&mut value);
         (self.event)(value.to_string());
     }
 

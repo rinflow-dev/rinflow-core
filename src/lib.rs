@@ -13,6 +13,7 @@ mod model;
 mod protocol;
 mod qos;
 mod quic;
+pub mod reason;
 mod remap;
 mod runtime;
 mod secure;
