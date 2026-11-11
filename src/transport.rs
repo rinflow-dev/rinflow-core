@@ -8,12 +8,14 @@
 
 use crate::input::{OutboundInputQueue, PushOutcome};
 use crate::model::{LcInputEvent, MAX_FRAME_SIZE, WireMessage};
+use crate::priority::FineTimers;
 use crate::protocol::{decode_message, encode_message};
 use crate::remap::ModifierMap;
 use crate::secure;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -161,6 +163,7 @@ pub struct ActiveConnection {
     input: OutboundInputQueue,
     bulk: BulkQueue,
     files: mpsc::Sender<WireMessage>,
+    paced: Arc<AtomicBool>,
     connection: quinn::Connection,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
@@ -196,6 +199,17 @@ impl ActiveConnection {
     /// is busy, so a file is read only as fast as it goes out.
     pub fn file_sender(&self) -> mpsc::Sender<WireMessage> {
         self.files.clone()
+    }
+
+    /// Paces motion to this peer, or sends it as it comes (see
+    /// `MotionPacing` in `input.rs`).
+    pub fn set_motion_paced(&self, paced: bool) {
+        self.paced.store(paced, Ordering::Relaxed);
+    }
+
+    /// The round trip, and the packets sent and lost so far.
+    pub fn path_stats(&self) -> quinn::PathStats {
+        self.connection.stats().path
     }
 
     /// Closes the connection now, telling the peer why. The connection is
@@ -257,11 +271,13 @@ pub fn spawn_connection(
     let input = OutboundInputQueue::new();
     let bulk = BulkQueue::default();
     let (files_tx, files_rx) = mpsc::channel(4);
+    let paced = Arc::new(AtomicBool::new(false));
     let queues = Queues {
         controls: control_rx,
         input: input.clone(),
         bulk: bulk.clone(),
         files: files_rx,
+        paced: paced.clone(),
     };
     let (read_task, write_task) =
         spawn_loops(connection_id, link.recv, link.send, queues, hello, events);
@@ -277,6 +293,7 @@ pub fn spawn_connection(
         input,
         bulk,
         files: files_tx,
+        paced,
         connection: link.connection,
         read_task,
         write_task,
@@ -289,6 +306,8 @@ struct Queues {
     input: OutboundInputQueue,
     bulk: BulkQueue,
     files: mpsc::Receiver<WireMessage>,
+    /// Motion is paced now (see `MOTION_INTERVAL`); the runtime decides.
+    paced: Arc<AtomicBool>,
 }
 
 fn spawn_loops<R, W>(
@@ -409,6 +428,10 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     hello: WireMessage,
 ) -> io::Result<()> {
     write_frame(&mut writer, &hello).await?;
+    // When input last went out.
+    let mut input_sent: Option<tokio::time::Instant> = None;
+    // Held while input goes out, so the slots are kept to the millisecond.
+    let mut fine_timers: Option<FineTimers> = None;
     loop {
         // Check control between every input batch so keepalives and handshake
         // responses cannot be starved by a high-rate pointing device.
@@ -416,8 +439,25 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             write_frame(&mut writer, &message).await?;
             continue;
         }
-        if let Some(message) = queues.input.pop_message() {
+        // Motion alone waits for its slot (see `MOTION_INTERVAL`), merging
+        // with what comes meanwhile; anything else goes at once, and the
+        // motion queued before it with it.
+        let paced = queues.paced.load(Ordering::Relaxed);
+        let slot = if paced && queues.input.only_motion() {
+            input_sent
+                .map(|sent| sent + MOTION_INTERVAL)
+                .filter(|slot| *slot > tokio::time::Instant::now())
+        } else {
+            None
+        };
+        if slot.is_none()
+            && let Some(message) = queues.input.pop_message()
+        {
             write_frame(&mut writer, &message).await?;
+            input_sent = Some(tokio::time::Instant::now());
+            if paced {
+                fine_timers.get_or_insert_with(FineTimers::new);
+            }
             continue;
         }
         // Bulk data only when nothing else waits, one frame at a time:
@@ -438,11 +478,37 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                 write_frame(&mut writer, &message).await?;
             }
             _ = queues.input.notified() => {}
+            _ = motion_slot(slot) => {}
+            _ = motion_slot(input_sent.filter(|_| fine_timers.is_some()).map(|sent| sent + INPUT_IDLE)) => {
+                fine_timers = None;
+            }
             _ = queues.bulk.notified() => {}
             Some(message) = queues.files.recv() => write_frame(&mut writer, &message).await?,
         }
     }
     writer.shutdown().await
+}
+
+/// The least time between two frames of pointer motion or scrolling.
+///
+/// A mouse reports up to 1000 times a second (some 8000), and each report
+/// sent by itself is a packet: far more than any display shows, and on Wi-Fi
+/// every packet waits for the channel, so a flood of them delays itself and
+/// the acknowledgements coming back. Reports within one interval merge into
+/// one frame instead (`coalesce` in `input.rs`). The first motion after a
+/// pause still goes at once, and so do keys and buttons: at most this much
+/// is added to the rest, half a frame at 120 Hz.
+const MOTION_INTERVAL: Duration = Duration::from_millis(4);
+
+/// How long after the last input the finer timers are given up.
+const INPUT_IDLE: Duration = Duration::from_secs(2);
+
+/// Waits until `slot`; for ever if there is none.
+async fn motion_slot(slot: Option<tokio::time::Instant>) {
+    match slot {
+        Some(slot) => tokio::time::sleep_until(slot).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -580,5 +646,100 @@ mod budget_tests {
         }
         writer.await.unwrap();
         reader.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use crate::model::{LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_MOVE};
+
+    /// Sends 300 reports a millisecond apart, then a click; returns the
+    /// frames of input that went out, the motion in them, and how long the
+    /// click took.
+    async fn frames_for_fast_motion(paced: bool) -> (usize, f64, Duration) {
+        let (writer, mut reader) = tokio::io::duplex(1024 * 1024);
+        let (_controls_tx, controls) = mpsc::channel(4);
+        let (_files_tx, files) = mpsc::channel(1);
+        let input = OutboundInputQueue::new();
+        let queues = Queues {
+            controls,
+            input: input.clone(),
+            bulk: BulkQueue::default(),
+            files,
+            paced: Arc::new(AtomicBool::new(paced)),
+        };
+        tokio::spawn(write_loop(
+            writer,
+            queues,
+            WireMessage::Ping { sequence: 1 },
+        ));
+
+        let reading = tokio::spawn(async move {
+            let (mut frames, mut total) = (0, 0.0);
+            loop {
+                let length = reader.read_u32().await.unwrap() as usize;
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).await.unwrap();
+                let WireMessage::InputBatch { events, .. } = decode_message(&payload).unwrap()
+                else {
+                    continue;
+                };
+                frames += 1;
+                total += events.iter().map(|event| event.delta_x).sum::<f64>();
+                if events
+                    .iter()
+                    .any(|event| event.kind == LC_INPUT_MOUSE_BUTTON_DOWN)
+                {
+                    return (frames, total, std::time::Instant::now());
+                }
+            }
+        });
+
+        let start = std::time::Instant::now();
+        for report in 0..300u64 {
+            input
+                .push(LcInputEvent {
+                    kind: LC_INPUT_MOUSE_MOVE,
+                    delta_x: 1.0,
+                    ..LcInputEvent::default()
+                })
+                .unwrap();
+            while start.elapsed() < Duration::from_millis(report + 1) {
+                tokio::task::yield_now().await;
+            }
+        }
+        let clicked = std::time::Instant::now();
+        input
+            .push(LcInputEvent {
+                kind: LC_INPUT_MOUSE_BUTTON_DOWN,
+                code: 1,
+                buttons: 1,
+                ..LcInputEvent::default()
+            })
+            .unwrap();
+        let (frames, total, arrived) = reading.await.unwrap();
+        (frames, total, arrived.saturating_duration_since(clicked))
+    }
+
+    /// Paced, a thousand reports a second go out as about 250 frames, and
+    /// a click right behind them does not wait for a slot; not paced, every
+    /// report goes as it comes. Either way no motion is lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn motion_is_merged_into_slots_only_while_paced() {
+        let (frames, total, click) = frames_for_fast_motion(true).await;
+        eprintln!("paced: 300 reports in 0.3 s went out as {frames} frames, click in {click:?}");
+        assert_eq!(total, 300.0);
+        // 75 slots of 4 ms in 300 ms, and the frame of the click.
+        assert!((40..=110).contains(&frames), "{frames} frames");
+        assert!(click < Duration::from_millis(5), "{click:?}");
+
+        let (frames, total, click) = frames_for_fast_motion(false).await;
+        eprintln!(
+            "not paced: 300 reports in 0.3 s went out as {frames} frames, click in {click:?}"
+        );
+        assert_eq!(total, 300.0);
+        assert!(frames > 200, "{frames} frames");
+        assert!(click < Duration::from_millis(5), "{click:?}");
     }
 }

@@ -10,6 +10,7 @@ mod files;
 mod input;
 pub mod layout;
 mod model;
+mod priority;
 mod protocol;
 mod qos;
 mod quic;
@@ -58,10 +59,10 @@ mod tests {
     use super::layout::{Display, Offset, Side};
     use super::model::{
         Announcement, CAPABILITY_CONTROL_REVOKE, CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION,
-        LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN, LC_INPUT_MOUSE_BUTTON_UP,
-        LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL, LC_MODIFIER_LEFT_COMMAND,
-        LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES, LcInputEvent,
-        PROTOCOL_MAX_VERSION, WireMessage,
+        LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
+        LC_INPUT_MOUSE_BUTTON_UP, LC_INPUT_MOUSE_MOVE, LC_MODIFIER_COMMAND, LC_MODIFIER_CONTROL,
+        LC_MODIFIER_LEFT_COMMAND, LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES,
+        LcInputEvent, PROTOCOL_MAX_VERSION, WireMessage,
     };
     use super::model::{CAPABILITY_PAIRING_V2, PlacementRecord, TrustedPeer};
     use super::protocol::{decode_message, encode_message};
@@ -720,8 +721,17 @@ mod tests {
         queue.push_control(PlatformEntry::SetTarget(Some("other".to_owned())));
         // Motion after the switch must not merge into motion for the old target.
         queue.push(second).expect("second motion");
+        // The queue stamps each event with when it came; that aside, they
+        // are as they were pushed.
+        let mut drained = queue.drain();
+        for entry in &mut drained {
+            if let PlatformEntry::Event(event) = entry {
+                assert_ne!(event.timestamp_micros, 0);
+                event.timestamp_micros = 0;
+            }
+        }
         assert_eq!(
-            queue.drain(),
+            drained,
             vec![
                 PlatformEntry::Event(first),
                 PlatformEntry::SetTarget(Some("other".to_owned())),
@@ -1067,6 +1077,304 @@ mod tests {
             .filter_map(|event| serde_json::from_str::<Value>(&event).ok())
             .filter(|event| event["event"] == name)
             .collect()
+    }
+
+    /// On a link that keeps up, a mouse that reports 1000 times a second is
+    /// sent as it reports: nothing is held back (motion is paced only on a
+    /// link in trouble, see `MotionPacing`), and none of it is lost. The
+    /// driving device hears how long its input takes there and back.
+    #[test]
+    fn fast_motion_goes_out_as_it_comes_and_all_of_it_arrives() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("pace-a", discovery_port);
+        let mut b = test_core("pace-b", discovery_port);
+        wait_for_peers(&a, &["pace-b"]);
+        a.thread.send(Command::Connect("pace-b".into())).unwrap();
+        wait_connected(&a, "pace-b");
+        wait_connected(&b, "pace-a");
+
+        const REPORTS: u32 = 1000;
+        let mut arrivals: Vec<(Instant, f64)> = Vec::new();
+        let start = Instant::now();
+        for report in 0..REPORTS {
+            a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+            // One report a millisecond, as exactly as a test can.
+            while start.elapsed() < Duration::from_millis(u64::from(report) + 1) {
+                while let Ok(event) = b.input.try_recv() {
+                    arrivals.push((Instant::now(), event.delta_x));
+                }
+                std::hint::spin_loop();
+            }
+        }
+        while let Ok(event) = b.input.recv_timeout(Duration::from_millis(200)) {
+            arrivals.push((Instant::now(), event.delta_x));
+        }
+
+        let total: f64 = arrivals.iter().map(|(_, delta)| delta).sum();
+        assert_eq!(total, f64::from(REPORTS), "motion was lost or made up");
+        let longest_gap = arrivals
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].0)
+            .max()
+            .unwrap_or_default();
+        eprintln!(
+            "{REPORTS} reports in 1 s arrived as {} moves, longest gap {longest_gap:?}",
+            arrivals.len()
+        );
+        // Not paced: nearly every report is its own move (a few merge when
+        // two reports meet in the queue).
+        assert!(
+            arrivals.len() > 600,
+            "{} moves for {REPORTS} reports: held back on a good link",
+            arrivals.len()
+        );
+        assert!(longest_gap < Duration::from_millis(40), "{longest_gap:?}");
+
+        // B echoed the stamps of what it received: A knows the round trip.
+        let latency = wait_for_event(&a.events, Duration::from_secs(3), |event| {
+            event["event"] == "input_latency" && event["peer_id"] == "pace-b"
+        });
+        eprintln!("input round trip: {latency}");
+        assert!(latency["samples"].as_u64().unwrap() >= 1);
+        assert!(latency["worst_ms"].as_f64().unwrap() < 50.0, "{latency}");
+        assert!(events_named(&a, "link_quality").is_empty());
+
+        // A button pressed right after motion does not wait for a slot.
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        a.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        let pressed = Instant::now();
+        a.thread
+            .send(Command::SendInput(LcInputEvent {
+                kind: LC_INPUT_MOUSE_BUTTON_DOWN,
+                code: 1,
+                buttons: 1,
+                ..LcInputEvent::default()
+            }))
+            .unwrap();
+        loop {
+            let event = b
+                .input
+                .recv_timeout(Duration::from_millis(200))
+                .expect("the button arrives");
+            if event.kind == LC_INPUT_MOUSE_BUTTON_DOWN {
+                break;
+            }
+        }
+        eprintln!("a button after motion arrived in {:?}", pressed.elapsed());
+        assert!(pressed.elapsed() < Duration::from_millis(50));
+
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    /// Motion is paced while a link is in trouble and for a while after;
+    /// trouble that returns soon after pacing stopped makes it last longer.
+    #[test]
+    fn motion_is_paced_while_the_link_is_in_trouble_and_longer_if_it_returns() {
+        use super::input::MotionPacing;
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut pacing = MotionPacing::default();
+        assert!(!pacing.observe(false, at(0)));
+
+        // Trouble: paced for 30 s after its last sign.
+        assert!(pacing.observe(true, at(1)));
+        assert!(pacing.observe(true, at(5)));
+        assert!(pacing.observe(false, at(34)));
+        assert!(!pacing.observe(false, at(36)));
+
+        // Back within a minute of stopping: unpaced motion was the cause,
+        // so twice as long now, and twice again the next time.
+        assert!(pacing.observe(true, at(40)));
+        assert!(pacing.observe(false, at(99)));
+        assert!(!pacing.observe(false, at(101)));
+        assert!(pacing.observe(true, at(110)));
+        assert!(pacing.observe(false, at(229)));
+        assert!(!pacing.observe(false, at(231)));
+
+        // Trouble long after is a new matter: 30 s again.
+        assert!(pacing.observe(true, at(2_000)));
+        assert!(!pacing.observe(false, at(2_031)));
+
+        // Never longer than ten minutes, however often it returns.
+        let mut now = 3_000;
+        for _ in 0..10 {
+            assert!(pacing.observe(true, at(now)));
+            while pacing.observe(false, at(now + 1)) {
+                now += 1;
+            }
+            now += 2;
+        }
+        assert!(pacing.observe(true, at(now)));
+        assert!(pacing.observe(false, at(now + 599)));
+        assert!(!pacing.observe(false, at(now + 601)));
+    }
+
+    #[test]
+    fn echoes_give_the_round_trip_of_input() {
+        use super::input::RoundTrips;
+        let mut round_trips = RoundTrips::default();
+        assert_eq!(round_trips.take(), None);
+        round_trips.echoed(1_000, 3_000);
+        round_trips.echoed(2_000, 10_000);
+        // Stamps of some other clock: from the future, or absurdly old.
+        round_trips.echoed(20_000, 10_000);
+        round_trips.echoed(1, 60_000_000);
+        assert_eq!(round_trips.take(), Some((2, 5_000, 8_000)));
+        assert_eq!(round_trips.take(), None);
+
+        let echo = WireMessage::InputEcho { stamp: 123_456 };
+        let bytes = encode_message(&echo).expect("encode echo");
+        assert_eq!(decode_message(&bytes).expect("decode echo"), echo);
+    }
+
+    /// Input whose arrival is further from its stamp than the best seen was
+    /// held up on the way by that much: every event of a burst after a
+    /// stall, not only the first. Pauses are not delays.
+    #[test]
+    fn input_timing_tells_how_long_input_was_held_up() {
+        use super::input::InputTiming;
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // The peer's clock is somewhere else entirely.
+        let stamp = |sent_ms: u64| 7_000_000_000 + sent_ms * 1_000;
+        let mut timing = InputTiming::default();
+        assert_eq!(timing.take(), None);
+
+        // Straight through, 2 ms on the way.
+        assert_eq!(timing.held_up(stamp(0), at(2)), Some(0));
+        assert_eq!(timing.held_up(stamp(8), at(10)), Some(0));
+        // A stall: sent at 16, 24 and 32, all arriving at 70.
+        assert_eq!(timing.held_up(stamp(16), at(70)), Some(52_000));
+        assert_eq!(timing.held_up(stamp(24), at(70)), Some(44_000));
+        assert_eq!(timing.held_up(stamp(32), at(70)), Some(36_000));
+        // A pause, then straight through again; a faster trip than any
+        // before is the new best.
+        assert_eq!(timing.held_up(stamp(5_000), at(5_002)), Some(0));
+        assert_eq!(timing.held_up(stamp(5_010), at(5_011)), Some(0));
+        assert_eq!(timing.held_up(stamp(5_020), at(5_022)), Some(1_000));
+        // No stamp: not known.
+        assert_eq!(timing.held_up(0, at(5_030)), None);
+
+        // The clocks drift apart: what counted as the best trip a minute
+        // ago no longer does.
+        assert_eq!(timing.held_up(stamp(40_000), at(40_004)), Some(3_000));
+        assert_eq!(timing.held_up(stamp(80_000), at(80_004)), Some(0));
+
+        // Batches: late from 20 ms, and a key repeat is stale from 100 ms.
+        timing.batch(Some(0));
+        timing.batch(Some(52_000));
+        timing.batch(None);
+        assert!(!timing.stale_repeat(Some(99_000)));
+        assert!(!timing.stale_repeat(None));
+        assert!(timing.stale_repeat(Some(100_000)));
+        let report = timing.take().expect("input arrived");
+        assert_eq!(
+            (
+                report.batches,
+                report.late,
+                report.worst_micros,
+                report.stale_repeats
+            ),
+            (3, 1, 52_000, 1)
+        );
+        assert_eq!(timing.take(), None);
+    }
+
+    /// A held key repeats; repeats that were held up on the way are not
+    /// played all at once when they finally arrive, but the key still goes
+    /// down and comes up.
+    #[test]
+    fn key_repeats_that_arrive_too_late_are_not_played() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let a = test_core("repeat-a", discovery_port);
+        // B, whose shell blocks the core for a while when told to (a motion
+        // of 99): whatever A sends meanwhile reaches B's core late, as
+        // after a stall of the network.
+        let (events_tx, events) = mpsc::channel();
+        let (input_tx, input) = mpsc::channel();
+        let mut b = CoreThread::spawn(
+            CoreConfig {
+                device_id: "repeat-b".to_owned(),
+                control_port: free_udp_port(),
+                discovery_port,
+                ..CoreConfig::default()
+            },
+            EventSink::new(
+                move |event| {
+                    let _ = events_tx.send(event);
+                },
+                move |event: LcInputEvent| {
+                    if event.kind == LC_INPUT_MOUSE_MOVE && event.delta_x == 99.0 {
+                        std::thread::sleep(Duration::from_millis(450));
+                    }
+                    let _ = input_tx.send(event);
+                },
+            ),
+        )
+        .expect("start core");
+        let mut a = a;
+        wait_for_peers(&a, &["repeat-b"]);
+        a.thread.send(Command::Connect("repeat-b".into())).unwrap();
+        wait_connected(&a, "repeat-b");
+        wait_for_event(&events, Duration::from_secs(6), |event| {
+            event["event"] == "connected"
+        });
+
+        const BACKSPACE: u32 = 0x2A;
+        let key = |kind: u32, repeat: bool| LcInputEvent {
+            kind,
+            code: BACKSPACE,
+            flags: if repeat { LC_INPUT_FLAG_KEY_REPEAT } else { 0 },
+            repeat_count: u32::from(repeat),
+            ..LcInputEvent::default()
+        };
+        let send = |event: LcInputEvent| a.thread.send(Command::SendInput(event)).unwrap();
+        let repeats_played = |wait: Duration| {
+            let deadline = Instant::now() + wait;
+            let (mut repeats, mut released) = (0, false);
+            while let Ok(event) =
+                input.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                repeats += u32::from(event.flags & LC_INPUT_FLAG_KEY_REPEAT != 0);
+                released |= event.kind == LC_INPUT_KEY_UP;
+            }
+            (repeats, released)
+        };
+
+        // The key goes down and repeats, straight through: all played.
+        send(key(LC_INPUT_KEY_DOWN, false));
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(33));
+            send(key(LC_INPUT_KEY_DOWN, true));
+        }
+        assert_eq!(repeats_played(Duration::from_millis(200)), (5, false));
+
+        // B stalls; eight more repeats are sent meanwhile, then the key
+        // comes up after the stall.
+        send(motion(99.0));
+        std::thread::sleep(Duration::from_millis(20));
+        for _ in 0..8 {
+            send(key(LC_INPUT_KEY_DOWN, true));
+            std::thread::sleep(Duration::from_millis(33));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        send(key(LC_INPUT_KEY_UP, false));
+        let (repeats, released) = repeats_played(Duration::from_millis(600));
+        eprintln!("of 8 repeats sent during a stall, {repeats} were played");
+        // All of them are at least 100 ms late; one may slip through.
+        assert!(repeats <= 1, "{repeats} stale repeats were played");
+        assert!(released, "the key did not come up");
+
+        let quality = wait_for_event(&events, Duration::from_secs(3), |event| {
+            event["event"] == "link_quality" && event["stale_repeats"].as_u64().unwrap_or(0) > 0
+        });
+        eprintln!("{quality}");
+
+        a.thread.stop_and_join();
+        b.stop_and_join();
     }
 
     #[test]

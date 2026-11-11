@@ -41,6 +41,7 @@ const MESSAGE_FILE_STREAM_READ: u8 = 25;
 const MESSAGE_FILE_STREAM_DATA: u8 = 26;
 const MESSAGE_FILE_STREAM_CLOSE: u8 = 27;
 const MESSAGE_FILE_OFFER_REVOKE: u8 = 28;
+const MESSAGE_INPUT_ECHO: u8 = 29;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -49,6 +50,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::InputBatch { .. } => MESSAGE_INPUT_BATCH,
         WireMessage::InputReset { .. } => MESSAGE_INPUT_RESET,
         WireMessage::Ping { .. } => MESSAGE_PING,
+        WireMessage::InputEcho { .. } => MESSAGE_INPUT_ECHO,
         WireMessage::Pong { .. } => MESSAGE_PONG,
         WireMessage::ScreenInfo { .. } => MESSAGE_SCREEN_INFO,
         WireMessage::Placement { .. } => MESSAGE_PLACEMENT,
@@ -251,6 +253,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         | WireMessage::UserActive
         | WireMessage::LockScreen => {}
         WireMessage::PointerLock { locked } => encoder.u8(u8::from(*locked)),
+        WireMessage::InputEcho { stamp } => encoder.u64(*stamp),
         WireMessage::PairCommit { commitment: value }
         | WireMessage::PairNonce { nonce: value }
         | WireMessage::PairReveal { nonce: value } => encoder.bytes.extend_from_slice(value),
@@ -482,6 +485,9 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
                 1 => true,
                 _ => return Err(invalid_data("invalid control revoke flag")),
             },
+        },
+        MESSAGE_INPUT_ECHO => WireMessage::InputEcho {
+            stamp: decoder.u64()?,
         },
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,

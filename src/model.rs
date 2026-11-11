@@ -54,6 +54,10 @@ pub const CAPABILITY_PAIRING_V2: u64 = 1 << 11;
 /// Bounded, seekable file reads from a pinned clipboard offer. Never sent
 /// to older peers. Receiving shells opt in with `on_demand_files`.
 pub const CAPABILITY_FILE_STREAMS: u64 = 1 << 12;
+/// Understands `InputEcho`: a driven device sends the stamp of input it
+/// received straight back, and the driving device measures how long input
+/// takes there and back (`input_latency`).
+pub const CAPABILITY_INPUT_ECHO: u64 = 1 << 13;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -63,7 +67,8 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_CONTROL_REVOKE
     | CAPABILITY_PRESENCE
     | CAPABILITY_POINTER_LOCK
-    | CAPABILITY_PAIRING_V2;
+    | CAPABILITY_PAIRING_V2
+    | CAPABILITY_INPUT_ECHO;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
@@ -584,6 +589,14 @@ pub enum WireMessage {
     /// `CAPABILITY_POINTER_LOCK`.
     PointerLock {
         locked: bool,
+    },
+    /// From a driven device, a few times a second while input arrives: the
+    /// `timestamp_micros` of the newest event it just received, unchanged.
+    /// The stamp is the driving device's own clock, so that device knows
+    /// how long the input took there and this message back. Only to peers
+    /// with `CAPABILITY_INPUT_ECHO`.
+    InputEcho {
+        stamp: u64,
     },
 }
 

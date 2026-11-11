@@ -45,6 +45,17 @@ const KEEP_ALIVE: Duration = Duration::from_secs(2);
 /// How much of its one stream a peer may send ahead of what this side read
 /// (quinn's default per stream), and the most the whole connection may.
 const RECEIVE_WINDOW: u32 = 1_250_000;
+/// Acknowledgements of input (QUIC's ACK frequency extension, which both
+/// sides of a Rinflow connection speak; a peer without it keeps its own
+/// timing). By default a peer acknowledges every second packet, or after
+/// 25 ms. Pointer motion is hundreds of small packets a second, and on Wi-Fi
+/// every acknowledgement takes air time from the motion going the other way:
+/// so one acknowledgement per this many packets. And the 25 ms are part of
+/// how long the sender waits before it sends again the last packet of a
+/// burst that got lost (a button release, the end of a movement), which no
+/// later packet shows to be lost: so a shorter delay.
+const INPUT_ACK_PACKETS: u32 = 10;
+const INPUT_ACK_DELAY: Duration = Duration::from_millis(8);
 
 /// This device's key pair and certificate.
 pub struct Identity {
@@ -118,7 +129,8 @@ impl Identity {
     }
 
     /// Accepts connections; asks every client for its certificate.
-    pub fn server_config(&self) -> Result<quinn::ServerConfig, String> {
+    /// `interactive`: for the control endpoint (see [`transport`]).
+    pub fn server_config(&self, interactive: bool) -> Result<quinn::ServerConfig, String> {
         let provider = provider();
         let mut crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -129,12 +141,12 @@ impl Identity {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = QuicServerConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(transport(true));
+        config.transport_config(transport(true, interactive));
         Ok(config)
     }
 
     /// Dials; shows this device's certificate to the server.
-    pub fn client_config(&self) -> Result<quinn::ClientConfig, String> {
+    pub fn client_config(&self, interactive: bool) -> Result<quinn::ClientConfig, String> {
         let provider = provider();
         let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -146,7 +158,7 @@ impl Identity {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = QuicClientConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(transport(false));
+        config.transport_config(transport(false, interactive));
         Ok(config)
     }
 }
@@ -163,7 +175,10 @@ fn provider() -> Arc<CryptoProvider> {
 /// handshake. So the peer may open only the one stream (`accepts_stream`:
 /// the side that accepts connections), the connection gets no more window
 /// than that stream, and there are no datagrams.
-fn transport(accepts_stream: bool) -> Arc<quinn::TransportConfig> {
+///
+/// `interactive` (the control endpoint, which carries input): the peer is
+/// asked to acknowledge less often and sooner (see [`INPUT_ACK_PACKETS`]).
+fn transport(accepts_stream: bool, interactive: bool) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(IDLE_TIMEOUT.try_into().ok());
     transport.keep_alive_interval(Some(KEEP_ALIVE));
@@ -172,6 +187,12 @@ fn transport(accepts_stream: bool) -> Arc<quinn::TransportConfig> {
     transport.stream_receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW));
     transport.receive_window(quinn::VarInt::from_u32(RECEIVE_WINDOW));
     transport.datagram_receive_buffer_size(None);
+    if interactive {
+        let mut acks = quinn::AckFrequencyConfig::default();
+        acks.ack_eliciting_threshold(quinn::VarInt::from_u32(INPUT_ACK_PACKETS));
+        acks.max_ack_delay(Some(INPUT_ACK_DELAY));
+        transport.ack_frequency_config(Some(acks));
+    }
     Arc::new(transport)
 }
 
@@ -387,7 +408,7 @@ mod tests {
         assert_eq!(first.fingerprint.len(), 64);
         let other = Identity::load_or_create(None, "device-b").unwrap();
         assert_ne!(first.fingerprint, other.fingerprint);
-        assert!(first.server_config().is_ok() && first.client_config().is_ok());
+        assert!(first.server_config(true).is_ok() && first.client_config(false).is_ok());
         let _ = std::fs::remove_dir_all(&directory);
     }
 

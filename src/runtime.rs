@@ -10,12 +10,16 @@ pub(crate) mod trust;
 
 use crate::clipboard::{Clipboard, ClipboardAssembler};
 use crate::files::Offer;
-use crate::input::{PlatformEntry, PlatformInputQueue, RemoteInputState, SequenceStatus};
+use crate::input::{
+    InputTiming, MotionPacing, PlatformEntry, PlatformInputQueue, RemoteInputState, RoundTrips,
+    SequenceStatus, monotonic_micros,
+};
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_V2, CAPABILITY_POINTER_LOCK,
-    CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP, LcInputEvent, Peer, PlacementRecord,
-    WireMessage, negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2,
+    CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
+    LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
+    negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
 use crate::remap::ModifierMap;
@@ -158,10 +162,13 @@ impl CoreThread {
         let join = std::thread::Builder::new()
             .name("rinflow-core".to_owned())
             .spawn(move || {
+                // This thread runs the core's loop, which all input passes.
+                crate::priority::raise_current_thread();
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
                     .thread_name("rinflow-io")
+                    .on_thread_start(crate::priority::raise_current_thread)
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -497,6 +504,16 @@ struct Session {
     data_invited: Option<Instant>,
     /// When `UserActive` last went to the peer.
     activity_sent: Option<Instant>,
+    /// How late the peer's input arrives, and the packets this side had sent
+    /// and lost when the link was last looked at (`link_quality`).
+    input_timing: InputTiming,
+    packets: (u64, u64),
+    /// Whether motion to the peer is paced (see `MotionPacing`).
+    pacing: MotionPacing,
+    /// How long input takes to the peer and back, from its echoes, and
+    /// when this side last echoed the peer's input.
+    round_trips: RoundTrips,
+    echoed: Option<Instant>,
 }
 
 impl Session {
@@ -974,6 +991,11 @@ impl Runtime<'_> {
                         data_token: None,
                         data_invited: None,
                         activity_sent: None,
+                        input_timing: InputTiming::default(),
+                        packets: (0, 0),
+                        pacing: MotionPacing::default(),
+                        round_trips: RoundTrips::default(),
+                        echoed: None,
                     },
                 );
             }
@@ -1619,6 +1641,10 @@ impl Runtime<'_> {
             }
             WireMessage::DataInvite { token, port } => self.data_invited(id, token, port),
             WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
+            // The peer got input this device stamped, and says so at once.
+            WireMessage::InputEcho { stamp } => {
+                session.round_trips.echoed(stamp, monotonic_micros());
+            }
             WireMessage::PairRequest => self.pair_requested(id),
             WireMessage::PairAccept => self.pair_accepted(id),
             WireMessage::PairCommit { commitment } => self.pair_committed(id, commitment),
@@ -1688,6 +1714,31 @@ impl Runtime<'_> {
             }
             SequenceStatus::InOrder => {}
         }
+        // Only a peer whose core stamps input itself (the same build that
+        // echoes): an older one passes on its shell's stamps, which may be
+        // in other units.
+        let stamped = session.connection.capabilities & CAPABILITY_INPUT_ECHO != 0;
+        let arrived = Instant::now();
+        let held_up = events.last().filter(|_| stamped).and_then(|newest| {
+            session
+                .input_timing
+                .held_up(newest.timestamp_micros, arrived)
+        });
+        session.input_timing.batch(held_up);
+        // Its stamp goes straight back, a few times a second: the peer
+        // learns how long its input takes (`InputEcho`).
+        if let Some(newest) = events.last()
+            && newest.timestamp_micros != 0
+            && session.connection.capabilities & CAPABILITY_INPUT_ECHO != 0
+            && session
+                .echoed
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+        {
+            session.echoed = Some(Instant::now());
+            let _ = session.connection.send_control(WireMessage::InputEcho {
+                stamp: newest.timestamp_micros,
+            });
+        }
         if session.revoked {
             // Sent before the peer heard that it lost control.
             return;
@@ -1724,6 +1775,19 @@ impl Runtime<'_> {
         }
         let modifier_map = session.connection.modifier_map;
         for mut event in events {
+            // A key repeat that was held up on the way is not played: after
+            // a stall they arrive all at once (see `InputTiming`).
+            if stamped
+                && event.kind == LC_INPUT_KEY_DOWN
+                && event.flags & LC_INPUT_FLAG_KEY_REPEAT != 0
+            {
+                let held_up = session
+                    .input_timing
+                    .held_up(event.timestamp_micros, arrived);
+                if session.input_timing.stale_repeat(held_up) {
+                    continue;
+                }
+            }
             // Mapped before observing, so the synthetic key-ups for held
             // keys use the same codes the shell saw. A key mapped to nothing
             // is not played at all.
@@ -1995,6 +2059,68 @@ impl Runtime<'_> {
         self.flush_disconnects(true);
     }
 
+    /// Looks at every session's link, once a second.
+    ///
+    /// - `input_latency`, while this device drives the peer: how long input
+    ///   took there and back (the peer's `InputEcho`).
+    /// - `link_quality`, only for a second in which the link got in the way
+    ///   of input: packets this side sent were lost, the peer's input
+    ///   arrived late (see `InputTiming`), or input took long there and
+    ///   back. What a shell logs of these is the list of moments the pointer
+    ///   may have stuttered, and why.
+    /// - Motion to the peer is paced while its link is in such trouble, and
+    ///   sent as it comes otherwise (see `MotionPacing`).
+    fn report_link_quality(&mut self) {
+        /// Input that takes this long there and back shows.
+        const SLOW_ROUND_TRIP_MICROS: u64 = 50_000;
+        let now = Instant::now();
+        for session in self.sessions.values_mut() {
+            if !session.established() {
+                continue;
+            }
+            let path = session.connection.path_stats();
+            let (sent_before, lost_before) = session.packets;
+            session.packets = (path.sent_packets, path.lost_packets);
+            let sent = path.sent_packets.saturating_sub(sent_before);
+            let lost = path.lost_packets.saturating_sub(lost_before);
+            let timing = session.input_timing.take();
+            let late = timing.map_or(0, |timing| timing.late);
+            let round_trips = session.round_trips.take();
+            if let Some((samples, mean, worst)) = round_trips {
+                self.sink.emit_value(json!({
+                    "event": "input_latency",
+                    "peer_id": session.peer_id(),
+                    "ms": mean as f64 / 1000.0,
+                    "worst_ms": worst as f64 / 1000.0,
+                    "samples": samples
+                }));
+            }
+            let slow = round_trips.is_some_and(|(_, _, worst)| worst >= SLOW_ROUND_TRIP_MICROS);
+            // The link's own round trip well above its best: a queue
+            // somewhere on the way.
+            let congested = path.rtt >= Duration::from_millis(20) && path.rtt >= path.min_rtt * 3;
+            let trouble = lost > 0 || late > 0 || slow || congested;
+            let paced = session.pacing.observe(trouble, now);
+            session.connection.set_motion_paced(paced);
+            if lost == 0 && late == 0 && !slow {
+                continue;
+            }
+            self.sink.emit_value(json!({
+                "event": "link_quality",
+                "peer_id": session.peer_id(),
+                "rtt_ms": path.rtt.as_secs_f64() * 1000.0,
+                "sent_packets": sent,
+                "lost_packets": lost,
+                "input_batches": timing.map_or(0, |timing| timing.batches),
+                "input_late": late,
+                "input_worst_ms": timing.map_or(0.0, |timing| timing.worst_micros as f64 / 1000.0),
+                "stale_repeats": timing.map_or(0, |timing| timing.stale_repeats),
+                "round_trip_worst_ms": round_trips.map_or(0.0, |(_, _, worst)| worst as f64 / 1000.0),
+                "paced": paced
+            }));
+        }
+    }
+
     fn maintenance(&mut self) {
         self.expire_streams();
         self.flush_disconnects(false);
@@ -2047,6 +2173,7 @@ impl Runtime<'_> {
         for (id, reason) in stale {
             self.close_session(id, reason, true);
         }
+        self.report_link_quality();
         self.expire_pairings();
         self.reinvite_data_links();
         self.publish_manual();

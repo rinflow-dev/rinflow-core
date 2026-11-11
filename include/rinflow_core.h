@@ -225,6 +225,29 @@ bool lc_core_reset_input(LcCore *core);
  *
  * Every connected peer's round trip is reported about once a second:
  *   {"event":"latency","peer_id":…,"ms":…}
+ *
+ * A second in which a session's link got in the way of input is reported
+ * (and only such a second, so a log of these is the list of moments the
+ * pointer may have stuttered):
+ *   {"event":"link_quality","peer_id":…,"rtt_ms":…,"sent_packets":…,
+ *    "lost_packets":…,"input_batches":…,"input_late":…,"input_worst_ms":…,
+ *    "stale_repeats":…,"round_trip_worst_ms":…,"paced":…}
+ * lost_packets of the sent_packets this device sent in that second were
+ * lost; input_late of the input_batches the peer sent were held up on the
+ * way for at least 20 ms, the worst by input_worst_ms (stale_repeats key
+ * repeats held up for 100 ms or more were not played: after a stall they
+ * would all arrive at once); or
+ * input took 50 ms or more to the peer and back (round_trip_worst_ms).
+ * paced: motion to the peer is paced from now (sent at most every 4 ms,
+ * merged in between), as it is while a link is in trouble and for a while
+ * after; on a link that keeps up, input goes out as it comes.
+ *
+ * While this device drives a peer, how long its input takes to the peer's
+ * core and back is reported about once a second (mean and worst):
+ *   {"event":"input_latency","peer_id":…,"ms":…,"worst_ms":…,"samples":…}
+ *
+ * The core stamps timestamp_micros of every LcInputEvent itself for these
+ * (lc_core_send_input ignores what the shell put there).
  */
 bool lc_core_set_remote_control_allowed(LcCore *core, bool allowed);
 

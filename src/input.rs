@@ -57,6 +57,10 @@ impl PlatformInputQueue {
         event.validate()?;
         event.sequence = 0;
         event.reserved = 0;
+        // When the shell handed it over, on one clock for every shell: the
+        // receiving core tells from it how late input arrives (see
+        // `InputTiming`).
+        event.timestamp_micros = monotonic_micros();
         let mut state = self.shared.lock().expect("platform input queue poisoned");
 
         let outcome = if let Some(PlatformEntry::Event(previous)) = state.entries.back_mut()
@@ -183,6 +187,19 @@ impl OutboundInputQueue {
         self.shared.notify.notify_one();
     }
 
+    /// Only relative motion and scrolling wait, which merge with what comes
+    /// next (see `coalesce`): they may be held back for a moment, unlike
+    /// keys, buttons, resets and the absolute move that places the pointer.
+    pub fn only_motion(&self) -> bool {
+        let state = self.shared.state.lock().expect("input queue poisoned");
+        !state.entries.is_empty()
+            && state.entries.iter().all(|entry| {
+                matches!(entry, ScheduledInput::Event(event)
+                    if event.is_coalescible()
+                        && event.flags & LC_INPUT_FLAG_ABSOLUTE_POSITION == 0)
+            })
+    }
+
     pub fn pop_message(&self) -> Option<WireMessage> {
         let mut state = self.shared.state.lock().expect("input queue poisoned");
         let first = state.entries.pop_front()?;
@@ -228,6 +245,17 @@ impl OutboundInputQueue {
     }
 }
 
+/// Microseconds on a clock that only moves forward, from an arbitrary start.
+pub(crate) fn monotonic_micros() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // Never 0, which a shell leaves in the field.
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+        + 1
+}
+
 fn take_sequence(state: &mut OutboundState) -> u64 {
     let sequence = state.next_sequence;
     state.next_sequence = state.next_sequence.checked_add(1).unwrap_or(1);
@@ -268,6 +296,122 @@ pub enum SequenceStatus {
     InOrder,
     Duplicate,
     Gap { expected: u64, received: u64 },
+}
+
+/// How late input from a peer arrives: for the `link_quality` event, and to
+/// drop key repeats that come too late to mean anything.
+///
+/// The sending core stamps every event when its shell hands it over. Two
+/// devices' clocks cannot be compared, but the difference between this
+/// device's clock at arrival and the peer's stamp can be compared with
+/// itself: it is smallest for input that came straight through, and input
+/// whose difference is 60 ms above that was held up for 60 ms on the way (a
+/// lost packet sent again, a busy Wi-Fi channel, a busy thread on either
+/// device). That is the stall a user sees as a pointer that stops and then
+/// jumps, and it holds for every event of the burst that follows a stall,
+/// not only the first.
+///
+/// The smallest difference is that of the last minute or so, because the
+/// two clocks drift apart by a few milliseconds a minute.
+#[derive(Default)]
+pub struct InputTiming {
+    /// What this device's clock counts from.
+    origin: Option<std::time::Instant>,
+    /// The smallest difference (arrival minus stamp, in microseconds) in the
+    /// current stretch of [`Self::STRETCH`] and in the one before.
+    smallest: [Option<i64>; 2],
+    /// When the current stretch began.
+    stretch_began: Option<std::time::Instant>,
+    batches: u32,
+    late: u32,
+    worst_micros: u64,
+    stale_repeats: u32,
+}
+
+/// What [`InputTiming`] saw since it was last asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputTimingReport {
+    /// Batches of input that arrived.
+    pub batches: u32,
+    /// Those held up for at least [`InputTiming::LATE_MICROS`].
+    pub late: u32,
+    /// The longest any was held up, in microseconds.
+    pub worst_micros: u64,
+    /// Key repeats dropped because they came too late.
+    pub stale_repeats: u32,
+}
+
+impl InputTiming {
+    /// A batch held up this long counts as late: more than a frame at 60 Hz.
+    pub const LATE_MICROS: u64 = 20_000;
+    /// A key repeat held up this long is not played. A held key repeats
+    /// every 30 to 80 ms; one this late has later ones right behind it, and
+    /// playing them all at once deletes or moves further than the user held
+    /// the key for. The key going down, and up, is always played.
+    pub const STALE_REPEAT_MICROS: u64 = 100_000;
+    const STRETCH: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long the event stamped `stamp` by the peer, arriving at `now`,
+    /// was held up on the way, in microseconds. `None` for an event without
+    /// a stamp.
+    pub fn held_up(&mut self, stamp: u64, now: std::time::Instant) -> Option<u64> {
+        if stamp == 0 {
+            return None;
+        }
+        let origin = *self.origin.get_or_insert(now);
+        if self
+            .stretch_began
+            .is_none_or(|began| now.saturating_duration_since(began) >= Self::STRETCH)
+        {
+            self.stretch_began = Some(now);
+            self.smallest = [None, self.smallest[0]];
+        }
+        let arrival = now.saturating_duration_since(origin).as_micros() as i64;
+        let difference = arrival.saturating_sub(stamp.min(i64::MAX as u64) as i64);
+        let current = self.smallest[0].map_or(difference, |known| known.min(difference));
+        self.smallest[0] = Some(current);
+        let smallest = self.smallest[1].map_or(current, |before| before.min(current));
+        Some(difference.saturating_sub(smallest).max(0) as u64)
+    }
+
+    /// A batch arrived whose newest event was held up for `held_up`
+    /// microseconds (`None`: not known).
+    pub fn batch(&mut self, held_up: Option<u64>) {
+        self.batches = self.batches.saturating_add(1);
+        if let Some(held_up) = held_up {
+            self.worst_micros = self.worst_micros.max(held_up);
+            if held_up >= Self::LATE_MICROS {
+                self.late = self.late.saturating_add(1);
+            }
+        }
+    }
+
+    /// Whether a key repeat held up for `held_up` is dropped, and counts it.
+    pub fn stale_repeat(&mut self, held_up: Option<u64>) -> bool {
+        let stale = held_up.is_some_and(|held_up| held_up >= Self::STALE_REPEAT_MICROS);
+        if stale {
+            self.stale_repeats = self.stale_repeats.saturating_add(1);
+        }
+        stale
+    }
+
+    /// What arrived since the last call; `None` if nothing did.
+    pub fn take(&mut self) -> Option<InputTimingReport> {
+        if self.batches == 0 {
+            return None;
+        }
+        let report = InputTimingReport {
+            batches: self.batches,
+            late: self.late,
+            worst_micros: self.worst_micros,
+            stale_repeats: self.stale_repeats,
+        };
+        self.batches = 0;
+        self.late = 0;
+        self.worst_micros = 0;
+        self.stale_repeats = 0;
+        Some(report)
+    }
 }
 
 #[derive(Default)]
@@ -373,5 +517,99 @@ impl RemoteInputState {
             });
         }
         events
+    }
+}
+
+/// How long input takes to a driven peer and back, from its `InputEcho`
+/// messages, for the `input_latency` event.
+#[derive(Default)]
+pub struct RoundTrips {
+    samples: u32,
+    total_micros: u64,
+    worst_micros: u64,
+}
+
+impl RoundTrips {
+    /// An echo of the input stamped `stamp` (this device's clock) came back
+    /// at `now` (the same clock).
+    pub fn echoed(&mut self, stamp: u64, now: u64) {
+        // A stamp from the future or from long ago is not this core's.
+        let Some(micros) = now.checked_sub(stamp).filter(|micros| *micros < 10_000_000) else {
+            return;
+        };
+        self.samples += 1;
+        self.total_micros += micros;
+        self.worst_micros = self.worst_micros.max(micros);
+    }
+
+    /// Since the last call: how many echoes, their mean and their worst, in
+    /// microseconds. `None` if none came.
+    pub fn take(&mut self) -> Option<(u32, u64, u64)> {
+        let taken = std::mem::take(self);
+        (taken.samples > 0).then(|| {
+            (
+                taken.samples,
+                taken.total_micros / u64::from(taken.samples),
+                taken.worst_micros,
+            )
+        })
+    }
+}
+
+/// Whether motion to a peer is paced (sent at most every `MOTION_INTERVAL`,
+/// merged in between; see `transport.rs`) or sent as it comes.
+///
+/// On a link that keeps up, every report of the mouse goes out at once:
+/// nothing is gained by holding it. Pacing is for a link in trouble, where
+/// a thousand small packets a second make the trouble worse. So it starts
+/// when the link shows trouble and lasts a while after the last sign of it.
+/// If trouble comes back soon after pacing stopped, the unpaced motion was
+/// probably its cause, and pacing then lasts twice as long, up to
+/// [`Self::LONGEST`]: a link that only works paced ends up paced.
+pub struct MotionPacing {
+    /// Paced until then.
+    until: Option<std::time::Instant>,
+    /// How long pacing lasts after the last trouble.
+    hold: std::time::Duration,
+    /// When pacing last stopped.
+    stopped: Option<std::time::Instant>,
+}
+
+impl Default for MotionPacing {
+    fn default() -> Self {
+        Self {
+            until: None,
+            hold: Self::SHORTEST,
+            stopped: None,
+        }
+    }
+}
+
+impl MotionPacing {
+    pub const SHORTEST: std::time::Duration = std::time::Duration::from_secs(30);
+    pub const LONGEST: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Looks at the link once (every second): `trouble` if packets were
+    /// lost, input arrived late or the round trip grew. Returns whether
+    /// motion is paced from now.
+    pub fn observe(&mut self, trouble: bool, now: std::time::Instant) -> bool {
+        let paced = self.until.is_some_and(|until| now < until);
+        if !paced && self.until.take().is_some() {
+            self.stopped = Some(now);
+        }
+        if trouble {
+            if !paced {
+                let soon = self
+                    .stopped
+                    .is_some_and(|stopped| now.saturating_duration_since(stopped) < self.hold * 2);
+                self.hold = if soon {
+                    (self.hold * 2).min(Self::LONGEST)
+                } else {
+                    Self::SHORTEST
+                };
+            }
+            self.until = Some(now + self.hold);
+        }
+        self.until.is_some()
     }
 }

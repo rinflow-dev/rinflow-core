@@ -14,6 +14,9 @@ First public version.
 - Arrangement sync: placements, portals and chained devices
 - Clipboard and on-demand file transfer over a separate data link
 - C ABI (version 10) and Android JNI bindings
+- Smoother pointer on busy links: while a link is in trouble, motion is sent at most every 4 ms (merged in between) instead of as it comes; acknowledgements of input are fewer and sooner; and the core's threads run above normal priority
+- Key repeats held up on the way for 100 ms or more are not played, so a held Backspace or arrow key no longer overshoots after a stall
+- `link_quality`: an event for every second in which packets were lost or input arrived late, to tell why a pointer stuttered; `input_latency`: how long input takes to a driven peer and back
 - A stable `reason_code` beside every event `reason` and `error` message, so shells can show them in the user's language
 
 ### Known issues

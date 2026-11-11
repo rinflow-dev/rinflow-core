@@ -72,14 +72,15 @@ fn endpoint(
     let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))
         .map_err(|error| format!("UDP port {port}: {error}"))?;
     let qos = Qos::udp(&socket, class);
+    let interactive = class == TrafficClass::Interactive;
     let runtime = quinn::default_runtime().ok_or("no async runtime for QUIC")?;
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
-        Some(identity.server_config()?),
+        Some(identity.server_config(interactive)?),
         socket,
         runtime,
     )
     .map_err(|error| error.to_string())?;
-    endpoint.set_default_client_config(identity.client_config()?);
+    endpoint.set_default_client_config(identity.client_config(interactive)?);
     Ok((endpoint, qos))
 }
