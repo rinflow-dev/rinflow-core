@@ -1261,6 +1261,10 @@ mod tests {
         // ago no longer does.
         assert_eq!(timing.held_up(stamp(40_000), at(40_004)), Some(3_000));
         assert_eq!(timing.held_up(stamp(80_000), at(80_004)), Some(0));
+        // After an hour of silence the clocks are 90 ms further apart:
+        // nothing from before says how long this input took.
+        assert_eq!(timing.held_up(stamp(3_680_000), at(3_680_094)), Some(0));
+        assert_eq!(timing.held_up(stamp(3_680_033), at(3_680_127)), Some(0));
 
         // Batches: late from 20 ms, and a key repeat is stale from 100 ms.
         timing.batch(Some(0));

@@ -359,12 +359,17 @@ impl InputTiming {
             return None;
         }
         let origin = *self.origin.get_or_insert(now);
-        if self
+        let since = self
             .stretch_began
-            .is_none_or(|began| now.saturating_duration_since(began) >= Self::STRETCH)
-        {
+            .map(|began| now.saturating_duration_since(began));
+        if since.is_none_or(|since| since >= Self::STRETCH) {
             self.stretch_began = Some(now);
-            self.smallest = [None, self.smallest[0]];
+            // After a longer silence the stretch before is too old as well:
+            // the clocks have drifted since, and input that came straight
+            // through would look held up by that much.
+            let before =
+                self.smallest[0].filter(|_| since.is_some_and(|since| since < Self::STRETCH * 2));
+            self.smallest = [None, before];
         }
         let arrival = now.saturating_duration_since(origin).as_micros() as i64;
         let difference = arrival.saturating_sub(stamp.min(i64::MAX as u64) as i64);
