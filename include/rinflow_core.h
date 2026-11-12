@@ -6,6 +6,7 @@
 #define RINFLOW_CORE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -107,6 +108,18 @@ _Static_assert(sizeof(LcInputEvent) == 96, "LcInputEvent ABI layout changed");
 typedef void (*LcEventCallback)(const char *json, void *context);
 typedef void (*LcInputCallback)(const LcInputEvent *event, void *context);
 
+/* One frame of a watched picture (docs/media.md), valid until the callback
+ * returns. */
+typedef struct LcMediaFrame {
+    uint8_t key_frame; /* 1: a decoder can start from this frame */
+    uint8_t reserved[7];
+    uint64_t sequence; /* counts the source's frames; a gap: frames were skipped */
+    uint64_t timestamp_micros; /* the source's clock */
+    const uint8_t *data;
+    size_t length;
+} LcMediaFrame;
+typedef void (*LcMediaCallback)(const char *peer_id, const LcMediaFrame *frame, void *context);
+
 uint32_t lc_core_abi_version(void);
 LcCore *lc_core_create(
     const char *config_json,
@@ -116,6 +129,24 @@ LcCore *lc_core_create(
 );
 
 void lc_core_destroy(LcCore *core);
+
+/* Pictures (docs/media.md). Watching, with config key "media": frames of
+ * watched pictures go to the callback, on the core's threads, in order. */
+bool lc_core_set_media_callback(LcCore *core, LcMediaCallback callback, void *context);
+/* After the event media_available; media_started and media_ended follow. */
+bool lc_core_watch(LcCore *core, const char *peer_id);
+bool lc_core_unwatch(LcCore *core, const char *peer_id);
+/* The decoder lost its place: ask the watched peer for a key frame. */
+bool lc_core_request_media_key_frame(LcCore *core, const char *peer_id);
+/* A source, with config key "media_source": one encoded frame for every peer
+ * watching (event media_viewers). The bytes are copied. */
+bool lc_core_send_media_frame(
+    LcCore *core,
+    bool key_frame,
+    uint64_t timestamp_micros,
+    const uint8_t *data,
+    size_t length
+);
 
 /* Opens a session with the peer (unless one exists) and makes it the input
  * target. Sessions with other peers stay open. */

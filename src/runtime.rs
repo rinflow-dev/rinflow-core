@@ -15,9 +15,10 @@ use crate::input::{
     SequenceStatus, monotonic_micros,
 };
 use crate::layout::{self, Display, Offset, Side, validate_displays};
+use crate::media::MediaHub;
 use crate::model::{
     Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2,
-    CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
+    CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
     LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
     negotiate_protocol,
 };
@@ -146,6 +147,8 @@ pub enum Command {
 
 pub struct CoreThread {
     commands: mpsc::UnboundedSender<Command>,
+    /// Pictures (see `media.rs`): shared with the core's loop.
+    pub(crate) media: Arc<MediaHub>,
     platform_input: PlatformInputQueue,
     join: Option<JoinHandle<()>>,
 }
@@ -159,6 +162,11 @@ impl CoreThread {
         let (commands, receiver) = mpsc::unbounded_channel();
         let platform_input = PlatformInputQueue::new();
         let runtime_input = platform_input.clone();
+        let media = {
+            let sink = sink.clone();
+            MediaHub::new(move |value| sink.emit_value(value))
+        };
+        let runtime_media = media.clone();
         let join = std::thread::Builder::new()
             .name("rinflow-core".to_owned())
             .spawn(move || {
@@ -177,12 +185,13 @@ impl CoreThread {
                         return;
                     }
                 };
-                runtime.block_on(run(config, receiver, runtime_input, sink));
+                runtime.block_on(run(config, receiver, runtime_input, sink, runtime_media));
             })
             .map_err(|error| error.to_string())?;
 
         Ok(Self {
             commands,
+            media,
             platform_input,
             join: Some(join),
         })
@@ -249,6 +258,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     platform_input: PlatformInputQueue,
     sink: EventSink,
+    media: Arc<MediaHub>,
 ) {
     let udp = match create_discovery_socket(config.discovery_port) {
         Ok(socket) => socket,
@@ -271,7 +281,11 @@ async fn run(
             return;
         }
     };
-    let quic = match QuicEndpoints::bind(config.control_port, &identity) {
+    let quic = match QuicEndpoints::bind(
+        config.control_port,
+        &identity,
+        config.media || config.media_source,
+    ) {
         Ok(endpoints) => endpoints,
         Err(error) => {
             sink.emit_error(format!("control port failed: {error}"));
@@ -281,6 +295,11 @@ async fn run(
     };
     let capabilities = config.advertised_capabilities();
     let fingerprint = identity.fingerprint.clone();
+    if let Some((endpoint, _, _)) = &quic.media {
+        media.start(endpoint.clone(), &config.device_id);
+    }
+    // Never ready on a device without pictures.
+    let media_endpoint = quic.media.as_ref().map(|(endpoint, _, _)| endpoint.clone());
 
     let group = Ipv4Addr::from(DISCOVERY_GROUP);
     let multicast = SocketAddr::V4(SocketAddrV4::new(group, config.discovery_port));
@@ -324,6 +343,7 @@ async fn run(
         capabilities,
         fingerprint: fingerprint.clone(),
         quic: quic.clone(),
+        media: media.clone(),
         trusted: config
             .trusted_peers
             .iter()
@@ -427,6 +447,13 @@ async fn run(
                     accept_in_background(incoming, true, state.connection_events.clone());
                 }
             }
+            Some(incoming) = accept_media(&media_endpoint) => {
+                if state.asleep() || !config.media_source {
+                    incoming.refuse();
+                } else {
+                    media.accept(incoming);
+                }
+            }
             received = udp.recv_from(&mut buffer) => {
                 if let Ok((length, source)) = received {
                     state.announcement(&buffer[..length], source);
@@ -458,10 +485,19 @@ async fn run(
     }
 
     state.close_all("core stopped");
+    media.stop();
     quic.close();
     // Lets the close reach peers before the runtime goes away.
     let _ = tokio::time::timeout(Duration::from_millis(300), quic.control.wait_idle()).await;
     sink.emit_value(json!({ "event": "stopped" }));
+}
+
+/// The next connection to the media endpoint; never, without one.
+async fn accept_media(endpoint: &Option<quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// One connection to a peer. It is handshaken once the peer's `Hello` has
@@ -576,6 +612,8 @@ struct Runtime<'a> {
     /// This device's certificate fingerprint.
     fingerprint: String,
     quic: QuicEndpoints,
+    /// Pictures (see `media.rs`).
+    media: Arc<MediaHub>,
     /// Paired peers: device ID to certificate fingerprint.
     trusted: HashMap<String, String>,
     require_pairing: bool,
@@ -1557,6 +1595,7 @@ impl Runtime<'_> {
                 | WireMessage::PairReveal { .. } => {}
                 WireMessage::ScreenInfo { .. }
                 | WireMessage::Placement { .. }
+                | WireMessage::MediaOffer { .. }
                 | WireMessage::DataInvite { .. } => {
                     let kind = std::mem::discriminant(&message);
                     session
@@ -1640,6 +1679,19 @@ impl Runtime<'_> {
                 }
             }
             WireMessage::DataInvite { token, port } => self.data_invited(id, token, port),
+            // The peer has a picture, for when the shell wants to watch.
+            WireMessage::MediaOffer { token, port } => {
+                if self.config.media
+                    && let Some(peer_id) = session.peer_id()
+                {
+                    let address = SocketAddr::new(session.connection.remote.ip(), port);
+                    if let Some((_, _, qos)) = &self.quic.media {
+                        qos.add_destination(address);
+                    }
+                    self.media
+                        .offered(peer_id, address, token, &session.connection.fingerprint);
+                }
+            }
             WireMessage::ControlRevoke { handoff } => self.control_revoked(id, handoff),
             // The peer got input this device stamped, and says so at once.
             WireMessage::InputEcho { stamp } => {
@@ -1914,12 +1966,40 @@ impl Runtime<'_> {
         }
         self.send_placement(&peer_id);
         self.invite_data_link(id);
+        self.offer_media(id);
         // What the peer sent while it waited for this side.
         for message in held {
             self.message(id, message, None);
         }
         // A disconnect held back for this peer is moot now.
         self.flush_disconnects(false);
+    }
+
+    /// Offers this device's picture to a peer that can watch it.
+    fn offer_media(&mut self, id: u64) {
+        let (Some(session), Some((_, port, qos))) = (self.sessions.get(&id), &self.quic.media)
+        else {
+            return;
+        };
+        if !self.config.media_source
+            || !session.established()
+            || session.connection.capabilities & CAPABILITY_MEDIA == 0
+        {
+            return;
+        }
+        let Some(peer_id) = session.peer_id() else {
+            return;
+        };
+        // The peer dials from its own media endpoint, at its session's address.
+        qos.add_destination(SocketAddr::new(session.connection.remote.ip(), 0));
+        if let Some(token) = self
+            .media
+            .offer_to(peer_id, &session.connection.fingerprint)
+        {
+            let _ = session
+                .connection
+                .send_control(WireMessage::MediaOffer { token, port: *port });
+        }
     }
 
     fn emit_connected(&self, id: u64) {
@@ -1998,6 +2078,10 @@ impl Runtime<'_> {
         );
         if let Some(peer_id) = &peer_id {
             self.session_ended(peer_id, reason);
+            // Unless another session with the same peer carries on.
+            if self.established_session(peer_id).is_none() {
+                self.media.session_ended(peer_id);
+            }
         }
         // An automatic attempt the shell never heard of ends quietly, unless
         // the device turned out not to be the one paired.

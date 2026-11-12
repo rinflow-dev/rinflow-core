@@ -18,6 +18,8 @@ First public version.
 - Key repeats held up on the way for 100 ms or more are not played, so a held Backspace or arrow key no longer overshoots after a stall
 - `link_quality`: an event for every second in which packets were lost or input arrived late, to tell why a pointer stuttered; `input_latency`: how long input takes to a driven peer and back
 - A stable `reason_code` beside every event `reason` and `error` message, so shells can show them in the user's language
+- Pictures: a device with one (`media_source`, such as a KVM) sends encoded frames to the peers that watch it (`media`) over a media link of its own, where late frames are dropped rather than queued
+- ChaCha20-Poly1305 is preferred on processors without AES instructions
 
 ### Known issues
 

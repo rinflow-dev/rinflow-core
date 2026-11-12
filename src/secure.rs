@@ -131,6 +131,29 @@ impl Identity {
     /// Accepts connections; asks every client for its certificate.
     /// `interactive`: for the control endpoint (see [`transport`]).
     pub fn server_config(&self, interactive: bool) -> Result<quinn::ServerConfig, String> {
+        self.server_with(transport(true, interactive))
+    }
+
+    /// Dials; shows this device's certificate to the server.
+    pub fn client_config(&self, interactive: bool) -> Result<quinn::ClientConfig, String> {
+        self.client_with(transport(false, interactive))
+    }
+
+    /// For the media endpoint (see `media.rs`): the side that accepts a
+    /// media link sends the picture.
+    pub fn media_server_config(&self) -> Result<quinn::ServerConfig, String> {
+        self.server_with(media_transport(false))
+    }
+
+    /// For the media endpoint: the side that dials a media link watches.
+    pub fn media_client_config(&self) -> Result<quinn::ClientConfig, String> {
+        self.client_with(media_transport(true))
+    }
+
+    fn server_with(
+        &self,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> Result<quinn::ServerConfig, String> {
         let provider = provider();
         let mut crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -139,14 +162,19 @@ impl Identity {
             .with_single_cert(vec![self.certificate.clone()], self.key.clone_key())
             .map_err(|error| error.to_string())?;
         crypto.alpn_protocols = vec![ALPN.to_vec()];
+        // The cipher is the client's choice unless this side has the
+        // stronger reason (see [`provider`]).
+        crypto.ignore_client_order = !HARDWARE_AES;
         let crypto = QuicServerConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(transport(true, interactive));
+        config.transport_config(transport);
         Ok(config)
     }
 
-    /// Dials; shows this device's certificate to the server.
-    pub fn client_config(&self, interactive: bool) -> Result<quinn::ClientConfig, String> {
+    fn client_with(
+        &self,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> Result<quinn::ClientConfig, String> {
         let provider = provider();
         let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -158,13 +186,64 @@ impl Identity {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let crypto = QuicClientConfig::try_from(crypto).map_err(|error| error.to_string())?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(transport(false, interactive));
+        config.transport_config(transport);
         Ok(config)
     }
 }
 
+/// Whether this processor encrypts AES in hardware, as every PC, Mac and
+/// phone of the last decade does. One that does not (a RISC-V or 32-bit ARM
+/// board, such as a KVM) takes twice as long over AES-GCM as over
+/// ChaCha20-Poly1305: measured on a 1 GHz RISC-V core sending 4 Mbit/s,
+/// 23 % of the core against 13 %.
+const HARDWARE_AES: bool = cfg!(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64"
+));
+
+/// rustls with ring. On a processor without hardware AES, ChaCha20-Poly1305
+/// goes first: as the dialing side that is the order it asks in, which the
+/// other side follows, and as the accepting side its own order decides
+/// (`ignore_client_order`). On every other processor nothing changes.
 fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    let mut provider = rustls::crypto::ring::default_provider();
+    if !HARDWARE_AES {
+        provider.cipher_suites.sort_by_key(|suite| {
+            suite.suite() != rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        });
+    }
+    Arc::new(provider)
+}
+
+/// How much of a picture a watching device takes ahead of what it read:
+/// a key frame of a busy 1080p screen is a few hundred kilobytes.
+const MEDIA_RECEIVE_WINDOW: u32 = 8 << 20;
+/// Frames in flight at once on a media link. Each is a stream of its own.
+const MEDIA_STREAMS: u32 = 16;
+
+/// A media link (see `media.rs`): the dialer opens one bidirectional stream
+/// to say who it is and to ask for key frames, and the accepting side sends
+/// each frame on a unidirectional stream. Nothing else, either way.
+fn media_transport(watching: bool) -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(IDLE_TIMEOUT.try_into().ok());
+    transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(u32::from(!watching)));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(if watching {
+        MEDIA_STREAMS
+    } else {
+        0
+    }));
+    let window = if watching {
+        MEDIA_RECEIVE_WINDOW
+    } else {
+        64 * 1024
+    };
+    transport.stream_receive_window(quinn::VarInt::from_u32(window));
+    transport.receive_window(quinn::VarInt::from_u32(window));
+    transport.datagram_receive_buffer_size(None);
+    Arc::new(transport)
 }
 
 /// A connection carries one bidirectional stream, which the dialer opens,

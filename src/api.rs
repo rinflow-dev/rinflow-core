@@ -4,6 +4,7 @@
 
 use crate::clipboard::Clipboard;
 use crate::layout::{Display, Offset, Side};
+use crate::media::MediaFrame;
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::remap::ModifierMap;
 use crate::runtime::{Command, CoreThread, EventSink};
@@ -205,6 +206,38 @@ impl Core {
     /// longer does): peers driving it report `peer_pointer_lock`.
     pub fn set_pointer_locked(&self, locked: bool) -> Result<(), String> {
         self.thread.send(Command::SetPointerLocked(locked))
+    }
+
+    /// Where the frames of watched pictures go (see `media.rs`): called
+    /// with the peer's device ID, on the core's threads, in order. Set it
+    /// before `watch`.
+    pub fn set_media_sink(&self, sink: impl Fn(&str, MediaFrame) + Send + Sync + 'static) {
+        self.thread.media.set_frame_sink(std::sync::Arc::new(sink));
+    }
+
+    /// Starts watching a peer's picture, once it has offered one
+    /// (`media_available`). `media_started` and `media_ended` follow.
+    /// Needs `CoreConfig::media`.
+    pub fn watch(&self, peer_id: &str) -> Result<(), String> {
+        self.thread.media.watch(peer_id)
+    }
+
+    pub fn unwatch(&self, peer_id: &str) {
+        self.thread.media.unwatch(peer_id);
+    }
+
+    /// Asks a watched peer for a key frame: the decoder lost its place.
+    pub fn request_media_key_frame(&self, peer_id: &str) -> Result<(), String> {
+        self.thread.media.request_key_frame(peer_id)
+    }
+
+    /// One encoded frame of this device's picture, for every peer watching
+    /// it (`media_viewers` says who). Needs `CoreConfig::media_source`.
+    /// Goes straight to the links: it does not wait for the core's loop.
+    pub fn send_media_frame(&self, key_frame: bool, timestamp_micros: u64, data: Vec<u8>) {
+        self.thread
+            .media
+            .send_frame(key_frame, timestamp_micros, data);
     }
 
     pub fn send_input(&self, event: LcInputEvent) -> Result<(), String> {

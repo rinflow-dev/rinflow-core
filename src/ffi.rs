@@ -441,3 +441,129 @@ pub unsafe extern "C" fn lc_core_reset_input(core: *mut LcCore) -> bool {
     }))
     .unwrap_or(false)
 }
+
+/// One frame of a watched picture, for the call's duration only.
+#[repr(C)]
+pub struct LcMediaFrame {
+    /// 1 when a decoder can start from this frame.
+    pub key_frame: u8,
+    pub reserved: [u8; 7],
+    /// Counts the source's frames: a gap means frames were skipped.
+    pub sequence: u64,
+    /// The source's clock, in microseconds.
+    pub timestamp_micros: u64,
+    pub data: *const u8,
+    pub length: usize,
+}
+
+pub type LcMediaCallback = Option<extern "C" fn(*const c_char, *const LcMediaFrame, *mut c_void)>;
+
+/// Pictures (see `media.rs`): where the frames of watched pictures go. The
+/// callback runs on the core's threads, in order, with the peer's device ID;
+/// the frame and its bytes are valid until it returns. Set it before
+/// `lc_core_watch`. Config key `media`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_media_callback(
+    core: *mut LcCore,
+    callback: LcMediaCallback,
+    context: *mut c_void,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let context_address = context as usize;
+        core.thread
+            .media
+            .set_frame_sink(std::sync::Arc::new(move |peer_id: &str, frame| {
+                let (Some(callback), Ok(peer_id)) = (callback, CString::new(peer_id)) else {
+                    return;
+                };
+                let frame = LcMediaFrame {
+                    key_frame: u8::from(frame.key_frame),
+                    reserved: [0; 7],
+                    sequence: frame.sequence,
+                    timestamp_micros: frame.timestamp_micros,
+                    data: frame.data.as_ptr(),
+                    length: frame.data.len(),
+                };
+                callback(peer_id.as_ptr(), &frame, context_address as *mut c_void);
+            }));
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Starts watching a peer's picture, once it offered one
+/// (`media_available`); `media_started` and `media_ended` follow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_watch(core: *mut LcCore, peer_id: *const c_char) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        !core.is_null() && unsafe { &*core }.thread.media.watch(&peer_id).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_unwatch(core: *mut LcCore, peer_id: *const c_char) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        if core.is_null() {
+            return false;
+        }
+        unsafe { &*core }.thread.media.unwatch(&peer_id);
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Asks a watched peer for a key frame: the decoder lost its place.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_request_media_key_frame(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        !core.is_null()
+            && unsafe { &*core }
+                .thread
+                .media
+                .request_key_frame(&peer_id)
+                .is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// One encoded frame of this device's picture, for every peer watching it
+/// (`media_viewers`). The bytes are copied. Config key `media_source`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_send_media_frame(
+    core: *mut LcCore,
+    key_frame: bool,
+    timestamp_micros: u64,
+    data: *const u8,
+    length: usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() || data.is_null() || length > crate::media::MAX_FRAME_BYTES {
+            return false;
+        }
+        // SAFETY: the caller passes `length` readable bytes at `data`.
+        let data = unsafe { std::slice::from_raw_parts(data, length) }.to_vec();
+        unsafe { &*core }
+            .thread
+            .media
+            .send_frame(key_frame, timestamp_micros, data);
+        true
+    }))
+    .unwrap_or(false)
+}

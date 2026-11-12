@@ -19,6 +19,7 @@
 | 21 | `PairNonce` | 32 bytes: the other side's nonce, sent once it holds the commitment. |
 | 22 | `PairReveal` | 32 bytes: the dialer's nonce, sent once it holds the other side's. |
 | 29 | `InputEcho` | The `timestamp_micros` (`u64`) of the newest input event the sender just received, unchanged: from a driven device to the one driving it, at most every 100 ms. Only to peers with capability bit 13 (`INPUT_ECHO`). |
+| 30 | `MediaOffer` | Token (`u64`) and the UDP port (`u16`) of the sender's media endpoint, where its picture can be watched ([media.md](media.md)). Only to peers with capability bit 14 (`MEDIA`). |
 
 Types 8–13 are the clipboard and file messages of the data link ([clipboard-and-files.md](clipboard-and-files.md)). `DataInvite` (type 9) carries the token (`u64`) and the UDP port (`u16`, never 0) of the core's second endpoint, where the data link goes.
 

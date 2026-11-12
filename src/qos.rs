@@ -23,6 +23,10 @@
 //!   unconnected socket only per destination, so each peer the endpoint
 //!   talks to is added ([`Qos::add_destination`]).
 //!
+//! A third endpoint carries pictures (`media.rs`), tagged video: after
+//! input, before bulk (`NET_SERVICE_TYPE_VI`; DSCP AF41 and priority 5;
+//! qWAVE audio/video).
+//!
 //! All of it is best effort: a socket that cannot be tagged works as before.
 
 use std::net::SocketAddr;
@@ -33,6 +37,9 @@ pub enum TrafficClass {
     Interactive,
     /// Clipboards and files: large, latency-tolerant.
     Bulk,
+    /// A device's picture (see `media.rs`): steady, and late is useless,
+    /// but behind input.
+    Video,
 }
 
 /// The class of one UDP socket. The socket must stay open as long as this
@@ -90,12 +97,14 @@ mod platform {
     // <sys/socket.h>
     pub const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
     pub const NET_SERVICE_TYPE_BK: libc::c_int = 1;
+    const NET_SERVICE_TYPE_VI: libc::c_int = 3;
     const NET_SERVICE_TYPE_VO: libc::c_int = 4;
 
     pub fn set(qos: &Qos) {
         let value = match qos.class {
             TrafficClass::Interactive => NET_SERVICE_TYPE_VO,
             TrafficClass::Bulk => NET_SERVICE_TYPE_BK,
+            TrafficClass::Video => NET_SERVICE_TYPE_VI,
         };
         // SAFETY: an int option on a socket the endpoint keeps open.
         unsafe {
@@ -115,12 +124,13 @@ mod platform {
     use super::{Qos, TrafficClass};
 
     pub fn set(qos: &Qos) {
-        // DSCP EF (46) or CS1 (8), in the upper six bits of the TOS byte;
-        // queue priority 6 or 1 (Wi-Fi drivers map them to voice and
-        // background).
+        // DSCP EF (46), CS1 (8) or AF41 (34), in the upper six bits of the
+        // TOS byte; queue priority 6, 1 or 5 (Wi-Fi drivers map them to
+        // voice, background and video).
         let (tos, priority): (libc::c_int, libc::c_int) = match qos.class {
             TrafficClass::Interactive => (46 << 2, 6),
             TrafficClass::Bulk => (8 << 2, 1),
+            TrafficClass::Video => (34 << 2, 5),
         };
         // SAFETY: int options on a socket the endpoint keeps open.
         unsafe {
@@ -149,7 +159,8 @@ mod platform {
     use std::sync::OnceLock;
     use windows_sys::Win32::NetworkManagement::QoS::{
         QOS_NON_ADAPTIVE_FLOW, QOS_VERSION, QOSAddSocketToFlow, QOSCreateHandle,
-        QOSRemoveSocketFromFlow, QOSTrafficTypeBackground, QOSTrafficTypeVoice,
+        QOSRemoveSocketFromFlow, QOSTrafficTypeAudioVideo, QOSTrafficTypeBackground,
+        QOSTrafficTypeVoice,
     };
     use windows_sys::Win32::Networking::WinSock::SOCKET;
 
@@ -180,6 +191,7 @@ mod platform {
         let traffic = match qos.class {
             TrafficClass::Interactive => QOSTrafficTypeVoice,
             TrafficClass::Bulk => QOSTrafficTypeBackground,
+            TrafficClass::Video => QOSTrafficTypeAudioVideo,
         };
         let target = socket2::SockAddr::from(address);
         let mut id = 0;

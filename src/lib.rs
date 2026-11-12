@@ -9,6 +9,7 @@ mod file_stream;
 mod files;
 mod input;
 pub mod layout;
+pub mod media;
 mod model;
 mod priority;
 mod protocol;
@@ -28,12 +29,13 @@ pub use clipboard::{
     CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardFormat, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
     MIME_TEXT,
 };
-pub use ffi::{LcCore, LcEventCallback, LcInputCallback};
+pub use ffi::{LcCore, LcEventCallback, LcInputCallback, LcMediaCallback, LcMediaFrame};
 pub use file_stream::{MAX_READ_SIZE, RemoteFileLease};
 pub use files::MIME_URI_LIST;
 pub use files::{
     Entry as FileEntry, Manifest as FileManifest, sanitize_name as sanitize_file_name,
 };
+pub use media::MediaFrame;
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -389,6 +391,135 @@ mod tests {
         let length = zero.len();
         zero[length - 2..].fill(0);
         assert!(decode_message(&zero).is_err());
+    }
+
+    #[test]
+    fn media_offers_round_trip() {
+        let offer = WireMessage::MediaOffer {
+            token: 0x0123_4567_89AB_CDEF,
+            port: 50_123,
+        };
+        let bytes = encode_message(&offer).expect("encode");
+        assert_eq!(decode_message(&bytes).expect("decode"), offer);
+        assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// A device with a picture offers it to a peer that can watch; the
+    /// peer's shell asks, and frames arrive whole and in order from the
+    /// first key frame on. Asking for a key frame reaches the source's
+    /// shell, and the end of watching both.
+    #[test]
+    fn a_picture_reaches_the_peer_that_watches_it() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut source = test_core_with("picture-source", discovery_port, |config| {
+            config.media_source = true;
+        });
+        let mut watcher = test_core_with("picture-watcher", discovery_port, |config| {
+            config.media = true;
+        });
+        let (frames_tx, frames) = mpsc::channel();
+        watcher
+            .thread
+            .media
+            .set_frame_sink(std::sync::Arc::new(move |peer: &str, frame| {
+                let _ = frames_tx.send((peer.to_owned(), frame));
+            }));
+
+        wait_for_peers(&watcher, &["picture-source"]);
+        watcher
+            .thread
+            .send(Command::Connect("picture-source".into()))
+            .unwrap();
+        wait_for_event(&watcher.events, Duration::from_secs(6), |event| {
+            event["event"] == "media_available" && event["peer_id"] == "picture-source"
+        });
+        watcher.thread.media.watch("picture-source").expect("watch");
+        wait_for_event(&watcher.events, Duration::from_secs(6), |event| {
+            event["event"] == "media_started"
+        });
+        wait_for_event(&source.events, Duration::from_secs(6), |event| {
+            event["event"] == "media_viewers" && event["peer_ids"][0] == "picture-watcher"
+        });
+        // A new viewer starts from a key frame, and the shell hears so.
+        wait_for_event(&source.events, Duration::from_secs(2), |event| {
+            event["event"] == "media_key_frame_wanted"
+        });
+
+        // The first is no key frame: nothing a decoder could start from.
+        let big = pattern(300_000, 7);
+        source.thread.media.send_frame(false, 1_000, vec![1; 100]);
+        source.thread.media.send_frame(true, 2_000, big.clone());
+        source.thread.media.send_frame(false, 3_000, vec![3; 100]);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let (peer, frame) = frames
+                .recv_timeout(Duration::from_secs(4))
+                .expect("a frame");
+            assert_eq!(peer, "picture-source");
+            got.push(frame);
+        }
+        assert!(got[0].key_frame && !got[1].key_frame);
+        assert_eq!((got[0].sequence, got[1].sequence), (2, 3));
+        assert_eq!(
+            (got[0].timestamp_micros, got[1].timestamp_micros),
+            (2_000, 3_000)
+        );
+        assert_eq!(got[0].data, big);
+        assert_eq!(got[1].data, vec![3; 100]);
+
+        // The watching shell's decoder lost its place.
+        watcher
+            .thread
+            .media
+            .request_key_frame("picture-source")
+            .expect("request");
+        wait_for_event(&source.events, Duration::from_secs(4), |event| {
+            event["event"] == "media_key_frame_wanted"
+        });
+        // Frames are skipped until the key frame comes.
+        source.thread.media.send_frame(false, 4_000, vec![4; 100]);
+        source.thread.media.send_frame(true, 5_000, vec![5; 100]);
+        let (_, frame) = frames
+            .recv_timeout(Duration::from_secs(4))
+            .expect("a frame");
+        assert_eq!((frame.sequence, frame.key_frame), (5, true));
+
+        watcher.thread.media.unwatch("picture-source");
+        wait_for_event(&watcher.events, Duration::from_secs(4), |event| {
+            event["event"] == "media_ended" && event["peer_id"] == "picture-source"
+        });
+        wait_for_event(&source.events, Duration::from_secs(4), |event| {
+            event["event"] == "media_viewers" && event["peer_ids"] == serde_json::json!([])
+        });
+
+        source.thread.stop_and_join();
+        watcher.thread.stop_and_join();
+    }
+
+    /// Without `media` a device announces no such capability, is offered no
+    /// picture, and has none to watch.
+    #[test]
+    fn a_device_that_cannot_watch_is_offered_nothing() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut source = test_core_with("offer-source", discovery_port, |config| {
+            config.media_source = true;
+        });
+        let mut plain = test_core("offer-plain", discovery_port);
+        wait_for_peers(&plain, &["offer-source"]);
+        plain
+            .thread
+            .send(Command::Connect("offer-source".into()))
+            .unwrap();
+        wait_connected(&plain, "offer-source");
+        // Long enough for an offer to have come.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(events_named(&plain, "media_available").is_empty());
+        assert!(plain.thread.media.watch("offer-source").is_err());
+
+        source.thread.stop_and_join();
+        plain.thread.stop_and_join();
     }
 
     #[test]
@@ -1473,7 +1604,7 @@ mod tests {
             let runtime = tokio::runtime::Runtime::new().expect("stranger runtime");
             let (endpoints, connection, send) = runtime.block_on(async {
                 let identity = crate::secure::Identity::load_or_create(None, "stranger").unwrap();
-                let endpoints = crate::quic::QuicEndpoints::bind(0, &identity).unwrap();
+                let endpoints = crate::quic::QuicEndpoints::bind(0, &identity, false).unwrap();
                 let connection = endpoints
                     .control
                     .connect(([127, 0, 0, 1], port).into(), crate::secure::SERVER_NAME)
@@ -1501,7 +1632,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("stranger runtime");
         runtime.block_on(async {
             let identity = crate::secure::Identity::load_or_create(None, "stranger").unwrap();
-            let endpoints = crate::quic::QuicEndpoints::bind(0, &identity).unwrap();
+            let endpoints = crate::quic::QuicEndpoints::bind(0, &identity, false).unwrap();
             let connection = endpoints
                 .control
                 .connect(

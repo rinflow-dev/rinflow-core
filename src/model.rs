@@ -58,6 +58,9 @@ pub const CAPABILITY_FILE_STREAMS: u64 = 1 << 12;
 /// received straight back, and the driving device measures how long input
 /// takes there and back (`input_latency`).
 pub const CAPABILITY_INPUT_ECHO: u64 = 1 << 13;
+/// Understands `MediaOffer` and can watch a device's picture over a media
+/// link (see `media.rs`). Announced with `CoreConfig::media`.
+pub const CAPABILITY_MEDIA: u64 = 1 << 14;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -160,6 +163,12 @@ pub struct CoreConfig {
     /// or IPv4 addresses, optionally with the discovery port (`host:port`).
     /// See `runtime/manual.rs`.
     pub manual_addresses: Vec<String>,
+    /// The shell can show a peer's picture (`Core::watch`, see `media.rs`).
+    /// Off by default.
+    pub media: bool,
+    /// The shell has a picture to send (`Core::send_media_frame`): peers
+    /// with `media` are offered it. A KVM is one. Off by default.
+    pub media_source: bool,
 }
 
 /// A paired peer: its device ID and the fingerprint of its certificate.
@@ -202,6 +211,8 @@ impl Default for CoreConfig {
             require_pairing: false,
             auto_connect: true,
             manual_addresses: Vec::new(),
+            media: false,
+            media_source: false,
         }
     }
 }
@@ -215,6 +226,9 @@ impl CoreConfig {
         }
         if self.files {
             capabilities |= CAPABILITY_FILES | CAPABILITY_FILE_STREAMS;
+        }
+        if self.media {
+            capabilities |= CAPABILITY_MEDIA;
         }
         capabilities
     }
@@ -589,6 +603,13 @@ pub enum WireMessage {
     /// `CAPABILITY_POINTER_LOCK`.
     PointerLock {
         locked: bool,
+    },
+    /// Control connection, from a device with a picture to one that can
+    /// watch (`CAPABILITY_MEDIA`): the picture is at `port` (the sender's
+    /// media endpoint, UDP) for whoever dials it with this token.
+    MediaOffer {
+        token: u64,
+        port: u16,
     },
     /// From a driven device, a few times a second while input arrives: the
     /// `timestamp_micros` of the newest event it just received, unchanged.
