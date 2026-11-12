@@ -43,7 +43,7 @@
 
 use crate::secure::peer_fingerprint;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -196,6 +196,9 @@ struct State {
     sources: HashMap<String, Source>,
     /// By device ID: the links to the pictures being watched.
     watching: HashMap<String, Watching>,
+    /// By device ID: links being dialed, not yet in `watching`. A second
+    /// `watch` meanwhile must not dial again.
+    connecting: HashSet<String>,
     frame_sink: Option<FrameSink>,
     /// The core's runtime and this device's endpoint, while the core runs.
     running: Option<(tokio::runtime::Handle, quinn::Endpoint, String)>,
@@ -239,6 +242,7 @@ impl MediaHub {
         state.running = None;
         state.offers.clear();
         state.sources.clear();
+        state.connecting.clear();
         for viewer in state.viewers.drain(..) {
             close_viewer(&viewer, "core stopped");
         }
@@ -422,8 +426,8 @@ impl MediaHub {
     /// Starts watching a peer's picture. Its frames go to the frame sink.
     pub fn watch(self: &Arc<Self>, peer_id: &str) -> Result<(), String> {
         let (handle, endpoint, device_id, source) = {
-            let state = self.state();
-            if state.watching.contains_key(peer_id) {
+            let mut state = self.state();
+            if state.watching.contains_key(peer_id) || state.connecting.contains(peer_id) {
                 return Ok(());
             }
             let (handle, endpoint, device_id) = state
@@ -434,12 +438,9 @@ impl MediaHub {
                 .sources
                 .get(peer_id)
                 .ok_or("that device offers no picture")?;
-            (
-                handle,
-                endpoint,
-                device_id,
-                (source.address, source.token, source.fingerprint.clone()),
-            )
+            let source = (source.address, source.token, source.fingerprint.clone());
+            state.connecting.insert(peer_id.to_owned());
+            (handle, endpoint, device_id, source)
         };
         let (hub, peer_id) = (self.clone(), peer_id.to_owned());
         handle.spawn(async move {
@@ -447,7 +448,9 @@ impl MediaHub {
                 Ok(()) => "ended",
                 Err(reason) => reason,
             };
-            hub.state().watching.remove(&peer_id);
+            // `receive` took its own link out of `watching`; a link that
+            // replaced it in the meantime stays.
+            hub.state().connecting.remove(&peer_id);
             (hub.events)(json!({
                 "event": "media_ended",
                 "peer_id": peer_id,
@@ -507,6 +510,7 @@ impl MediaHub {
         let key_frame = Arc::new(Notify::new());
         let sink = {
             let mut state = self.state();
+            state.connecting.remove(peer_id);
             state.watching.insert(
                 peer_id.to_owned(),
                 Watching {
@@ -521,15 +525,15 @@ impl MediaHub {
         // Frames are read in the order their streams were opened, which is
         // the order they were made in.
         let mut last = 0u64;
-        loop {
+        let result = loop {
             let mut stream = tokio::select! {
                 stream = connection.accept_uni() => match stream {
                     Ok(stream) => stream,
-                    Err(_) => break,
+                    Err(_) => break Ok(()),
                 },
                 _ = key_frame.notified() => {
                     if hello.write_all(&[KEY_FRAME_PLEASE]).await.is_err() {
-                        break;
+                        break Ok(());
                     }
                     continue;
                 }
@@ -540,7 +544,7 @@ impl MediaHub {
             };
             let Some(frame) = MediaFrame::decode(bytes) else {
                 connection.close(1u32.into(), b"bad frame");
-                return Err("bad frame");
+                break Err("bad frame");
             };
             // Frames skipped by the source resume at a key frame; anything
             // else out of order would only confuse a decoder.
@@ -551,8 +555,17 @@ impl MediaHub {
             if let Some(sink) = &sink {
                 sink(peer_id, frame);
             }
+        };
+        // This link's own entry only: a second `watch` may have replaced it.
+        let mut state = self.state();
+        if state
+            .watching
+            .get(peer_id)
+            .is_some_and(|watching| watching.connection.stable_id() == connection.stable_id())
+        {
+            state.watching.remove(peer_id);
         }
-        Ok(())
+        result
     }
 
     // ---- Both -----------------------------------------------------------
