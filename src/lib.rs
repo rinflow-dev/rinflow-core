@@ -30,7 +30,10 @@ pub use clipboard::{
     CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardFormat, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
     MIME_TEXT,
 };
-pub use ffi::{LcCore, LcEventCallback, LcInputCallback, LcMediaCallback, LcMediaFrame};
+pub use ffi::{
+    LcCore, LcEventCallback, LcInputCallback, LcMediaAudio, LcMediaAudioCallback, LcMediaCallback,
+    LcMediaFrame,
+};
 pub use file_stream::{MAX_READ_SIZE, RemoteFileLease};
 pub use files::MIME_URI_LIST;
 pub use files::{

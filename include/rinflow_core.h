@@ -142,6 +142,34 @@ bool lc_core_watch(LcCore *core, const char *peer_id);
 bool lc_core_unwatch(LcCore *core, const char *peer_id);
 /* The decoder lost its place: ask the watched peer for a key frame. */
 bool lc_core_request_media_key_frame(LcCore *core, const char *peer_id);
+
+/* A few milliseconds of the sound that goes with a picture (docs/media.md),
+ * valid until the callback returns. */
+typedef struct LcMediaAudio {
+    uint8_t channels; /* 1 or 2 */
+    uint8_t reserved[3];
+    uint32_t sequence; /* counts the sender's packets (and wraps); a gap: sound was lost */
+    const uint8_t *samples; /* signed 16-bit little endian, 48 kHz, interleaved */
+    size_t length; /* bytes */
+} LcMediaAudio;
+typedef void (*LcMediaAudioCallback)(const char *peer_id, const LcMediaAudio *sound, void *context);
+
+/* Sound of watched pictures (what the computer behind a KVM plays) goes to
+ * the callback, on the core's threads, in the order it came. Lost packets
+ * are not sent again: keep a few tens of milliseconds ahead and skip ahead
+ * when more piles up. */
+bool lc_core_set_media_audio_callback(LcCore *core, LcMediaAudioCallback callback, void *context);
+/* Sound for the peer whose picture is watched (a microphone for that
+ * computer): at most 960 bytes of samples in the same format, channels 1
+ * or 2. The bytes are copied. */
+bool lc_core_send_media_audio_to(
+    LcCore *core,
+    const char *peer_id,
+    uint8_t channels,
+    const uint8_t *samples,
+    size_t length
+);
+
 /* A source, with config key "media_source": one encoded frame for every peer
  * watching (event media_viewers; how each viewer's link does, four times a second:
  * media_link, see docs/media.md). The bytes are copied. */
