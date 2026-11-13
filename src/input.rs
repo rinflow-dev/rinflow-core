@@ -30,6 +30,10 @@ pub enum PlatformEntry {
     Event(LcInputEvent),
     SetTarget(Option<String>),
     Reset,
+    /// Input passed on to an attached screen while a peer drives this
+    /// device (see `docs/attached-screens.md`).
+    Relay(LcInputEvent),
+    SetRelay(Option<String>),
 }
 
 #[derive(Clone)]
@@ -53,7 +57,21 @@ impl PlatformInputQueue {
     }
 
     /// Returns whether the runtime must be notified that input is available.
-    pub fn push(&self, mut event: LcInputEvent) -> Result<(PushOutcome, bool), &'static str> {
+    pub fn push(&self, event: LcInputEvent) -> Result<(PushOutcome, bool), &'static str> {
+        self.push_entry(event, false)
+    }
+
+    /// The same for input relayed to an attached screen. It is merged only
+    /// with relayed input, never with the shell's own.
+    pub fn push_relay(&self, event: LcInputEvent) -> Result<(PushOutcome, bool), &'static str> {
+        self.push_entry(event, true)
+    }
+
+    fn push_entry(
+        &self,
+        mut event: LcInputEvent,
+        relay: bool,
+    ) -> Result<(PushOutcome, bool), &'static str> {
         event.validate()?;
         event.sequence = 0;
         event.reserved = 0;
@@ -63,15 +81,24 @@ impl PlatformInputQueue {
         event.timestamp_micros = monotonic_micros();
         let mut state = self.shared.lock().expect("platform input queue poisoned");
 
-        let outcome = if let Some(PlatformEntry::Event(previous)) = state.entries.back_mut()
+        let previous = match state.entries.back_mut() {
+            Some(PlatformEntry::Event(previous)) if !relay => Some(previous),
+            Some(PlatformEntry::Relay(previous)) if relay => Some(previous),
+            _ => None,
+        };
+        let outcome = if let Some(previous) = previous
             && coalesce(previous, &event)
         {
             PushOutcome::Coalesced
         } else {
             if state.entries.len() >= SOFT_QUEUE_LIMIT {
-                if let Some(index) = state.entries.iter().position(
-                    |entry| matches!(entry, PlatformEntry::Event(event) if event.is_coalescible()),
-                ) {
+                if let Some(index) = state.entries.iter().position(|entry| {
+                    matches!(
+                        entry,
+                        PlatformEntry::Event(event) | PlatformEntry::Relay(event)
+                            if event.is_coalescible()
+                    )
+                }) {
                     state.entries.remove(index);
                 } else if event.is_coalescible() {
                     return Ok((PushOutcome::DroppedCoalescible, false));
@@ -80,7 +107,11 @@ impl PlatformInputQueue {
             if state.entries.len() >= HARD_QUEUE_LIMIT {
                 return Err("platform critical input queue is full");
             }
-            state.entries.push_back(PlatformEntry::Event(event));
+            state.entries.push_back(if relay {
+                PlatformEntry::Relay(event)
+            } else {
+                PlatformEntry::Event(event)
+            });
             PushOutcome::Queued
         };
 

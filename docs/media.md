@@ -4,7 +4,7 @@ A device with a picture sends it to the peers that watch it. The first is a KVM 
 
 | | Config | Calls | Events |
 | --- | --- | --- | --- |
-| **Source** | `media_source` | `Core::send_media_frame(key_frame, timestamp_micros, data)` | `media_viewers` (`peer_ids`: who watches now), `media_key_frame_wanted` |
+| **Source** | `media_source` | `Core::send_media_frame(key_frame, timestamp_micros, data)` | `media_viewers` (`peer_ids`: who watches now), `media_key_frame_wanted`, `media_link` (each viewer's link, four times a second) |
 | **Watching** | `media` (capability bit 14, `MEDIA`) | `Core::set_media_sink`, `watch`, `unwatch`, `request_media_key_frame` | `media_available` / `media_unavailable` (`peer_id`), `media_started`, `media_ended` (`peer_id`, `reason`) |
 
 Both are off by default, and a core without either binds no third port and behaves as before. The C ABI has the same calls: `lc_core_set_media_callback`, `lc_core_watch`, `lc_core_unwatch`, `lc_core_request_media_key_frame` and `lc_core_send_media_frame` (see the header); `media` and `media_source` are config keys.
@@ -23,7 +23,15 @@ The watching side allows 16 unidirectional streams at once and 8 MiB of unread d
 
 ## Late frames are dropped, not queued
 
-A frame waits while the link is busy with the one before. When three wait for one peer, all are dropped and frames are skipped up to the next key frame, which the source's shell is asked for (`media_key_frame_wanted`). A new viewer also starts at a key frame. So a link that carries less than the encoder puts out shows a picture that stutters but never falls behind, and a decoder never gets a frame whose predecessor it missed.
+A frame waits while the link is busy with the one before. When the oldest waiting frame has waited 100 ms (or eight wait, however fast they come), all are dropped and frames are skipped up to the next key frame, which the source's shell is asked for (`media_key_frame_wanted`). The limit is a time, not a count, so it holds at 30 and at 60 frames a second. A new viewer also starts at a key frame. So a link that carries less than the encoder puts out shows a picture that stutters but never falls behind, and a decoder never gets a frame whose predecessor it missed.
+
+## Fitting the picture to the link
+
+The core never changes the picture; it tells the source's shell how each viewer's link does, four times a second:
+
+`{"event":"media_link","peer_id":…,"rtt_ms":…,"min_rtt_ms":…,"sent_packets":…,"lost_packets":…,"frames":…,"overflows":…,"skipped":…,"kbps":…,"worst_wait_ms":…}`
+
+`frames` went out in that second at `kbps` (what actually went, not the encoder's setting). `overflows` counts the times frames were dropped for being late (the link could not keep up); `skipped` all frames left out, including those waiting for a key frame a decoder asked for. `worst_wait_ms` is the longest a frame waited from `send_frame` until the link took all of it. `rtt_ms` and the packet counts are the media connection's own. The NanoKVM agent lowers its encoder's bit rate (and then frame rate) on a link in trouble and raises them again once it keeps up (`rinflow-nanokvm`, `agent/src/rate.rs`).
 
 ## Encryption on small processors
 

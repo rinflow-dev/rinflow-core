@@ -30,7 +30,7 @@ Decoding is strict: truncated frames, extra bytes after a message, non-zero rese
 ## Changing the protocol or ABI
 
 - The **protocol version** is set by `PROTOCOL_MIN_VERSION` / `PROTOCOL_MAX_VERSION` in [model.rs](../src/model.rs).
-- The **C ABI version** is written by hand in two places: `lc_core_abi_version()` in [ffi.rs](../src/ffi.rs) and `LC_CORE_ABI_VERSION` in the header. Bump both together. It is currently **10**:
+- The **C ABI version** is written by hand in two places: `lc_core_abi_version()` in [ffi.rs](../src/ffi.rs) and `LC_CORE_ABI_VERSION` in the header. Bump both together. It is currently **11**:
   - Version 3 added multiple sessions, `lc_core_disconnect_peer`, `lc_core_set_input_target` and the `peer_id` fields.
   - Version 4 added the arrangement: `lc_core_set_local_displays`, `lc_core_set_placement`, `lc_core_place_beside`, the `displays` / `placements` config keys and the `peer_displays` / `placement_changed` events. It came with wire protocol v3, which does not interoperate with v2, so every device needs a build of this core.
   - Versions 5 and 6 added the clipboard, the data link and files (see [clipboard-and-files.md](clipboard-and-files.md)).
@@ -38,5 +38,6 @@ Decoding is strict: truncated frames, extra bytes after a message, non-zero rese
   - Version 8 keeps the user's devices connected (`auto_connect`, on by default), adds the `disconnected` reasons `"disconnected on the other device"`, `"refused by the other device"` and `"going to sleep"`, and `lc_core_system_will_sleep` / `lc_core_network_changed`. Shells drop their own reconnect timers.
   - Version 9 finds devices by address (`manual_addresses`), switches shortcut translation at run time, adds presence and pointer lock (capability bits 9 and 10, wire messages 17–19), file progress on both sides (`files_receiving`, `files_sending`, `files_send_ended`; `lc_core_cancel_files` also stops sending), and chained placements. Version 8 cores still connect: the new messages go only to peers that announce them, and older cores ignore the `reply` field of a probe (they do not answer it, but are found through their own multicast).
   - Version 10 makes the modifier keys of a peer of the other platform convention configurable key by key: `modifier_map` and `lc_core_set_modifier_map` replace `shortcut_remap` and `lc_core_set_shortcut_remap`. Nothing changes on the wire.
+  - Version 11 adds attached screens ([attached-screens.md](attached-screens.md)): the `attachable` config key (capability bit 15, `ATTACHABLE`), `lc_core_set_relay_target`, `lc_core_relay_input` and the `attached_screens` / `relay_ended` events. Nothing else changes on the wire: an attached screen's displays travel in the host's `ScreenInfo` like its own.
   - Earlier calls keep their meaning.
 - The header is maintained by hand (no cbindgen). Any change to `LcInputEvent` or the flag/modifier constants in `model.rs` must be copied into it.

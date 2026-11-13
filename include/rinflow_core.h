@@ -48,8 +48,12 @@
  *    lc_core_set_modifier_map replace "shortcut_remap" and
  *    lc_core_set_shortcut_remap. Nothing changes on the wire. Event
  *    "files_not_shared" when copied files pass the limits (see Files).
+ * 11: attached screens (docs/attached-screens.md): config key "attachable",
+ *    lc_core_set_relay_target, lc_core_relay_input, events
+ *    "attached_screens" and "relay_ended". Capability bit 15; nothing else
+ *    changes on the wire.
  */
-#define LC_CORE_ABI_VERSION 10
+#define LC_CORE_ABI_VERSION 11
 
 #ifdef __cplusplus
 extern "C" {
@@ -139,7 +143,8 @@ bool lc_core_unwatch(LcCore *core, const char *peer_id);
 /* The decoder lost its place: ask the watched peer for a key frame. */
 bool lc_core_request_media_key_frame(LcCore *core, const char *peer_id);
 /* A source, with config key "media_source": one encoded frame for every peer
- * watching (event media_viewers). The bytes are copied. */
+ * watching (event media_viewers; how each viewer's link does, four times a second:
+ * media_link, see docs/media.md). The bytes are copied. */
 bool lc_core_send_media_frame(
     LcCore *core,
     bool key_frame,
@@ -281,6 +286,32 @@ bool lc_core_reset_input(LcCore *core);
  * (lc_core_send_input ignores what the shell put there).
  */
 bool lc_core_set_remote_control_allowed(LcCore *core, bool allowed);
+
+/*
+ * Attached screens (version 11, docs/attached-screens.md). A peer with
+ * config key "attachable" (a KVM: no keyboard and mouse of its own), placed
+ * right against this device's own displays and connected, is an attached
+ * screen: every other peer is told its displays as this device's own, so a
+ * device driving this one pushes the pointer onto it like onto a monitor.
+ *   {"event":"attached_screens","screens":[{"peer_id":…,"offset":{"x","y"},
+ *    "displays":[…]}]}
+ *       each screen's displays in this device's space and its placement
+ *       (subtract offset for its own space), whenever that changes
+ * While a peer drives this device and its pointer is on an attached screen,
+ * pass the input on to it: lc_core_set_relay_target(core, peer_id), then
+ * lc_core_relay_input with events in the attached peer's own space (absolute
+ * positions are best), and lc_core_set_relay_target(core, NULL) when the
+ * pointer leaves (the screen releases what it holds). Relaying does not
+ * count as driving another device: whoever drives this one carries on. The
+ * relay ends by itself, with
+ *   {"event":"relay_ended","peer_id":…,"reason":…}
+ * "control ended" (the driving peer stopped or was replaced), "not attached"
+ * (the screen went away, or never was one), "not driven" (nobody drives this
+ * device) or "revoked" (another device took the screen over). Input relayed
+ * meanwhile is dropped.
+ */
+bool lc_core_set_relay_target(LcCore *core, const char *peer_id);
+bool lc_core_relay_input(LcCore *core, const LcInputEvent *event);
 
 /*
  * Arrangement (all geometry in logical points: macOS points, or pixels at

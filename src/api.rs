@@ -247,4 +247,20 @@ impl Core {
     pub fn reset_input(&self) -> Result<(), String> {
         self.thread.send(Command::ResetInput)
     }
+
+    /// While a peer drives this device, passes the input that lands on an
+    /// attached screen (`attached_screens`) on to it with `relay_input`;
+    /// `None` stops, and the screen releases what it holds. Without a peer
+    /// driving this device, or for a peer that is not attached, the relay
+    /// ends at once (`relay_ended`). See `docs/attached-screens.md`.
+    pub fn set_relay_target(&self, peer_id: Option<&str>) -> Result<(), String> {
+        self.thread
+            .send(Command::SetRelayTarget(peer_id.map(str::to_owned)))
+    }
+
+    /// Input for the attached screen chosen with `set_relay_target`, in its
+    /// own space; dropped while there is none.
+    pub fn relay_input(&self, event: LcInputEvent) -> Result<(), String> {
+        self.thread.send(Command::RelayInput(event))
+    }
 }

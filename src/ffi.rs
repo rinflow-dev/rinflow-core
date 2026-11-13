@@ -36,10 +36,12 @@ pub struct LcCore {
 /// convention configurable, key by key: config key `modifier_map` and
 /// `lc_core_set_modifier_map` replace `shortcut_remap` and
 /// `lc_core_set_shortcut_remap`; event `files_not_shared` when copied files
-/// pass the limits (10 000 entries, 32 folders deep).
+/// pass the limits (10 000 entries, 32 folders deep). Version 11 adds
+/// attached screens: config key `attachable`, `lc_core_set_relay_target`,
+/// `lc_core_relay_input` and the `attached_screens` / `relay_ended` events.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    10
+    11
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -438,6 +440,47 @@ pub unsafe extern "C" fn lc_core_reset_input(core: *mut LcCore) -> bool {
         }
         let core = unsafe { &*core };
         core.thread.send(Command::ResetInput).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// Starts passing input on to an attached screen while a peer drives this
+/// device, or stops with a null `peer_id` (see `docs/attached-screens.md`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_relay_target(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let target = if peer_id.is_null() {
+            None
+        } else {
+            match unsafe { string_argument(peer_id) } {
+                Some(peer_id) => Some(peer_id),
+                None => return false,
+            }
+        };
+        core.thread.send(Command::SetRelayTarget(target)).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_relay_input(
+    core: *mut LcCore,
+    event: *const LcInputEvent,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() || event.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let event = unsafe { *event };
+        core.thread.send(Command::RelayInput(event)).is_ok()
     }))
     .unwrap_or(false)
 }

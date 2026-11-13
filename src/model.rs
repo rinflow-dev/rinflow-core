@@ -61,6 +61,11 @@ pub const CAPABILITY_INPUT_ECHO: u64 = 1 << 13;
 /// Understands `MediaOffer` and can watch a device's picture over a media
 /// link (see `media.rs`). Announced with `CoreConfig::media`.
 pub const CAPABILITY_MEDIA: u64 = 1 << 14;
+/// Has no keyboard and mouse of its own and is only ever driven, such as a
+/// KVM: placed right against a device, it becomes that device's attached
+/// screen (see `docs/attached-screens.md`). Announced with
+/// `CoreConfig::attachable`.
+pub const CAPABILITY_ATTACHABLE: u64 = 1 << 15;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -169,6 +174,10 @@ pub struct CoreConfig {
     /// The shell has a picture to send (`Core::send_media_frame`): peers
     /// with `media` are offered it. A KVM is one. Off by default.
     pub media_source: bool,
+    /// This device has no keyboard and mouse of its own (a KVM): a device
+    /// that places it right beside itself treats it as an attached screen.
+    /// Off by default.
+    pub attachable: bool,
 }
 
 /// A paired peer: its device ID and the fingerprint of its certificate.
@@ -213,6 +222,7 @@ impl Default for CoreConfig {
             manual_addresses: Vec::new(),
             media: false,
             media_source: false,
+            attachable: false,
         }
     }
 }
@@ -229,6 +239,9 @@ impl CoreConfig {
         }
         if self.media {
             capabilities |= CAPABILITY_MEDIA;
+        }
+        if self.attachable {
+            capabilities |= CAPABILITY_ATTACHABLE;
         }
         capabilities
     }
