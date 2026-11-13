@@ -13,6 +13,8 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 base64 = "0.22"
+# A frame of a picture is shared with QUIC as it is, not copied (media.rs).
+bytes = "1"
 # QUIC transport with TLS 1.3 (secure.rs, quic.rs). ring as the crypto
 # provider everywhere: it builds without CMake or NASM on Windows.
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }

@@ -23,7 +23,7 @@ The watching side allows 16 unidirectional streams at once and 8 MiB of unread d
 
 ## Late frames are dropped, not queued
 
-A frame waits while the link is busy with the one before. When the oldest waiting frame has waited 100 ms (or eight wait, however fast they come), all are dropped and frames are skipped up to the next key frame, which the source's shell is asked for (`media_key_frame_wanted`). The limit is a time, not a count, so it holds at 30 and at 60 frames a second. A new viewer also starts at a key frame. So a link that carries less than the encoder puts out shows a picture that stutters but never falls behind, and a decoder never gets a frame whose predecessor it missed.
+A frame waits while the link is busy with the one before. When the oldest waiting frame has waited 100 ms (or eight wait, however fast they come), all are dropped and frames are skipped up to the next key frame, which the source's shell is asked for (`media_key_frame_wanted`). The limit is a time, not a count, so it holds at 30 and at 60 frames a second. A new viewer also starts at a key frame. So a link that carries less than the encoder puts out shows a picture that stutters but never falls behind, and a decoder never gets a frame whose predecessor it missed. A source therefore needs no key frames of its own accord: only those it is asked for. (On a small source that matters: a key frame is several times the other frames, and the burst holds up what comes behind it.)
 
 ## Fitting the picture to the link
 
@@ -32,6 +32,14 @@ The core never changes the picture; it tells the source's shell how each viewer'
 `{"event":"media_link","peer_id":…,"rtt_ms":…,"min_rtt_ms":…,"sent_packets":…,"lost_packets":…,"frames":…,"overflows":…,"skipped":…,"kbps":…,"worst_wait_ms":…}`
 
 `frames` went out in that second at `kbps` (what actually went, not the encoder's setting). `overflows` counts the times frames were dropped for being late (the link could not keep up); `skipped` all frames left out, including those waiting for a key frame a decoder asked for. `worst_wait_ms` is the longest a frame waited from `send_frame` until the link took all of it. `rtt_ms` and the packet counts are the media connection's own. The NanoKVM agent lowers its encoder's bit rate (and then frame rate) on a link in trouble and raises them again once it keeps up (`rinflow-nanokvm`, `agent/src/rate.rs`).
+
+A frame's bytes are shared, not copied, from `send_media_frame` (which takes a `Vec<u8>` or `Bytes`) to the packets QUIC makes of them, and for every viewer; `MediaFrame::data` is `Bytes` (re-exported as `rinflow_core::Bytes`). `lc_core_send_media_frame` copies once, out of the caller's memory.
+
+## Sound
+
+Sound goes with a picture, over the same media link, either way: a source's to every peer watching it (`Core::send_media_audio`: what the computer behind a KVM plays), and a watching device's to the source (`Core::send_media_audio_to`: a microphone for that computer). What arrives goes to `Core::set_media_audio_sink`, on either side, as `MediaAudio`: `channels` (1 or 2), a `sequence` that counts the sender's packets, and signed 16-bit little-endian samples at 48 kHz, interleaved, at most `MAX_AUDIO_BYTES` (960: 5 ms of stereo, 10 ms of mono) a packet. Nothing is compressed: on a local network 1.5 Mbit/s is little, and a KVM's processor encrypts it for less than encoding would cost.
+
+Each packet is one QUIC datagram: a byte for the format (1, the only one), the channels, the sequence (`u32`, little endian), then the samples. Datagrams are not sent again when lost, and at most 16 KiB of them wait for a link (the oldest are dropped): sound, too, is better lost than late. The receiving shell keeps a few tens of milliseconds ahead to cover the network's unevenness and skips ahead when more piles up. A peer that knows no sound ignores the datagrams. Rust only so far: the C ABI has no calls for it.
 
 ## Encryption on small processors
 

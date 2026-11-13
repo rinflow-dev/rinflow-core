@@ -215,6 +215,30 @@ impl Core {
         self.thread.media.set_frame_sink(std::sync::Arc::new(sink));
     }
 
+    /// Where the sound that comes with pictures goes, on either side of a
+    /// media link (see `media.rs`): called with the peer's device ID, on
+    /// the core's threads, in the order it came.
+    pub fn set_media_audio_sink(
+        &self,
+        sink: impl Fn(&str, crate::media::MediaAudio) + Send + Sync + 'static,
+    ) {
+        self.thread.media.set_audio_sink(std::sync::Arc::new(sink));
+    }
+
+    /// Sound of this device's picture, for every peer watching it: signed
+    /// 16-bit little-endian samples at 48 kHz, `channels` (1 or 2)
+    /// interleaved, at most `MAX_AUDIO_BYTES` of them. Lost packets are not
+    /// sent again.
+    pub fn send_media_audio(&self, channels: u8, samples: &[u8]) {
+        self.thread.media.send_audio(channels, samples);
+    }
+
+    /// Sound for the peer whose picture this device watches: a microphone
+    /// for the computer behind a KVM. As `send_media_audio`.
+    pub fn send_media_audio_to(&self, peer_id: &str, channels: u8, samples: &[u8]) {
+        self.thread.media.send_audio_to(peer_id, channels, samples);
+    }
+
     /// Starts watching a peer's picture, once it has offered one
     /// (`media_available`). `media_started` and `media_ended` follow.
     /// Needs `CoreConfig::media`.
@@ -234,7 +258,12 @@ impl Core {
     /// One encoded frame of this device's picture, for every peer watching
     /// it (`media_viewers` says who). Needs `CoreConfig::media_source`.
     /// Goes straight to the links: it does not wait for the core's loop.
-    pub fn send_media_frame(&self, key_frame: bool, timestamp_micros: u64, data: Vec<u8>) {
+    pub fn send_media_frame(
+        &self,
+        key_frame: bool,
+        timestamp_micros: u64,
+        data: impl Into<bytes::Bytes>,
+    ) {
         self.thread
             .media
             .send_frame(key_frame, timestamp_micros, data);

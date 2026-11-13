@@ -48,8 +48,15 @@
 //! wait of a frame. Its shell can fit the encoder to the link with them
 //! (a lower bit rate or frame rate while a link struggles, more once it
 //! keeps up); the core itself never changes the picture.
+//!
+//! **Sound** goes with the picture, either way: the source's to those who
+//! watch, and a watching device's (a microphone) to the source. A few
+//! milliseconds of plain samples a packet ([`MediaAudio`]), each in a QUIC
+//! datagram on the media link: not sent again when lost, and dropped rather
+//! than sent late.
 
 use crate::secure::peer_fingerprint;
+use bytes::Bytes;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -83,7 +90,8 @@ pub struct MediaFrame {
     pub sequence: u64,
     /// The source's clock, in microseconds; only differences mean anything.
     pub timestamp_micros: u64,
-    pub data: Vec<u8>,
+    /// Shared, not copied, between the peers it goes to and with QUIC.
+    pub data: Bytes,
 }
 
 impl MediaFrame {
@@ -96,20 +104,79 @@ impl MediaFrame {
     }
 
     /// A frame as it came off its stream.
-    fn decode(mut bytes: Vec<u8>) -> Option<Self> {
+    fn decode(bytes: Vec<u8>) -> Option<Self> {
         let header: [u8; HEADER_LENGTH] = bytes.get(..HEADER_LENGTH)?.try_into().ok()?;
         if header[0] & !FLAG_KEY_FRAME != 0 {
             return None;
         }
-        bytes.drain(..HEADER_LENGTH);
         Some(Self {
             key_frame: header[0] & FLAG_KEY_FRAME != 0,
             sequence: u64::from_le_bytes(header[1..9].try_into().ok()?),
             timestamp_micros: u64::from_le_bytes(header[9..17].try_into().ok()?),
-            data: bytes,
+            // The bytes as they came, not moved up over the header.
+            data: Bytes::from(bytes).slice(HEADER_LENGTH..),
         })
     }
 }
+
+/// Format, channels, sequence: the head of a packet of sound.
+const AUDIO_HEADER_LENGTH: usize = 1 + 1 + 4;
+/// Signed 16-bit little-endian samples, 48 000 a second, channels
+/// interleaved: the only format so far.
+const AUDIO_PCM_48K: u8 = 1;
+/// The most samples one packet carries, in bytes: with its header it fits
+/// one QUIC packet on any link (5 ms of stereo, 10 ms of mono).
+pub const MAX_AUDIO_BYTES: usize = 960;
+/// How much sound may wait for a link, either way: what waits longer is
+/// better lost than heard late.
+pub(crate) const AUDIO_WAITING_BYTES: usize = 16 * 1024;
+
+/// A few milliseconds of sound that goes with a picture: what the computer
+/// behind a KVM plays, or what a watching device's microphone hears.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaAudio {
+    /// 1 or 2.
+    pub channels: u8,
+    /// Counts the sender's packets (and wraps): a gap is sound that was
+    /// lost.
+    pub sequence: u32,
+    /// Signed 16-bit little-endian samples at 48 kHz, channels interleaved.
+    pub samples: Bytes,
+}
+
+impl MediaAudio {
+    fn encode(&self) -> Bytes {
+        let mut bytes = Vec::with_capacity(AUDIO_HEADER_LENGTH + self.samples.len());
+        bytes.extend_from_slice(&[AUDIO_PCM_48K, self.channels]);
+        bytes.extend_from_slice(&self.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.samples);
+        bytes.into()
+    }
+
+    /// A packet as it came. `None` for a format this version does not know.
+    fn decode(bytes: Bytes) -> Option<Self> {
+        let header: [u8; AUDIO_HEADER_LENGTH] =
+            bytes.get(..AUDIO_HEADER_LENGTH)?.try_into().ok()?;
+        let samples = bytes.slice(AUDIO_HEADER_LENGTH..);
+        let channels = header[1];
+        if header[0] != AUDIO_PCM_48K
+            || !(1..=2).contains(&channels)
+            || samples.is_empty()
+            || !samples.len().is_multiple_of(2 * usize::from(channels))
+        {
+            return None;
+        }
+        Some(Self {
+            channels,
+            sequence: u32::from_le_bytes(header[2..].try_into().ok()?),
+            samples,
+        })
+    }
+}
+
+/// Called with the peer's device ID for every packet of sound from it, on
+/// the core's threads, in the order they came.
+pub type AudioSink = Arc<dyn Fn(&str, MediaAudio) + Send + Sync>;
 
 /// Called with the peer's device ID for every frame of a watched picture,
 /// on the core's threads, in order.
@@ -255,8 +322,34 @@ struct State {
     /// `watch` meanwhile must not dial again.
     connecting: HashSet<String>,
     frame_sink: Option<FrameSink>,
+    audio_sink: Option<AudioSink>,
+    /// Counts the packets of sound this device sends.
+    audio_sequence: u32,
     /// The core's runtime and this device's endpoint, while the core runs.
     running: Option<(tokio::runtime::Handle, quinn::Endpoint, String)>,
+}
+
+impl State {
+    /// The next packet of sound from this device, ready to send. `None`
+    /// for what is not a packet (see [`MediaAudio`]).
+    fn audio_packet(&mut self, channels: u8, samples: &[u8]) -> Option<Bytes> {
+        if !(1..=2).contains(&channels)
+            || samples.is_empty()
+            || samples.len() > MAX_AUDIO_BYTES
+            || !samples.len().is_multiple_of(2 * usize::from(channels))
+        {
+            return None;
+        }
+        self.audio_sequence = self.audio_sequence.wrapping_add(1);
+        Some(
+            MediaAudio {
+                channels,
+                sequence: self.audio_sequence,
+                samples: Bytes::copy_from_slice(samples),
+            }
+            .encode(),
+        )
+    }
 }
 
 /// Everything about pictures a core holds. Shared by the core's loop (which
@@ -310,6 +403,62 @@ impl MediaHub {
         self.state().frame_sink = Some(sink);
     }
 
+    pub fn set_audio_sink(&self, sink: AudioSink) {
+        self.state().audio_sink = Some(sink);
+    }
+
+    /// Sound of this device's picture, for every peer watching: up to
+    /// [`MAX_AUDIO_BYTES`] of samples (see [`MediaAudio`]). Not repeated
+    /// when lost, and dropped rather than sent late.
+    pub fn send_audio(&self, channels: u8, samples: &[u8]) {
+        let (packet, viewers) = {
+            let mut state = self.state();
+            if state.viewers.is_empty() {
+                return;
+            }
+            (state.audio_packet(channels, samples), state.viewers.clone())
+        };
+        let Some(packet) = packet else {
+            return;
+        };
+        for viewer in viewers {
+            let _ = viewer.connection.send_datagram(packet.clone());
+        }
+    }
+
+    /// Sound for the peer whose picture this device watches (a microphone,
+    /// for the computer behind a KVM). As [`MediaHub::send_audio`].
+    pub fn send_audio_to(&self, peer_id: &str, channels: u8, samples: &[u8]) {
+        let (packet, connection) = {
+            let mut state = self.state();
+            let Some(connection) = state
+                .watching
+                .get(peer_id)
+                .map(|watching| watching.connection.clone())
+            else {
+                return;
+            };
+            (state.audio_packet(channels, samples), connection)
+        };
+        if let Some(packet) = packet {
+            let _ = connection.send_datagram(packet);
+        }
+    }
+
+    /// Hands the sound that comes over a media link to the audio sink until
+    /// the link ends.
+    fn receive_audio(self: &Arc<Self>, connection: &quinn::Connection, peer_id: &str) {
+        let (hub, connection, peer_id) = (self.clone(), connection.clone(), peer_id.to_owned());
+        tokio::spawn(async move {
+            while let Ok(bytes) = connection.read_datagram().await {
+                let sink = hub.state().audio_sink.clone();
+                if let (Some(sink), Some(packet)) = (sink, MediaAudio::decode(bytes)) {
+                    sink(&peer_id, packet);
+                }
+            }
+        });
+    }
+
     // ---- Source ---------------------------------------------------------
 
     /// A session with a peer that can watch is established: a token for it.
@@ -328,7 +477,8 @@ impl MediaHub {
     }
 
     /// One frame of this device's picture, for every peer watching.
-    pub fn send_frame(&self, key_frame: bool, timestamp_micros: u64, data: Vec<u8>) {
+    pub fn send_frame(&self, key_frame: bool, timestamp_micros: u64, data: impl Into<Bytes>) {
+        let data = data.into();
         let (frame, viewers) = {
             let mut state = self.state();
             if state.viewers.is_empty() {
@@ -424,6 +574,7 @@ impl MediaHub {
             viewer
         };
         answer.write_all(&[ACCEPTED]).await.map_err(|_| "closed")?;
+        self.receive_audio(&connection, &viewer.peer_id);
         self.report_viewers();
         // It starts from a key frame.
         (self.events)(json!({ "event": "media_key_frame_wanted" }));
@@ -571,7 +722,7 @@ impl MediaHub {
     }
 
     async fn receive(
-        &self,
+        self: &Arc<Self>,
         endpoint: &quinn::Endpoint,
         device_id: &str,
         peer_id: &str,
@@ -612,6 +763,7 @@ impl MediaHub {
             );
             state.frame_sink.clone()
         };
+        self.receive_audio(&connection, peer_id);
         (self.events)(json!({ "event": "media_started", "peer_id": peer_id }));
 
         // Frames are read in the order their streams were opened, which is
@@ -725,7 +877,8 @@ async fn send_frames(viewer: &Viewer) {
             return;
         };
         if stream.write_all(&frame.header()).await.is_err()
-            || stream.write_all(&frame.data).await.is_err()
+            // The frame itself, not a copy: QUIC keeps it until it is sent.
+            || stream.write_chunk(frame.data.clone()).await.is_err()
             || stream.finish().is_err()
         {
             return;
@@ -758,7 +911,7 @@ mod tests {
             key_frame,
             sequence,
             timestamp_micros: sequence * 33_333,
-            data: vec![sequence as u8; 4],
+            data: vec![sequence as u8; 4].into(),
         })
     }
 
@@ -768,7 +921,7 @@ mod tests {
             key_frame: true,
             sequence: 7,
             timestamp_micros: 1_234_567,
-            data: vec![0, 0, 0, 1, 0x67],
+            data: vec![0, 0, 0, 1, 0x67].into(),
         };
         let mut bytes = original.header().to_vec();
         bytes.extend_from_slice(&original.data);

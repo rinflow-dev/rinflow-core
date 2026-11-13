@@ -178,7 +178,11 @@ impl CoreThread {
                 // This thread runs the core's loop, which all input passes.
                 crate::priority::raise_current_thread();
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    // Two, or one where there is one processor (a KVM): a
+                    // second thread there only hands work back and forth.
+                    .worker_threads(
+                        std::thread::available_parallelism().map_or(2, |n| n.get().min(2)),
+                    )
                     .enable_all()
                     .thread_name("rinflow-io")
                     .on_thread_start(crate::priority::raise_current_thread)

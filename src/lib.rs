@@ -25,6 +25,7 @@ mod transport;
 mod android_jni;
 
 pub use api::Core;
+pub use bytes::Bytes;
 pub use clipboard::{
     CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardFormat, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
     MIME_TEXT,
@@ -35,7 +36,7 @@ pub use files::MIME_URI_LIST;
 pub use files::{
     Entry as FileEntry, Manifest as FileManifest, sanitize_name as sanitize_file_name,
 };
-pub use media::MediaFrame;
+pub use media::{MAX_AUDIO_BYTES, MediaAudio, MediaFrame};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -495,6 +496,38 @@ mod tests {
         assert_eq!(report["overflows"], 0);
         assert!(report["rtt_ms"].as_f64().unwrap() > 0.0);
         assert!(report["kbps"].as_f64().unwrap() > 0.0);
+
+        // Sound goes with the picture, either way: the source's to those
+        // who watch, a watching device's (a microphone) to the source.
+        let (heard_tx, heard) = std::sync::mpsc::channel();
+        for core in [&watcher, &source] {
+            let heard_tx = heard_tx.clone();
+            core.thread
+                .media
+                .set_audio_sink(std::sync::Arc::new(move |peer: &str, sound| {
+                    let _ = heard_tx.send((peer.to_owned(), sound));
+                }));
+        }
+        source.thread.media.send_audio(2, &[1, 0, 2, 0]);
+        let (peer, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(peer, "picture-source");
+        assert_eq!((sound.channels, &sound.samples[..]), (2, &[1, 0, 2, 0][..]));
+        watcher
+            .thread
+            .media
+            .send_audio_to("picture-source", 1, &[5, 0]);
+        let (peer, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(peer, "picture-watcher");
+        assert_eq!((sound.channels, &sound.samples[..]), (1, &[5, 0][..]));
+        // Half a sample is not sound, nor is more than fits a packet.
+        source.thread.media.send_audio(2, &[1, 0, 2]);
+        source
+            .thread
+            .media
+            .send_audio(1, &vec![0; crate::MAX_AUDIO_BYTES + 2]);
+        source.thread.media.send_audio(1, &[9, 0]);
+        let (_, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(&sound.samples[..], &[9, 0][..]);
 
         watcher.thread.media.unwatch("picture-source");
         wait_for_event(&watcher.events, Duration::from_secs(4), |event| {
