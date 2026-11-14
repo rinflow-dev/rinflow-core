@@ -19,6 +19,10 @@ First public version.
 - `link_quality`: an event for every second in which packets were lost or input arrived late, to tell why a pointer stuttered; `input_latency`: how long input takes to a driven peer and back
 - A stable `reason_code` beside every event `reason` and `error` message, so shells can show them in the user's language
 
+### Changed
+
+- A message type from a newer peer is skipped and fields it appended to a message are ignored, instead of closing the connection, so a newer device never cuts off an older one (docs/protocol.md, Compatibility)
+
 ### Known issues
 
 - Clipboard pushes are limited to 8 MiB. Both ends must agree on the limit, so raising it requires updating every device together.

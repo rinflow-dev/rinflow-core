@@ -407,7 +407,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
             .map_err(|_| io::Error::other("receive budget closed"))?;
         let mut payload = vec![0_u8; length];
         reader.read_exact(&mut payload).await?;
-        let message = decode_message(&payload)?;
+        let Some(message) = decode_message(&payload)? else {
+            continue;
+        };
 
         if events
             .send(ConnectionEvent::Message {
@@ -681,7 +683,8 @@ mod pacing_tests {
                 let length = reader.read_u32().await.unwrap() as usize;
                 let mut payload = vec![0; length];
                 reader.read_exact(&mut payload).await.unwrap();
-                let WireMessage::InputBatch { events, .. } = decode_message(&payload).unwrap()
+                let Some(WireMessage::InputBatch { events, .. }) =
+                    decode_message(&payload).unwrap()
                 else {
                     continue;
                 };
