@@ -120,7 +120,9 @@ mod tests {
         let mut complete = None;
         for frame in frames {
             // Every frame survives the wire format.
-            let frame = decode_message(&encode_message(&frame).unwrap()).unwrap();
+            let frame = decode_message(&encode_message(&frame).unwrap())
+                .unwrap()
+                .unwrap();
             let WireMessage::ClipboardChunk {
                 id,
                 total,
@@ -334,7 +336,7 @@ mod tests {
             },
         ] {
             let bytes = encode_message(&message).unwrap();
-            assert_eq!(decode_message(&bytes).unwrap(), message);
+            assert_eq!(decode_message(&bytes).unwrap(), Some(message));
         }
     }
 
@@ -343,7 +345,7 @@ mod tests {
         for handoff in [false, true] {
             let message = WireMessage::ControlRevoke { handoff };
             let bytes = encode_message(&message).unwrap();
-            assert_eq!(decode_message(&bytes).unwrap(), message);
+            assert_eq!(decode_message(&bytes).unwrap(), Some(message));
         }
         let mut bytes = encode_message(&WireMessage::ControlRevoke { handoff: true }).unwrap();
         *bytes.last_mut().unwrap() = 2;
@@ -400,7 +402,7 @@ mod tests {
             port: 50_123,
         };
         let bytes = encode_message(&offer).expect("encode");
-        assert_eq!(decode_message(&bytes).expect("decode"), offer);
+        assert_eq!(decode_message(&bytes).expect("decode"), Some(offer));
         assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
     }
 
@@ -544,10 +546,10 @@ mod tests {
         let bytes = encode_message(&message).expect("encode message");
         assert_ne!(bytes.first(), Some(&b'{'));
         let actual = decode_message(&bytes).expect("decode message");
-        let WireMessage::InputBatch {
+        let Some(WireMessage::InputBatch {
             first_sequence,
             events,
-        } = actual
+        }) = actual
         else {
             panic!("expected input batch")
         };
@@ -558,10 +560,15 @@ mod tests {
     }
 
     #[test]
-    fn binary_protocol_rejects_trailing_data() {
-        let mut bytes = encode_message(&WireMessage::Ping { sequence: 7 }).expect("encode ping");
-        bytes.push(0);
-        assert!(decode_message(&bytes).is_err());
+    fn binary_protocol_skips_what_a_newer_peer_adds() {
+        let ping = WireMessage::Ping { sequence: 7 };
+        // A field appended to a known message.
+        let mut bytes = encode_message(&ping).expect("encode ping");
+        bytes.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(decode_message(&bytes).expect("decode ping"), Some(ping));
+        // A message type from a newer protocol (the type is header byte 3).
+        bytes[3] = u8::MAX;
+        assert_eq!(decode_message(&bytes).expect("skip unknown type"), None);
     }
 
     #[test]
@@ -1357,7 +1364,7 @@ mod tests {
 
         let echo = WireMessage::InputEcho { stamp: 123_456 };
         let bytes = encode_message(&echo).expect("encode echo");
-        assert_eq!(decode_message(&bytes).expect("decode echo"), echo);
+        assert_eq!(decode_message(&bytes).expect("decode echo"), Some(echo));
     }
 
     /// Input whose arrival is further from its stamp than the best seen was
@@ -3007,7 +3014,7 @@ mod tests {
             },
         ] {
             let bytes = encode_message(&message).expect("encode");
-            assert_eq!(decode_message(&bytes).expect("decode"), message);
+            assert_eq!(decode_message(&bytes).expect("decode"), Some(message));
         }
         assert!(
             encode_message(&WireMessage::ScreenInfo {

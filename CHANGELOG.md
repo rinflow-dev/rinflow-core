@@ -21,6 +21,10 @@ First public version.
 - Pictures: a device with one (`media_source`, such as a KVM) sends encoded frames to the peers that watch it (`media`) over a media link of its own, where late frames are dropped rather than queued
 - ChaCha20-Poly1305 is preferred on processors without AES instructions
 
+### Changed
+
+- A message type from a newer peer is skipped and fields it appended to a message are ignored, instead of closing the connection, so a newer device never cuts off an older one (docs/protocol.md, Compatibility)
+
 ### Known issues
 
 - Clipboard pushes are limited to 8 MiB. Both ends must agree on the limit, so raising it requires updating every device together.

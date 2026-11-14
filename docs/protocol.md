@@ -25,9 +25,18 @@ Types 8–13 are the clipboard and file messages of the data link ([clipboard-an
 
 **QUIC**: ALPN `rinflow/1`, TLS 1.3 only, server name `rinflow`. Both sides present a self-signed certificate; the TLS signatures are checked, the certificate chain is not, and the peer is identified by the SHA-256 of its certificate. The dialing side opens one bidirectional stream for the frames, and that is all a peer may open: the accepting side allows one incoming bidirectional stream, the dialing side none, neither allows unidirectional streams or datagrams, and the receive window is 1.25 MB for the stream and for the connection as a whole (anyone can complete the handshake, so nothing a peer sends may pile up unread). Idle timeout 10 s, keep-alive 2 s. On the control connection each side asks the other, with the ACK frequency extension, to acknowledge every 10 packets or after 8 ms (instead of every 2 or after 25 ms): fewer acknowledgements competing with input for air time on Wi-Fi, and a lost last packet of a burst is sent again sooner. A side that closes the connection because its user declined pairing closes it with application error code 1; code 0 is an ordinary close.
 
-Decoding is strict: truncated frames, extra bytes after a message, non-zero reserved fields or any message before `Hello` all close the connection. The encoder and decoder live in [protocol.rs](../src/protocol.rs).
+Truncated frames, non-zero reserved fields or any message before `Hello` close the connection. A message type the core does not know is skipped, and bytes after the fields it knows are ignored: that is what a newer peer adds (see Compatibility below). The encoder and decoder live in [protocol.rs](../src/protocol.rs).
 
 ## Changing the protocol or ABI
+
+### Compatibility
+
+Devices update one at a time, so a peer may run an older core for a long time. Cores before this rule (macOS and Windows 0.0.1) close the connection on an unknown message type or on extra bytes, so:
+
+- A new feature takes a new capability bit, and its messages go only to peers that announce the bit.
+- A field is only ever appended to the end of a message, and a peer that does not send it must still be understood (an older peer never does).
+- `PROTOCOL_MIN_VERSION` stays. A change that cannot follow these rules raises `PROTOCOL_MAX_VERSION` first, keeps speaking the old version for at least one release of every client, and only then raises the minimum.
+- A limit both sides must agree on (such as the clipboard size) is a capability too.
 
 - The **protocol version** is set by `PROTOCOL_MIN_VERSION` / `PROTOCOL_MAX_VERSION` in [model.rs](../src/model.rs).
 - The **C ABI version** is written by hand in two places: `lc_core_abi_version()` in [ffi.rs](../src/ffi.rs) and `LC_CORE_ABI_VERSION` in the header. Bump both together. It is currently **10**:

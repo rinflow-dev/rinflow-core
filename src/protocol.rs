@@ -267,7 +267,12 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
     Ok(encoder.bytes)
 }
 
-pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
+/// `None` for a message type this core does not know. A newer peer sends
+/// those only after the peer announced the capability for them, so one that
+/// arrives anyway is skipped rather than costing the connection. Bytes after
+/// the fields this core knows are fields a newer peer appended, and are
+/// ignored the same way (docs/protocol.md, "Compatibility").
+pub fn decode_message(bytes: &[u8]) -> io::Result<Option<WireMessage>> {
     if bytes.len() < WIRE_HEADER_SIZE {
         return Err(invalid_data("wire frame is shorter than its header"));
     }
@@ -519,10 +524,9 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
         MESSAGE_PAIR_REVEAL => WireMessage::PairReveal {
             nonce: decoder.array()?,
         },
-        _ => return Err(invalid_data("unknown wire message type")),
+        _ => return Ok(None),
     };
-    decoder.finish()?;
-    Ok(message)
+    Ok(Some(message))
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -705,13 +709,5 @@ impl<'a> Decoder<'a> {
             scroll_x: self.f64()?,
             scroll_y: self.f64()?,
         })
-    }
-
-    fn finish(self) -> io::Result<()> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(invalid_data("wire frame contains trailing bytes"))
-        }
     }
 }
