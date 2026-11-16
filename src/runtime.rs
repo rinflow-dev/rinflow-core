@@ -18,10 +18,10 @@ use crate::input::{
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::media::MediaHub;
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2,
-    CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
-    LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
-    negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_DEVICE_SETTINGS, CAPABILITY_INPUT_ECHO,
+    CAPABILITY_INPUT_V2, CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE,
+    CoreConfig, DISCOVERY_GROUP, LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer,
+    PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
 use crate::remap::ModifierMap;
@@ -147,6 +147,14 @@ pub enum Command {
     /// A game or a pointer-lock page holds this device's pointer: whoever
     /// drives it stops crossing at its edges meanwhile.
     SetPointerLocked(bool),
+    /// What this device is set to, for peers to show (`DeviceSettings`): a
+    /// JSON object.
+    SetDeviceSettings(Value),
+    /// Asks a peer to change its settings (`DeviceSettingsChange`).
+    ChangeDeviceSettings {
+        peer_id: String,
+        settings: Value,
+    },
     Stop,
 }
 
@@ -365,6 +373,7 @@ async fn run(
         answered_probes: HashMap::new(),
         modifier_map: config.modifier_map,
         pointer_locked: false,
+        device_settings: None,
         refitting: false,
         capabilities,
         fingerprint: fingerprint.clone(),
@@ -455,6 +464,10 @@ async fn run(
                     Some(Command::ReportUserActivity) => state.report_user_activity(),
                     Some(Command::LockPeers) => state.lock_peers(),
                     Some(Command::SetPointerLocked(locked)) => state.set_pointer_locked(locked),
+                    Some(Command::SetDeviceSettings(settings)) => state.set_device_settings(&settings),
+                    Some(Command::ChangeDeviceSettings { peer_id, settings }) => {
+                        state.change_device_settings(&peer_id, &settings)
+                    }
                     Some(
                         Command::SendInput(_)
                         | Command::SetInputTarget(_)
@@ -639,6 +652,8 @@ struct Runtime<'a> {
     modifier_map: ModifierMap,
     /// A game or a pointer-lock page holds this device's pointer.
     pointer_locked: bool,
+    /// What this device is set to, as its shell said (`SetDeviceSettings`).
+    device_settings: Option<String>,
     /// Placements are being fitted again after a change (`refit_others`);
     /// the moves that makes do not start another round.
     refitting: bool,
@@ -729,6 +744,24 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Whether a device's settings, as JSON text, go in one message.
+fn settings_fit(settings: &str) -> bool {
+    settings.len() <= crate::model::MAX_DEVICE_SETTINGS_LENGTH
+}
+
+/// `peer_settings` or `settings_change_requested`, unless what the peer sent
+/// is not a JSON object.
+fn emit_settings(sink: &EventSink, event: &str, peer_id: Option<&str>, settings: &str) {
+    match serde_json::from_str::<Value>(settings) {
+        Ok(settings) if settings.is_object() => sink.emit_value(json!({
+            "event": event,
+            "peer_id": peer_id,
+            "settings": settings
+        })),
+        _ => {}
+    }
 }
 
 impl Runtime<'_> {
@@ -1224,6 +1257,55 @@ impl Runtime<'_> {
         }
     }
 
+    /// This device's settings changed, or are known at last: peers hear.
+    /// Also when they are as they were: that is the answer to a peer that
+    /// asked for a change that was not made.
+    fn set_device_settings(&mut self, settings: &Value) {
+        let settings = settings.to_string();
+        if !settings_fit(&settings) {
+            return;
+        }
+        self.device_settings = Some(settings);
+        let ids: Vec<u64> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.tell_device_settings(id);
+        }
+    }
+
+    /// Tells a peer what this device is set to, if its shell said.
+    fn tell_device_settings(&self, id: u64) {
+        let (Some(session), Some(settings)) = (self.sessions.get(&id), &self.device_settings)
+        else {
+            return;
+        };
+        if session.established()
+            && session.connection.capabilities & CAPABILITY_DEVICE_SETTINGS != 0
+        {
+            let _ = session
+                .connection
+                .send_control(WireMessage::DeviceSettings {
+                    settings: settings.clone(),
+                });
+        }
+    }
+
+    fn change_device_settings(&mut self, peer_id: &str, settings: &Value) {
+        let settings = settings.to_string();
+        let session = self
+            .established_session(peer_id)
+            .and_then(|id| self.sessions.get(&id));
+        let Some(session) = session else {
+            return;
+        };
+        if settings_fit(&settings)
+            && session.connection.capabilities & CAPABILITY_DEVICE_SETTINGS != 0
+        {
+            let _ = session
+                .connection
+                .send_control(WireMessage::DeviceSettingsChange { settings });
+        }
+    }
+
     // ---- Arrangement ----------------------------------------------------
 
     /// Records a peer's displays and reports a change.
@@ -1644,6 +1726,7 @@ impl Runtime<'_> {
                 WireMessage::ScreenInfo { .. }
                 | WireMessage::Placement { .. }
                 | WireMessage::MediaOffer { .. }
+                | WireMessage::DeviceSettings { .. }
                 | WireMessage::DataInvite { .. } => {
                     let kind = std::mem::discriminant(&message);
                     session
@@ -1767,6 +1850,18 @@ impl Runtime<'_> {
                     "peer_id": session.peer_id(),
                     "locked": locked
                 }));
+            }
+            // Both are the shells' business: the core only carries them.
+            WireMessage::DeviceSettings { settings } => {
+                emit_settings(self.sink, "peer_settings", session.peer_id(), &settings);
+            }
+            WireMessage::DeviceSettingsChange { settings } => {
+                emit_settings(
+                    self.sink,
+                    "settings_change_requested",
+                    session.peer_id(),
+                    &settings,
+                );
             }
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
@@ -2016,6 +2111,7 @@ impl Runtime<'_> {
         self.send_placement(&peer_id);
         self.invite_data_link(id);
         self.offer_media(id);
+        self.tell_device_settings(id);
         // What the peer sent while it waited for this side.
         for message in held {
             self.message(id, message, None);

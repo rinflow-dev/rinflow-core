@@ -66,6 +66,11 @@ pub const CAPABILITY_MEDIA: u64 = 1 << 14;
 /// screen (see `docs/attached-screens.md`). Announced with
 /// `CoreConfig::attachable`.
 pub const CAPABILITY_ATTACHABLE: u64 = 1 << 15;
+/// Understands `DeviceSettings` and `DeviceSettingsChange`: what a device is
+/// set to, shown and changed from another device.
+pub const CAPABILITY_DEVICE_SETTINGS: u64 = 1 << 16;
+/// A device's settings on the wire (JSON text), at most.
+pub const MAX_DEVICE_SETTINGS_LENGTH: usize = 4096;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -76,7 +81,8 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_PRESENCE
     | CAPABILITY_POINTER_LOCK
     | CAPABILITY_PAIRING_V2
-    | CAPABILITY_INPUT_ECHO;
+    | CAPABILITY_INPUT_ECHO
+    | CAPABILITY_DEVICE_SETTINGS;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
@@ -631,6 +637,20 @@ pub enum WireMessage {
     /// with `CAPABILITY_INPUT_ECHO`.
     InputEcho {
         stamp: u64,
+    },
+    /// What the sender is set to, where another device may show and change
+    /// it (a KVM: how it names itself to the computer on its USB port): a
+    /// JSON object the two shells agree on, which the core carries unread.
+    /// Sent when the session starts and whenever it changes. Only to peers
+    /// with `CAPABILITY_DEVICE_SETTINGS`.
+    DeviceSettings {
+        settings: String,
+    },
+    /// Asks the receiver to change its settings to these (some of them, or
+    /// all). Its shell decides, and answers with `DeviceSettings`. Only to
+    /// peers with `CAPABILITY_DEVICE_SETTINGS`.
+    DeviceSettingsChange {
+        settings: String,
     },
 }
 

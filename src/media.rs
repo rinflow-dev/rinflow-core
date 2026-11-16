@@ -634,7 +634,11 @@ impl MediaHub {
                     "overflows": overflows.saturating_sub(counts.overflows),
                     "skipped": skipped.saturating_sub(counts.skipped),
                     "kbps": counts.bytes as f64 * 8.0 / 1000.0 / seconds,
-                    "worst_wait_ms": counts.worst_wait.as_secs_f64() * 1000.0
+                    "worst_wait_ms": counts.worst_wait.as_secs_f64() * 1000.0,
+                    // What the connection may have on its way at once: when
+                    // frames wait though nothing is lost and the round trip
+                    // is short, this says whether it was the limit.
+                    "cwnd": path.cwnd
                 })
             };
             (self.events)(report);

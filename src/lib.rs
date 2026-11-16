@@ -3664,6 +3664,51 @@ mod tests {
     }
 
     #[test]
+    fn a_device_tells_its_settings_and_is_asked_to_change_them() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("settings-a", discovery_port);
+        let mut b = test_core("settings-b", discovery_port);
+        let told = |name: &'static str| {
+            wait_for_event(&a.events, Duration::from_secs(2), move |event| {
+                event["event"] == "peer_settings"
+                    && event["peer_id"] == "settings-b"
+                    && event["settings"]["usb"]["product"] == name
+            })
+        };
+        // Said before anybody is connected: told when somebody is.
+        let settings = |name: &str| serde_json::json!({ "usb": { "product": name } });
+        b.thread
+            .send(Command::SetDeviceSettings(settings("first")))
+            .unwrap();
+        wait_for_peers(&a, &["settings-b"]);
+        a.thread
+            .send(Command::Connect("settings-b".into()))
+            .unwrap();
+        wait_connected(&a, "settings-b");
+        wait_connected(&b, "settings-a");
+        told("first");
+        // A asks; B's shell hears, changes and says so.
+        a.thread
+            .send(Command::ChangeDeviceSettings {
+                peer_id: "settings-b".into(),
+                settings: settings("second"),
+            })
+            .unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "settings_change_requested"
+                && event["peer_id"] == "settings-a"
+                && event["settings"]["usb"]["product"] == "second"
+        });
+        b.thread
+            .send(Command::SetDeviceSettings(settings("second")))
+            .unwrap();
+        told("second");
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
     fn a_driven_device_whose_pointer_is_held_tells_its_controller() {
         let _network = network_test();
         let discovery_port = free_udp_port();

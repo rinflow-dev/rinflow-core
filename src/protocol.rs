@@ -5,7 +5,7 @@
 use crate::clipboard::{CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_SIZE};
 use crate::files::FILE_CHUNK_SIZE;
 use crate::layout::{Display, MAX_DISPLAYS, Offset, validate_displays};
-use crate::model::{LcInputEvent, MAX_INPUT_BATCH_SIZE, WireMessage};
+use crate::model::{LcInputEvent, MAX_DEVICE_SETTINGS_LENGTH, MAX_INPUT_BATCH_SIZE, WireMessage};
 use std::io;
 
 const WIRE_MAGIC: [u8; 2] = *b"LC";
@@ -43,6 +43,8 @@ const MESSAGE_FILE_STREAM_CLOSE: u8 = 27;
 const MESSAGE_FILE_OFFER_REVOKE: u8 = 28;
 const MESSAGE_INPUT_ECHO: u8 = 29;
 const MESSAGE_MEDIA_OFFER: u8 = 30;
+const MESSAGE_DEVICE_SETTINGS: u8 = 31;
+const MESSAGE_DEVICE_SETTINGS_CHANGE: u8 = 32;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -77,6 +79,8 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::FileStreamData { .. } => MESSAGE_FILE_STREAM_DATA,
         WireMessage::FileStreamClose { .. } => MESSAGE_FILE_STREAM_CLOSE,
         WireMessage::FileOfferRevoke { .. } => MESSAGE_FILE_OFFER_REVOKE,
+        WireMessage::DeviceSettings { .. } => MESSAGE_DEVICE_SETTINGS,
+        WireMessage::DeviceSettingsChange { .. } => MESSAGE_DEVICE_SETTINGS_CHANGE,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -259,6 +263,14 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::MediaOffer { token, port } => {
             encoder.u64(*token);
             encoder.u16(*port);
+        }
+        WireMessage::DeviceSettings { settings }
+        | WireMessage::DeviceSettingsChange { settings } => {
+            if settings.is_empty() || settings.len() > MAX_DEVICE_SETTINGS_LENGTH {
+                return Err(invalid_data("invalid device settings length"));
+            }
+            encoder.u16(settings.len() as u16);
+            encoder.bytes.extend_from_slice(settings.as_bytes());
         }
         WireMessage::PairCommit { commitment: value }
         | WireMessage::PairNonce { nonce: value }
@@ -499,6 +511,12 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<WireMessage> {
             token: decoder.u64()?,
             port: decoder.u16()?,
         },
+        MESSAGE_DEVICE_SETTINGS => WireMessage::DeviceSettings {
+            settings: decoder.device_settings()?,
+        },
+        MESSAGE_DEVICE_SETTINGS_CHANGE => WireMessage::DeviceSettingsChange {
+            settings: decoder.device_settings()?,
+        },
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,
         MESSAGE_USER_ACTIVE => WireMessage::UserActive,
@@ -673,6 +691,15 @@ impl<'a> Decoder<'a> {
         }
         String::from_utf8(self.take(length)?.to_vec())
             .map_err(|_| invalid_data("identity string is not UTF-8"))
+    }
+
+    fn device_settings(&mut self) -> io::Result<String> {
+        let length = self.u16()? as usize;
+        if length == 0 || length > MAX_DEVICE_SETTINGS_LENGTH {
+            return Err(invalid_data("invalid device settings length"));
+        }
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| invalid_data("device settings are not UTF-8"))
     }
 
     fn input_event(&mut self) -> io::Result<LcInputEvent> {

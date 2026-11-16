@@ -208,6 +208,26 @@ impl Core {
         self.thread.send(Command::SetPointerLocked(locked))
     }
 
+    /// What this device is set to, where another device may show and change
+    /// it: a JSON object the shells agree on. Peers report `peer_settings`,
+    /// now and whenever they connect.
+    pub fn set_device_settings(&self, settings: serde_json::Value) -> Result<(), String> {
+        self.thread.send(Command::SetDeviceSettings(settings))
+    }
+
+    /// Asks a connected peer to change its settings: its shell reports
+    /// `settings_change_requested`, and answers with its settings.
+    pub fn change_device_settings(
+        &self,
+        peer_id: &str,
+        settings: serde_json::Value,
+    ) -> Result<(), String> {
+        self.thread.send(Command::ChangeDeviceSettings {
+            peer_id: peer_id.to_owned(),
+            settings,
+        })
+    }
+
     /// Where the frames of watched pictures go (see `media.rs`): called
     /// with the peer's device ID, on the core's threads, in order. Set it
     /// before `watch`.

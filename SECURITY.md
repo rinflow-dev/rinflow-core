@@ -4,7 +4,7 @@ Rinflow lets a connected device inject keyboard and mouse input and exchange cli
 
 ## Reporting a vulnerability
 
-**Do not open a public issue.** Instead, use [private vulnerability reporting](../../security/advisories/new) on this repository. If that is not available, email akarineren@gmail.com.
+**Do not open a public issue.** Instead, use [private vulnerability reporting](../../security/advisories/new) on this repository. If that is not available, email support@rinflow.com.
 
 Please include:
 

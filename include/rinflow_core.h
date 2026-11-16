@@ -52,6 +52,10 @@
  *    lc_core_set_relay_target, lc_core_relay_input, events
  *    "attached_screens" and "relay_ended". Capability bit 15; nothing else
  *    changes on the wire.
+ *    Within 11: device settings (lc_core_set_device_settings,
+ *    lc_core_change_device_settings, events "peer_settings" and
+ *    "settings_change_requested"). Capability bit 16, wire messages 31 and
+ *    32, only to peers that announce the bit.
  */
 #define LC_CORE_ABI_VERSION 11
 
@@ -276,6 +280,27 @@ bool lc_core_lock_peers(LcCore *core);
  * brings the pointer back.
  */
 bool lc_core_set_pointer_locked(LcCore *core, bool locked);
+
+/*
+ * Device settings (within version 11). What a device is set to, where another
+ * device may show and change it: a KVM has no screen of its own for a
+ * settings page, so the device that drives it shows one. The settings are a
+ * JSON object that the two shells agree on (at most 4096 bytes); the core
+ * carries it unread.
+ *
+ * The device that has settings calls lc_core_set_device_settings whenever
+ * they change (and once at start). Each connected peer reports
+ *   {"event":"peer_settings","peer_id":…,"settings":{…}}
+ * then, and when it connects. To change them, a peer calls
+ * lc_core_change_device_settings with the keys it wants changed; the device
+ * reports
+ *   {"event":"settings_change_requested","peer_id":…,"settings":{…}}
+ * and its shell decides, applies and calls lc_core_set_device_settings with
+ * what it is set to now. Only paired (admitted) peers are heard.
+ */
+bool lc_core_set_device_settings(LcCore *core, const char *settings_json);
+bool lc_core_change_device_settings(LcCore *core, const char *peer_id,
+                                    const char *settings_json);
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */

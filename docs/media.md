@@ -29,9 +29,9 @@ A frame waits while the link is busy with the one before. When the oldest waitin
 
 The core never changes the picture; it tells the source's shell how each viewer's link does, four times a second:
 
-`{"event":"media_link","peer_id":…,"rtt_ms":…,"min_rtt_ms":…,"sent_packets":…,"lost_packets":…,"frames":…,"overflows":…,"skipped":…,"kbps":…,"worst_wait_ms":…}`
+`{"event":"media_link","peer_id":…,"rtt_ms":…,"min_rtt_ms":…,"sent_packets":…,"lost_packets":…,"frames":…,"overflows":…,"skipped":…,"kbps":…,"worst_wait_ms":…,"cwnd":…}`
 
-`frames` went out in that second at `kbps` (what actually went, not the encoder's setting). `overflows` counts the times frames were dropped for being late (the link could not keep up); `skipped` all frames left out, including those waiting for a key frame a decoder asked for. `worst_wait_ms` is the longest a frame waited from `send_frame` until the link took all of it. `rtt_ms` and the packet counts are the media connection's own. The NanoKVM agent lowers its encoder's bit rate (and then frame rate) on a link in trouble and raises them again once it keeps up (`rinflow-nanokvm`, `agent/src/rate.rs`).
+`frames` went out in that second at `kbps` (what actually went, not the encoder's setting). `overflows` counts the times frames were dropped for being late (the link could not keep up); `skipped` all frames left out, including those waiting for a key frame a decoder asked for. `worst_wait_ms` is the longest a frame waited from `send_frame` until the link took all of it. `rtt_ms` and the packet counts are the media connection's own. `cwnd` is its congestion window in bytes: when frames wait though nothing is lost and the round trip is short, it says whether the connection was the limit or the source's own processor. The NanoKVM agent lowers its encoder's bit rate (and then frame rate) on a link in trouble and raises them again once it keeps up (`rinflow-nanokvm`, `agent/src/rate.rs`).
 
 A frame's bytes are shared, not copied, from `send_media_frame` (which takes a `Vec<u8>` or `Bytes`) to the packets QUIC makes of them, and for every viewer; `MediaFrame::data` is `Bytes` (re-exported as `rinflow_core::Bytes`). `lc_core_send_media_frame` copies once, out of the caller's memory.
 

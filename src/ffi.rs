@@ -397,6 +397,47 @@ pub unsafe extern "C" fn lc_core_set_pointer_locked(core: *mut LcCore, locked: b
     send_command(core, Command::SetPointerLocked(locked))
 }
 
+/// What this device is set to, where another device may show and change it
+/// (a KVM: how it names itself on its USB port): a JSON object the shells
+/// agree on. Peers report `peer_settings`, now and whenever they connect.
+/// Added within version 11 (capability bit 16, wire messages 31 and 32).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_device_settings(
+    core: *mut LcCore,
+    settings_json: *const c_char,
+) -> bool {
+    match unsafe { settings_argument(settings_json) } {
+        Some(settings) => send_command(core, Command::SetDeviceSettings(settings)),
+        None => false,
+    }
+}
+
+/// Asks a connected peer to change its settings to these (some of them, or
+/// all): its shell reports `settings_change_requested`, decides, and answers
+/// with its settings (`peer_settings` here). Added within version 11.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_change_device_settings(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    settings_json: *const c_char,
+) -> bool {
+    let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+        return false;
+    };
+    match unsafe { settings_argument(settings_json) } {
+        Some(settings) => send_command(core, Command::ChangeDeviceSettings { peer_id, settings }),
+        None => false,
+    }
+}
+
+/// A JSON object, short enough for one message.
+unsafe fn settings_argument(json: *const c_char) -> Option<serde_json::Value> {
+    let json = unsafe { string_argument(json) }?;
+    let settings: serde_json::Value = serde_json::from_str(&json).ok()?;
+    (settings.is_object() && json.len() <= crate::model::MAX_DEVICE_SETTINGS_LENGTH)
+        .then_some(settings)
+}
+
 /// Lets peers drive this device (the default), or stops them. Added within
 /// version 6 (nothing else changed).
 #[unsafe(no_mangle)]

@@ -23,6 +23,7 @@ First public version.
 - ChaCha20-Poly1305 is preferred on processors without AES instructions
 - A frame of a picture is shared with QUIC rather than copied (`MediaFrame::data` is `Bytes`), and a device with one processor runs one I/O thread instead of two: 15 % less processor time for the same picture on a 1 GHz RISC-V core
 - Attached screens: a KVM (`attachable`) placed right beside a device counts among that device's displays for every other peer, and while a peer drives the device, input on that screen is passed on to the KVM without giving up control (`lc_core_set_relay_target`, `lc_core_relay_input`)
+- Device settings: a device without a screen of its own (a KVM) says what it is set to (`lc_core_set_device_settings`, event `peer_settings`), and a paired peer asks it to change (`lc_core_change_device_settings`, event `settings_change_requested`); the core carries the JSON unread
 
 ### Known issues
 
