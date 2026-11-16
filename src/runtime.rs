@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 mod data;
+mod discovery;
 mod file_streams;
 pub mod manual;
 pub(crate) mod reconnect;
@@ -31,13 +32,11 @@ use crate::transport::{
 use data::{DataLink, Download, Upload};
 use reconnect::{INCOMPATIBLE, LOCAL_REQUEST, Retry, WRONG_DEVICE};
 use serde_json::{Value, json};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use trust::{Admission, Pairing};
 
@@ -250,14 +249,16 @@ async fn run(
     platform_input: PlatformInputQueue,
     sink: EventSink,
 ) {
-    let udp = match create_discovery_socket(config.discovery_port) {
-        Ok(socket) => socket,
-        Err(error) => {
-            sink.emit_error(format!("discovery socket failed: {error}"));
-            sink.emit_value(json!({ "event": "stopped" }));
-            return;
-        }
-    };
+    let group = Ipv4Addr::from(DISCOVERY_GROUP);
+    let (mut discovery, mut discovered) =
+        match discovery::Discovery::bind(config.discovery_port, group) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                sink.emit_error(format!("discovery socket failed: {error}"));
+                sink.emit_value(json!({ "event": "stopped" }));
+                return;
+            }
+        };
     // This device's certificate and its two QUIC endpoints (see `quic.rs`):
     // every connection is QUIC with TLS 1.3, so without them nothing works.
     let identity = match Identity::load_or_create(
@@ -282,23 +283,16 @@ async fn run(
     let capabilities = config.advertised_capabilities();
     let fingerprint = identity.fingerprint.clone();
 
-    let group = Ipv4Addr::from(DISCOVERY_GROUP);
-    let multicast = SocketAddr::V4(SocketAddrV4::new(group, config.discovery_port));
-    let broadcast = SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::BROADCAST,
-        config.discovery_port,
-    ));
-    // Not fatal: without a network yet (a PC that starts Rinflow at
-    // sign-in before Wi-Fi is up) the join fails, and is tried again with
-    // every announcement. Broadcast works meanwhile.
-    let mut joined = join_discovery_group(&udp, group);
+    // Announcement rounds in a row that got out nowhere, and rounds since
+    // the interfaces were last read.
+    let mut failed_rounds = 0_u32;
+    let mut rounds = 0_u32;
     let (connection_events_tx, mut connection_events_rx) = mpsc::unbounded_channel();
     let mut announce_timer = tokio::time::interval(Duration::from_secs(2));
     let mut maintenance_timer = tokio::time::interval(Duration::from_secs(1));
     // After the system slept, one tick each rather than every one missed.
     announce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut buffer = vec![0_u8; 64 * 1024];
     let mut state = Runtime {
         config: &config,
         sink: &sink,
@@ -393,10 +387,10 @@ async fn run(
                     Some(Command::NetworkChanged) => {
                         state.network_changed();
                         state.manual_network_changed();
-                        // The group membership belongs to an interface, which
-                        // may be gone or new: join afresh, and announce now.
-                        let _ = udp.leave_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
-                        joined = join_discovery_group(&udp, group);
+                        // Interfaces came or went, and a socket that lived
+                        // through the change may not work any more: a new one,
+                        // joined on what is there now, announcing at once.
+                        discovery.reset(&sink, "network_changed", None);
                         announce_timer.reset_immediately();
                     }
                     Some(Command::SetManualAddresses(addresses)) => state.set_manual_addresses(addresses),
@@ -427,25 +421,34 @@ async fn run(
                     accept_in_background(incoming, true, state.connection_events.clone());
                 }
             }
-            received = udp.recv_from(&mut buffer) => {
-                if let Ok((length, source)) = received {
-                    state.announcement(&buffer[..length], source);
-                }
-            }
+            Some(received) = discovered.recv() => match received {
+                discovery::Received::Datagram(datagram, source) => state.announcement(&datagram, source),
+                discovery::Received::Failed(error) => discovery.reset(&sink, "receive_failed", Some(&error)),
+            },
             connection_event = connection_events_rx.recv() => {
                 if let Some(event) = connection_event {
                     state.connection_event(event);
                 }
             }
             _ = announce_timer.tick() => {
-                if !joined {
-                    joined = join_discovery_group(&udp, group);
+                // Every 10 s, the interfaces, in case a change went unreported.
+                rounds += 1;
+                if rounds.is_multiple_of(5) {
+                    discovery.refresh();
                 }
                 let announcement = state.announcement.clone();
-                let _ = udp.send_to(&announcement, multicast).await;
-                // Broadcast is a compatibility fallback for networks or VPN setups that
-                // suppress multicast. Receivers deduplicate announcements by device ID.
-                let _ = udp.send_to(&announcement, broadcast).await;
+                match discovery.announce(&announcement).await {
+                    Ok(()) => failed_rounds = 0,
+                    // Three rounds (6 s) without one announcement out: the
+                    // socket is made anew.
+                    Err(error) => {
+                        failed_rounds += 1;
+                        if failed_rounds >= 3 {
+                            failed_rounds = 0;
+                            discovery.reset(&sink, "send_failed", Some(&error));
+                        }
+                    }
+                }
                 // And straight to the addresses the user added (`manual.rs`).
                 state.probe_manual();
             }
@@ -453,7 +456,7 @@ async fn run(
         }
         // Probes and answers queued meanwhile (see `manual.rs`).
         for (datagram, target) in std::mem::take(&mut state.datagrams) {
-            let _ = udp.send_to(&datagram, target).await;
+            discovery.send_to(&datagram, target).await;
         }
     }
 
@@ -2228,27 +2231,4 @@ fn emit_release_events(
         "reason": reason,
         "released_event_count": count
     }));
-}
-
-fn create_discovery_socket(port: u16) -> std::io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.set_multicast_ttl_v4(1)?;
-    socket.set_multicast_loop_v4(true)?;
-    socket.set_broadcast(true)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-    socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket.into())
-}
-
-/// Joins the discovery group on the system's default interface; false if
-/// that is not possible now (no network).
-fn join_discovery_group(socket: &UdpSocket, group: Ipv4Addr) -> bool {
-    match socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED) {
-        Ok(()) => true,
-        // Still a member there.
-        Err(error) => error.kind() == std::io::ErrorKind::AddrInUse,
-    }
 }
