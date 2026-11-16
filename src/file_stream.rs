@@ -4,7 +4,7 @@
 
 //! Blocking, bounded reads for native clipboard providers. Never call these
 //! methods from a core event callback or an input/UI event loop.
-use crate::runtime::Command;
+use crate::runtime::{Command, CoreThread};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc,
@@ -52,6 +52,35 @@ pub struct RemoteFileLease {
 }
 
 impl RemoteFileLease {
+    /// Pins the peer's current offer `transfer` (from `files_available`).
+    /// Blocks for at most `READ_TIMEOUT`.
+    pub(crate) fn open(thread: &CoreThread, peer: &str, transfer: u32) -> Result<Self, String> {
+        let lease = next_id();
+        let (reply, result) = mpsc::sync_channel(1);
+        thread.send(Command::FileStream(StreamCommand::Open {
+            peer: peer.to_owned(),
+            transfer,
+            lease,
+            reply,
+        }))?;
+        match result.recv_timeout(READ_TIMEOUT) {
+            Ok(Ok(())) => Ok(Self {
+                commands: thread.sender(),
+                id: lease,
+            }),
+            outcome => {
+                let _ = thread.send(Command::FileStream(StreamCommand::Close {
+                    lease,
+                    reason: "open failed".to_owned(),
+                }));
+                Err(outcome
+                    .ok()
+                    .and_then(Result::err)
+                    .unwrap_or_else(|| "remote file open timed out".to_owned()))
+            }
+        }
+    }
+
     /// Returns at most `MAX_READ_SIZE` bytes, or an error. Offsets are u64 so
     /// large files and seeking do not require an entire local cache.
     pub fn read(&self, entry: u32, offset: u64, length: usize) -> Result<Vec<u8>, String> {

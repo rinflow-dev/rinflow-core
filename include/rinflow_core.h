@@ -6,6 +6,7 @@
 #define RINFLOW_CORE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -47,8 +48,12 @@
  *    lc_core_set_modifier_map replace "shortcut_remap" and
  *    lc_core_set_shortcut_remap. Nothing changes on the wire. Event
  *    "files_not_shared" when copied files pass the limits (see Files).
+ * 11: on-demand files: config key "on_demand_files", events
+ *    "files_available", "files_unavailable" and "files_stream_ended",
+ *    lc_core_open_remote_files, lc_file_lease_read, lc_file_lease_close and
+ *    lc_core_revoke_file_streams (see On-demand files).
  */
-#define LC_CORE_ABI_VERSION 10
+#define LC_CORE_ABI_VERSION 11
 
 #ifdef __cplusplus
 extern "C" {
@@ -333,6 +338,51 @@ bool lc_core_set_clipboard(LcCore *core, const char *clipboard_json);
  */
 bool lc_core_accept_files(LcCore *core, uint32_t transfer);
 bool lc_core_cancel_files(LcCore *core, uint32_t transfer);
+
+/*
+ * On-demand files (version 11; config "on_demand_files": true, which needs
+ * "files"). A peer's copied files are not fetched when they arrive; the
+ * shell offers them to the system clipboard as promises and reads the bytes
+ * only when an application pastes. A peer whose core cannot serve them
+ * (no capability 12) still goes through "files_offered" above.
+ *   {"event":"files_available","peer_id":…,"manifest":{"transfer":N,
+ *    "total_size":…,"entries":[{"path":"Folder/a.txt","size":…},
+ *    {"path":"Folder","dir":true},…]}}
+ *       the peer's clipboard holds these files: entry i is index i, paths
+ *       are relative with "/" and checked not to leave where they are
+ *       written (no "..", no absolute paths). Nothing else of that
+ *       clipboard is delivered.
+ *   {"event":"files_unavailable","peer_id":…}
+ *       the offer is gone (the peer copied something else, or left)
+ * For one paste: lc_core_open_remote_files pins the offer, so the paste
+ * goes on even if either clipboard changes meanwhile; lc_file_lease_read
+ * reads ranges of an entry; lc_file_lease_close ends it with
+ *   "delivered" when the target has every byte, else "cancelled"
+ * Progress comes as on the receiving side above ("files_receiving",
+ * "files_progress"), then
+ *   {"event":"files_stream_ended","peer_id":…,"transfer":N,"reason":…}
+ * Opening and every read block for at most 15 s: call them on a worker
+ * thread, never in a core callback or on the UI thread. A file the peer
+ * changed or deleted meanwhile fails its reads rather than mixing versions.
+ * lc_core_revoke_file_streams ends every paste under way on both sides and
+ * withdraws this device's own offer, as when the user turns sharing off.
+ */
+#define LC_FILE_READ_MAX (256 * 1024)
+typedef struct LcFileLease LcFileLease;
+/* NULL if the offer is gone, the peer is not connected, or it timed out. */
+LcFileLease *lc_core_open_remote_files(LcCore *core, const char *peer_id, uint32_t transfer);
+/* Bytes read (at most LC_FILE_READ_MAX), 0 at the end of the entry, -1 on
+ * failure. Threads may read one lease at once. */
+int64_t lc_file_lease_read(
+    LcFileLease *lease,
+    uint32_t entry,
+    uint64_t offset,
+    uint8_t *buffer,
+    size_t length
+);
+/* Frees the lease, after its last read returned. reason may be NULL. */
+void lc_file_lease_close(LcFileLease *lease, const char *reason);
+bool lc_core_revoke_file_streams(LcCore *core);
 
 /*
  * Security (version 7). Every connection is QUIC over UDP with TLS 1.3: the

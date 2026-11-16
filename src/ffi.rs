@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::clipboard::Clipboard;
+use crate::file_stream::RemoteFileLease;
 use crate::layout::{Display, Offset, Side};
 use crate::model::{CoreConfig, LcInputEvent};
 use crate::runtime::{Command, CoreThread, EventSink};
@@ -37,9 +38,12 @@ pub struct LcCore {
 /// `lc_core_set_modifier_map` replace `shortcut_remap` and
 /// `lc_core_set_shortcut_remap`; event `files_not_shared` when copied files
 /// pass the limits (10 000 entries, 32 folders deep).
+/// Version 11 brings on-demand files to the C ABI: config key
+/// `on_demand_files`, `lc_core_open_remote_files`, `lc_file_lease_read`,
+/// `lc_file_lease_close` and `lc_core_revoke_file_streams`.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
-    10
+    11
 }
 
 /// Reads a C string argument; `None` for null or invalid UTF-8.
@@ -294,6 +298,93 @@ pub unsafe extern "C" fn lc_core_accept_files(core: *mut LcCore, transfer: u32) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lc_core_cancel_files(core: *mut LcCore, transfer: u32) -> bool {
     send_command(core, Command::CancelFiles(transfer))
+}
+
+/// One paste of a peer's files (`files_available`), until
+/// `lc_file_lease_close`.
+pub struct LcFileLease(RemoteFileLease);
+
+/// Pins the peer's offer `transfer` for one paste. Blocks for at most 15 s;
+/// null if the offer is gone, the peer is not connected, or it timed out.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_open_remote_files(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    transfer: u32,
+) -> *mut LcFileLease {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return std::ptr::null_mut();
+        };
+        if core.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a non-null pointer came from lc_core_create.
+        let core = unsafe { &*core };
+        match RemoteFileLease::open(&core.thread, &peer_id, transfer) {
+            Ok(lease) => Box::into_raw(Box::new(LcFileLease(lease))),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Reads up to `length` bytes (at most `MAX_READ_SIZE` at a time) of entry
+/// `entry` from `offset` into `buffer`: how many, 0 at the end of the file,
+/// -1 on failure (timeout, cancelled, connection lost, the file changed on
+/// the peer). Blocks for at most 15 s. Several threads may read at once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_file_lease_read(
+    lease: *mut LcFileLease,
+    entry: u32,
+    offset: u64,
+    buffer: *mut u8,
+    length: usize,
+) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if lease.is_null() || (buffer.is_null() && length > 0) {
+            return -1;
+        }
+        // SAFETY: a non-null pointer came from lc_core_open_remote_files and
+        // is not closed while reads run.
+        let lease = unsafe { &*lease };
+        match lease.0.read(entry, offset, length) {
+            Ok(data) => {
+                let count = data.len().min(length);
+                // SAFETY: the caller's buffer holds `length` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, count) };
+                count as i64
+            }
+            Err(_) => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Ends the paste and frees the lease, once no read runs. `reason`:
+/// "delivered" when the target got every byte, otherwise why it stopped
+/// ("cancelled"); reported by `files_stream_ended`. Null is "released".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_file_lease_close(lease: *mut LcFileLease, reason: *const c_char) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if lease.is_null() {
+            return;
+        }
+        // SAFETY: a non-null pointer came from lc_core_open_remote_files.
+        let lease = unsafe { Box::from_raw(lease) };
+        let reason = unsafe { string_argument(reason) }.unwrap_or_else(|| "released".to_owned());
+        lease.0.finish(&reason);
+    }));
+}
+
+/// Ends every paste under way and stops offering this device's files, as
+/// when the user turns sharing off. Copying again offers files again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_revoke_file_streams(core: *mut LcCore) -> bool {
+    send_command(
+        core,
+        Command::FileStream(crate::file_stream::StreamCommand::Revoke),
+    )
 }
 
 /// Pairing: the user checked the code of `pairing_requested` and accepts.
