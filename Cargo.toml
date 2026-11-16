@@ -1,6 +1,6 @@
 [package]
 name = "rinflow-core"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 description = "Cross-platform discovery, protocol, and network I/O core for Rinflow"
 license = "MPL-2.0"
