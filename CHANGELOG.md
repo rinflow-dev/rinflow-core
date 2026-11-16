@@ -30,6 +30,7 @@ First public version.
 ### Changed
 
 - A message type from a newer peer is skipped and fields it appended to a message are ignored, instead of closing the connection, so a newer device never cuts off an older one (docs/protocol.md, Compatibility)
+- Discovery announces out of every IPv4 interface and listens on each, instead of only the one the system routes the group to, and replaces its socket when it stops working (`discovery_reset`): a Mac with Ethernet, Wi-Fi and a VPN no longer ended up unable to find or be found by anyone after a network change, until restarted
 
 ### Known issues
 

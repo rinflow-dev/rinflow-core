@@ -185,9 +185,19 @@ bool lc_core_disconnect_peer(LcCore *core, const char *peer_id);
  *       asleep (at most 15 s), no connections are made or taken.
  *   lc_core_network_changed     after waking (didWakeNotification) and
  *       whenever the network changes (an address came or went: Wi-Fi
- *       joined, DHCP, VPN; NWPathMonitor). Announces this device, rejoins
- *       the discovery group, dials the user's devices now, and ends within
- *       3 s the sessions that no longer answer. Harmless to call too often.
+ *       joined, DHCP, VPN; NWPathMonitor). Makes the discovery socket
+ *       anew and announces this device, dials the user's devices now, and
+ *       ends within 3 s the sessions that no longer answer. Harmless to
+ *       call too often.
+ *
+ * Discovery announces out of every IPv4 interface and listens on each (a
+ * Mac on Ethernet and Wi-Fi with a VPN has three default routes), and reads
+ * the interfaces again every 10 s, also for shells that do not report
+ * network changes. When announcing fails everywhere for 6 s, or receiving
+ * fails, it makes its socket anew, and says so for the logs:
+ *   {"event":"discovery_reset","reason":"send_failed","error":"…"}
+ * reason "send_failed", "receive_failed" or "network_changed" ("failed":
+ * the new socket could not be made either; it is tried again).
  */
 bool lc_core_system_will_sleep(LcCore *core);
 bool lc_core_network_changed(LcCore *core);
