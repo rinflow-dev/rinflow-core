@@ -1,6 +1,6 @@
 # 剪贴板与文件传输方案
 
-Windows 现在启用 `on_demand_files`：支持能力位 12 的对端只发布文件描述，通过有界读取和独立 lease 按需取内容；旧对端需要显式接收。详见 [Windows 实现](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/docs/clipboard.md)。下文的自动落盘流程仍是默认接收模式，macOS 外壳继续使用它。
+按需文件（`on_demand_files`）：支持能力位 12 的对端只发布文件描述，粘贴时通过有界读取和独立 lease 按需取内容；旧对端需要显式接收。Windows 通过 Rust 接口使用（见 [Windows 实现](https://github.com/rinflow-dev/rinflow-windows/blob/main/agent/docs/clipboard.md)），C 接口自 ABI 11 起提供（`lc_core_open_remote_files`、`lc_file_lease_read`、`lc_file_lease_close`、`lc_core_revoke_file_streams`，见 `include/rinflow_core.h` 的 On-demand files）。下文的自动落盘流程是不开 `on_demand_files` 时的接收方式。
 
 给各平台外壳（macOS app、Windows agent）的实现说明。**核心库已经实现**（ABI 6）：第 0 部分的数据连接、第 1 部分的剪贴板同步、第 3 部分的 v1 复制粘贴文件，外壳照着接入即可。第 2 部分和第 3 部分里的 v2/v3 是**建议，尚未实现**。
 

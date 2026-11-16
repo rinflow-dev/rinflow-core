@@ -597,6 +597,24 @@ mod tests {
     }
 
     #[test]
+    fn file_lease_functions_refuse_what_they_cannot_use() {
+        use crate::ffi::*;
+        let peer = c"peer";
+        let mut buffer = [0u8; 4];
+        unsafe {
+            assert!(lc_core_open_remote_files(std::ptr::null_mut(), peer.as_ptr(), 1).is_null());
+            assert_eq!(
+                lc_file_lease_read(std::ptr::null_mut(), 0, 0, buffer.as_mut_ptr(), 4),
+                -1
+            );
+            lc_file_lease_close(std::ptr::null_mut(), std::ptr::null());
+            assert!(!lc_core_revoke_file_streams(std::ptr::null_mut()));
+        }
+        assert_eq!(lc_core_abi_version(), 11);
+        assert_eq!(crate::MAX_READ_SIZE, 256 * 1024, "LC_FILE_READ_MAX");
+    }
+
+    #[test]
     fn pointer_motion_is_coalesced_without_reordering_critical_input() {
         let queue = OutboundInputQueue::new();
         assert_eq!(
@@ -2451,26 +2469,7 @@ mod tests {
     }
 
     fn stream_lease(core: &TestCore, peer: &str, transfer: u32) -> crate::RemoteFileLease {
-        let lease = crate::file_stream::next_id();
-        let (reply, result) = std::sync::mpsc::sync_channel(1);
-        core.thread
-            .send(Command::FileStream(
-                crate::file_stream::StreamCommand::Open {
-                    peer: peer.into(),
-                    transfer,
-                    lease,
-                    reply,
-                },
-            ))
-            .unwrap();
-        result
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        crate::RemoteFileLease {
-            id: lease,
-            commands: core.thread.sender(),
-        }
+        crate::RemoteFileLease::open(&core.thread, peer, transfer).unwrap()
     }
 
     #[test]

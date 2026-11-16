@@ -94,31 +94,7 @@ impl Core {
         peer: &str,
         transfer: u32,
     ) -> Result<crate::RemoteFileLease, String> {
-        use crate::file_stream::{READ_TIMEOUT, StreamCommand, next_id};
-        let lease = next_id();
-        let (reply, result) = std::sync::mpsc::sync_channel(1);
-        self.thread.send(Command::FileStream(StreamCommand::Open {
-            peer: peer.to_owned(),
-            transfer,
-            lease,
-            reply,
-        }))?;
-        match result.recv_timeout(READ_TIMEOUT) {
-            Ok(Ok(())) => Ok(crate::RemoteFileLease {
-                commands: self.thread.sender(),
-                id: lease,
-            }),
-            outcome => {
-                let _ = self.thread.send(Command::FileStream(StreamCommand::Close {
-                    lease,
-                    reason: "open failed".to_owned(),
-                }));
-                Err(outcome
-                    .ok()
-                    .and_then(Result::err)
-                    .unwrap_or_else(|| "remote file open timed out".to_owned()))
-            }
-        }
+        crate::RemoteFileLease::open(&self.thread, peer, transfer)
     }
 
     /// Disables file providers and active leases immediately, for a sharing

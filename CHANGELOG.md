@@ -25,6 +25,7 @@ First public version.
 - Key repeats held up on the way for 100 ms or more are not played, so a held Backspace or arrow key no longer overshoots after a stall
 - `link_quality`: an event for every second in which packets were lost or input arrived late, to tell why a pointer stuttered; `input_latency`: how long input takes to a driven peer and back
 - A stable `reason_code` beside every event `reason` and `error` message, so shells can show them in the user's language
+- On-demand files in the C ABI (version 11): with `on_demand_files`, a peer's copied files come as `files_available` and are read only when pasted (`lc_core_open_remote_files`, `lc_file_lease_read`, `lc_file_lease_close`, `lc_core_revoke_file_streams`), as the Rust API already allowed
 
 ### Changed
 
