@@ -18,10 +18,10 @@ use crate::input::{
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::media::MediaHub;
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2,
-    CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
-    LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
-    negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_IDENTIFY_DISPLAYS, CAPABILITY_INPUT_ECHO,
+    CAPABILITY_INPUT_V2, CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE,
+    CoreConfig, DISCOVERY_GROUP, LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer,
+    PlacementRecord, WireMessage, negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
 use crate::remap::ModifierMap;
@@ -138,6 +138,12 @@ pub enum Command {
     ReportUserActivity,
     /// The user locked this device: peers lock too if their users want that.
     LockPeers,
+    /// Show `first`, `first + 1`, … on the peer's displays
+    /// (`IdentifyDisplays`).
+    IdentifyDisplays {
+        peer_id: String,
+        first: u32,
+    },
     /// A game or a pointer-lock page holds this device's pointer: whoever
     /// drives it stops crossing at its edges meanwhile.
     SetPointerLocked(bool),
@@ -420,6 +426,9 @@ async fn run(
                     }
                     Some(Command::ReportUserActivity) => state.report_user_activity(),
                     Some(Command::LockPeers) => state.lock_peers(),
+                    Some(Command::IdentifyDisplays { peer_id, first }) => {
+                        state.identify_displays(&peer_id, first)
+                    }
                     Some(Command::SetPointerLocked(locked)) => state.set_pointer_locked(locked),
                     Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
                         unreachable!("input commands are queued by CoreThread")
@@ -1161,6 +1170,21 @@ impl Runtime<'_> {
         }
     }
 
+    /// A peer that is not connected, or whose core does not know the
+    /// message, shows nothing.
+    fn identify_displays(&mut self, peer_id: &str, first: u32) {
+        let Some(session) = self
+            .established_session(peer_id)
+            .and_then(|id| self.sessions.get(&id))
+            .filter(|session| session.connection.capabilities & CAPABILITY_IDENTIFY_DISPLAYS != 0)
+        else {
+            return;
+        };
+        let _ = session
+            .connection
+            .send_control(WireMessage::IdentifyDisplays { first });
+    }
+
     /// Tells the peers driving this device whether its pointer is held.
     fn set_pointer_locked(&mut self, locked: bool) {
         if self.pointer_locked == locked {
@@ -1714,6 +1738,13 @@ impl Runtime<'_> {
             WireMessage::LockScreen => {
                 self.sink
                     .emit_value(json!({ "event": "lock_requested", "peer_id": session.peer_id() }));
+            }
+            WireMessage::IdentifyDisplays { first } => {
+                self.sink.emit_value(json!({
+                    "event": "identify_displays",
+                    "peer_id": session.peer_id(),
+                    "first": first
+                }));
             }
             WireMessage::PointerLock { locked } => {
                 self.sink.emit_value(json!({

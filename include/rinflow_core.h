@@ -51,7 +51,9 @@
  * 11: on-demand files: config key "on_demand_files", events
  *    "files_available", "files_unavailable" and "files_stream_ended",
  *    lc_core_open_remote_files, lc_file_lease_read, lc_file_lease_close and
- *    lc_core_revoke_file_streams (see On-demand files).
+ *    lc_core_revoke_file_streams (see On-demand files). Within 11:
+ *    identifying displays across devices (lc_core_identify_displays, event
+ *    "identify_displays"; see Identify displays).
  */
 #define LC_CORE_ABI_VERSION 11
 
@@ -257,6 +259,22 @@ bool lc_core_lock_peers(LcCore *core);
  * brings the pointer back.
  */
 bool lc_core_set_pointer_locked(LcCore *core, bool locked);
+
+/*
+ * Identify displays (within version 11), like Identify in Windows' display
+ * settings, across devices. The shell where the user asks numbers the
+ * displays of the arrangement: its own from 1, then each placed peer's in
+ * turn. It shows its own numbers and calls lc_core_identify_displays once
+ * per connected peer with the number of that peer's first display. The peer
+ * reports
+ *   {"event":"identify_displays","peer_id":…,"first":3}
+ * and shows first on its first display, first + 1 on the next, in the order
+ * it gave them to lc_core_set_local_displays, for a few seconds, in the same
+ * place on every screen. A peer whose core is older (no capability bit 17)
+ * is sent nothing and shows nothing; so is one that is not connected.
+ * False for a missing peer_id.
+ */
+bool lc_core_identify_displays(LcCore *core, const char *peer_id, uint32_t first);
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */

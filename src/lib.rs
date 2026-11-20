@@ -66,7 +66,9 @@ mod tests {
         LC_MODIFIER_LEFT_COMMAND, LC_MODIFIER_LEFT_CONTROL, LC_MODIFIER_SHIFT, LOCAL_CAPABILITIES,
         LcInputEvent, PROTOCOL_MAX_VERSION, WireMessage,
     };
-    use super::model::{CAPABILITY_PAIRING_V2, PlacementRecord, TrustedPeer};
+    use super::model::{
+        CAPABILITY_IDENTIFY_DISPLAYS, CAPABILITY_PAIRING_V2, PlacementRecord, TrustedPeer,
+    };
     use super::protocol::{decode_message, encode_message};
     use super::remap::{Modifier, ModifierMap};
     use super::runtime::trust as runtime_reason;
@@ -403,6 +405,14 @@ mod tests {
         };
         let bytes = encode_message(&offer).expect("encode");
         assert_eq!(decode_message(&bytes).expect("decode"), Some(offer));
+        assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn identify_displays_round_trips() {
+        let message = WireMessage::IdentifyDisplays { first: 3 };
+        let bytes = encode_message(&message).expect("encode");
+        assert_eq!(decode_message(&bytes).expect("decode"), Some(message));
         assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
     }
 
@@ -3454,6 +3464,55 @@ mod tests {
         });
         a.thread.stop_and_join();
         b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn peers_show_the_numbers_their_displays_are_given() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("identify-a", discovery_port);
+        let mut b = test_core("identify-b", discovery_port);
+        // An older build: it does not know `IdentifyDisplays`.
+        let mut c = test_core_with("identify-c", discovery_port, |config| {
+            config.capabilities = LOCAL_CAPABILITIES & !CAPABILITY_IDENTIFY_DISPLAYS;
+        });
+        wait_for_peers(&a, &["identify-b", "identify-c"]);
+        a.thread
+            .send(Command::Connect("identify-b".into()))
+            .unwrap();
+        a.thread
+            .send(Command::Connect("identify-c".into()))
+            .unwrap();
+        wait_connected(&b, "identify-a");
+        wait_connected(&c, "identify-a");
+        a.thread
+            .send(Command::IdentifyDisplays {
+                peer_id: "identify-c".into(),
+                first: 4,
+            })
+            .unwrap();
+        a.thread
+            .send(Command::IdentifyDisplays {
+                peer_id: "identify-b".into(),
+                first: 3,
+            })
+            .unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "identify_displays"
+                && event["peer_id"] == "identify-a"
+                && event["first"] == 3
+        });
+        // C hears what follows on the same connection, so anything sent
+        // to it before would have come first.
+        a.thread.send(Command::LockPeers).unwrap();
+        wait_for_event(&c.events, Duration::from_secs(2), |event| {
+            assert_ne!(event["event"], "identify_displays", "sent to an older core");
+            assert_ne!(event["event"], "disconnected");
+            event["event"] == "lock_requested"
+        });
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+        c.thread.stop_and_join();
     }
 
     #[test]

@@ -43,6 +43,8 @@ const MESSAGE_FILE_STREAM_CLOSE: u8 = 27;
 const MESSAGE_FILE_OFFER_REVOKE: u8 = 28;
 const MESSAGE_INPUT_ECHO: u8 = 29;
 const MESSAGE_MEDIA_OFFER: u8 = 30;
+// 31 and 32 are taken by device settings.
+const MESSAGE_IDENTIFY_DISPLAYS: u8 = 33;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -53,6 +55,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::Ping { .. } => MESSAGE_PING,
         WireMessage::InputEcho { .. } => MESSAGE_INPUT_ECHO,
         WireMessage::MediaOffer { .. } => MESSAGE_MEDIA_OFFER,
+        WireMessage::IdentifyDisplays { .. } => MESSAGE_IDENTIFY_DISPLAYS,
         WireMessage::Pong { .. } => MESSAGE_PONG,
         WireMessage::ScreenInfo { .. } => MESSAGE_SCREEN_INFO,
         WireMessage::Placement { .. } => MESSAGE_PLACEMENT,
@@ -260,6 +263,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.u64(*token);
             encoder.u16(*port);
         }
+        WireMessage::IdentifyDisplays { first } => encoder.u32(*first),
         WireMessage::PairCommit { commitment: value }
         | WireMessage::PairNonce { nonce: value }
         | WireMessage::PairReveal { nonce: value } => encoder.bytes.extend_from_slice(value),
@@ -503,6 +507,9 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<Option<WireMessage>> {
         MESSAGE_MEDIA_OFFER => WireMessage::MediaOffer {
             token: decoder.u64()?,
             port: decoder.u16()?,
+        },
+        MESSAGE_IDENTIFY_DISPLAYS => WireMessage::IdentifyDisplays {
+            first: decoder.u32()?,
         },
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,

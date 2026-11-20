@@ -178,6 +178,16 @@ impl Core {
         self.thread.send(Command::LockPeers)
     }
 
+    /// The user asked to identify the displays: the peer reports
+    /// `identify_displays` and shows `first` on its first display, `first +
+    /// 1` on the next. Nothing if it is not connected or its core is older.
+    pub fn identify_displays(&self, peer_id: &str, first: u32) -> Result<(), String> {
+        self.thread.send(Command::IdentifyDisplays {
+            peer_id: peer_id.to_owned(),
+            first,
+        })
+    }
+
     /// A game or a pointer-lock page holds this device's pointer (or no
     /// longer does): peers driving it report `peer_pointer_lock`.
     pub fn set_pointer_locked(&self, locked: bool) -> Result<(), String> {

@@ -34,6 +34,9 @@ lc_core_report_user_activity(core);      // someone uses this device (every few 
 lc_core_lock_peers(core);                // the user locked this device
 lc_core_set_pointer_locked(core, true);  // a game here holds the pointer
 
+// Within ABI 11: show the peer's displays the numbers 3, 4, … (Identify)
+lc_core_identify_displays(core, peer_id, 3);
+
 // ABI 10: what a Mac's modifier keys play as on a PC (or a PC's on a Mac)
 lc_core_set_modifier_map(core, "{\"super\":\"control\",\"control\":\"super\",\"alt\":\"alt\"}");
 
@@ -100,6 +103,7 @@ Every event with a `reason`, and every `error` event, also has `reason_code`: a 
 | `manual_addresses` | `addresses`: one entry per address given, `{"address","status"}` with `status` `searching`, `found` (plus `peer_id`, `name`), `no_response` or `unresolved` (plus `error`). Sent when any of it changes. |
 | `peer_active` | `peer_id`. Someone uses that device (see "Presence"). |
 | `lock_requested` | `peer_id`. That device's user locked it. |
+| `identify_displays` | `peer_id`, `first`. That device's user asked to identify the displays: show `first` on this device's first display (in the order given to `lc_core_set_local_displays`), `first + 1` on the next, for a few seconds, in the same place on every screen. Within ABI 11. |
 | `peer_pointer_lock` | `peer_id`, `locked`. A game on that peer holds its pointer (or no longer does): while driving it, send all motion and do not cross at its edges. |
 | `files_receiving` / `files_sending` / `files_send_ended` | Progress of file transfers on both sides; see [clipboard-and-files.md](clipboard-and-files.md) and the header. |
 | `error` | `message` |

@@ -61,6 +61,10 @@ pub const CAPABILITY_INPUT_ECHO: u64 = 1 << 13;
 /// Understands `MediaOffer` and can watch a device's picture over a media
 /// link (see `media.rs`). Announced with `CoreConfig::media`.
 pub const CAPABILITY_MEDIA: u64 = 1 << 14;
+/// Understands `IdentifyDisplays`: the receiver shows the numbers the
+/// sender gives its displays on its screens. Sent only to peers with this
+/// bit. (Bits 15 and 16 are taken by attached screens and device settings.)
+pub const CAPABILITY_IDENTIFY_DISPLAYS: u64 = 1 << 17;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -71,7 +75,8 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_PRESENCE
     | CAPABILITY_POINTER_LOCK
     | CAPABILITY_PAIRING_V2
-    | CAPABILITY_INPUT_ECHO;
+    | CAPABILITY_INPUT_ECHO
+    | CAPABILITY_IDENTIFY_DISPLAYS;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
@@ -618,6 +623,13 @@ pub enum WireMessage {
     /// with `CAPABILITY_INPUT_ECHO`.
     InputEcho {
         stamp: u64,
+    },
+    /// The sender's user asked to identify the displays: the receiver shows
+    /// `first` on its first display, `first + 1` on the next, in the order
+    /// it describes them (`ScreenInfo`). Only to peers with
+    /// `CAPABILITY_IDENTIFY_DISPLAYS`.
+    IdentifyDisplays {
+        first: u32,
     },
 }
 

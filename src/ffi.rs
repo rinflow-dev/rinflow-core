@@ -479,6 +479,20 @@ pub unsafe extern "C" fn lc_core_lock_peers(core: *mut LcCore) -> bool {
     send_command(core, Command::LockPeers)
 }
 
+/// Identify displays: the peer reports `identify_displays` and shows
+/// `first`, `first + 1`, … on its displays. False for a missing `peer_id`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_identify_displays(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    first: u32,
+) -> bool {
+    match unsafe { string_argument(peer_id) } {
+        Some(peer_id) => send_command(core, Command::IdentifyDisplays { peer_id, first }),
+        None => false,
+    }
+}
+
 /// A game or a pointer-lock page holds this device's pointer, or no longer
 /// does: peers driving it report `peer_pointer_lock`.
 #[unsafe(no_mangle)]
