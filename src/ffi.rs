@@ -41,6 +41,10 @@ pub struct LcCore {
 /// Version 11 brings on-demand files to the C ABI: config key
 /// `on_demand_files`, `lc_core_open_remote_files`, `lc_file_lease_read`,
 /// `lc_file_lease_close` and `lc_core_revoke_file_streams`.
+/// Within 11: attached screens (config key `attachable`,
+/// `lc_core_set_relay_target`, `lc_core_relay_input`, events
+/// `attached_screens` / `relay_ended`), device settings and identifying
+/// displays.
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
     11
@@ -500,6 +504,47 @@ pub unsafe extern "C" fn lc_core_set_pointer_locked(core: *mut LcCore, locked: b
     send_command(core, Command::SetPointerLocked(locked))
 }
 
+/// What this device is set to, where another device may show and change it
+/// (a KVM: how it names itself on its USB port): a JSON object the shells
+/// agree on. Peers report `peer_settings`, now and whenever they connect.
+/// Added within version 11 (capability bit 16, wire messages 31 and 32).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_device_settings(
+    core: *mut LcCore,
+    settings_json: *const c_char,
+) -> bool {
+    match unsafe { settings_argument(settings_json) } {
+        Some(settings) => send_command(core, Command::SetDeviceSettings(settings)),
+        None => false,
+    }
+}
+
+/// Asks a connected peer to change its settings to these (some of them, or
+/// all): its shell reports `settings_change_requested`, decides, and answers
+/// with its settings (`peer_settings` here). Added within version 11.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_change_device_settings(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    settings_json: *const c_char,
+) -> bool {
+    let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+        return false;
+    };
+    match unsafe { settings_argument(settings_json) } {
+        Some(settings) => send_command(core, Command::ChangeDeviceSettings { peer_id, settings }),
+        None => false,
+    }
+}
+
+/// A JSON object, short enough for one message.
+unsafe fn settings_argument(json: *const c_char) -> Option<serde_json::Value> {
+    let json = unsafe { string_argument(json) }?;
+    let settings: serde_json::Value = serde_json::from_str(&json).ok()?;
+    (settings.is_object() && json.len() <= crate::model::MAX_DEVICE_SETTINGS_LENGTH)
+        .then_some(settings)
+}
+
 /// Lets peers drive this device (the default), or stops them. Added within
 /// version 6 (nothing else changed).
 #[unsafe(no_mangle)]
@@ -543,6 +588,47 @@ pub unsafe extern "C" fn lc_core_reset_input(core: *mut LcCore) -> bool {
         }
         let core = unsafe { &*core };
         core.thread.send(Command::ResetInput).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// Starts passing input on to an attached screen while a peer drives this
+/// device, or stops with a null `peer_id` (see `docs/attached-screens.md`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_relay_target(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let target = if peer_id.is_null() {
+            None
+        } else {
+            match unsafe { string_argument(peer_id) } {
+                Some(peer_id) => Some(peer_id),
+                None => return false,
+            }
+        };
+        core.thread.send(Command::SetRelayTarget(target)).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_relay_input(
+    core: *mut LcCore,
+    event: *const LcInputEvent,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() || event.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let event = unsafe { *event };
+        core.thread.send(Command::RelayInput(event)).is_ok()
     }))
     .unwrap_or(false)
 }
@@ -595,6 +681,90 @@ pub unsafe extern "C" fn lc_core_set_media_callback(
                 };
                 callback(peer_id.as_ptr(), &frame, context_address as *mut c_void);
             }));
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// A few milliseconds of the sound that goes with a picture, valid until
+/// the callback returns (see `MediaAudio`).
+#[repr(C)]
+pub struct LcMediaAudio {
+    /// 1 or 2.
+    pub channels: u8,
+    pub reserved: [u8; 3],
+    /// Counts the sender's packets (and wraps); a gap: sound was lost.
+    pub sequence: u32,
+    /// Signed 16-bit little-endian samples at 48 kHz, channels interleaved.
+    pub samples: *const u8,
+    pub length: usize,
+}
+
+pub type LcMediaAudioCallback =
+    Option<extern "C" fn(*const c_char, *const LcMediaAudio, *mut c_void)>;
+
+/// Sound (see `media.rs`): where the sound that comes with pictures goes,
+/// on either side of a media link. The callback runs on the core's threads,
+/// in the order the packets came, with the peer's device ID; the packet and
+/// its samples are valid until it returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_media_audio_callback(
+    core: *mut LcCore,
+    callback: LcMediaAudioCallback,
+    context: *mut c_void,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if core.is_null() {
+            return false;
+        }
+        let core = unsafe { &*core };
+        let context_address = context as usize;
+        core.thread
+            .media
+            .set_audio_sink(std::sync::Arc::new(move |peer_id: &str, sound| {
+                let (Some(callback), Ok(peer_id)) = (callback, CString::new(peer_id)) else {
+                    return;
+                };
+                let sound = LcMediaAudio {
+                    channels: sound.channels,
+                    reserved: [0; 3],
+                    sequence: sound.sequence,
+                    samples: sound.samples.as_ptr(),
+                    length: sound.samples.len(),
+                };
+                callback(peer_id.as_ptr(), &sound, context_address as *mut c_void);
+            }));
+        true
+    }))
+    .unwrap_or(false)
+}
+
+/// Sound for the peer whose picture this device watches (a microphone for
+/// the computer behind a KVM): signed 16-bit little-endian samples at
+/// 48 kHz, `channels` (1 or 2) interleaved, at most `MAX_AUDIO_BYTES` of
+/// them. The bytes are copied; a packet that is not one, or for a peer not
+/// watched, is dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_send_media_audio_to(
+    core: *mut LcCore,
+    peer_id: *const c_char,
+    channels: u8,
+    samples: *const u8,
+    length: usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(peer_id) = (unsafe { string_argument(peer_id) }) else {
+            return false;
+        };
+        if core.is_null() || samples.is_null() || length > crate::media::MAX_AUDIO_BYTES {
+            return false;
+        }
+        // SAFETY: the caller passes `length` readable bytes at `samples`.
+        let samples = unsafe { std::slice::from_raw_parts(samples, length) };
+        unsafe { &*core }
+            .thread
+            .media
+            .send_audio_to(&peer_id, channels, samples);
         true
     }))
     .unwrap_or(false)

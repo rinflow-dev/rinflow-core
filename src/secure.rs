@@ -242,7 +242,10 @@ fn media_transport(watching: bool) -> Arc<quinn::TransportConfig> {
     };
     transport.stream_receive_window(quinn::VarInt::from_u32(window));
     transport.receive_window(quinn::VarInt::from_u32(window));
-    transport.datagram_receive_buffer_size(None);
+    // Sound goes with the picture, either way, in datagrams (`media.rs`):
+    // what waits for the link longer than a few packets is dropped.
+    transport.datagram_receive_buffer_size(Some(crate::media::AUDIO_WAITING_BYTES * 4));
+    transport.datagram_send_buffer_size(crate::media::AUDIO_WAITING_BYTES);
     Arc::new(transport)
 }
 

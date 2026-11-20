@@ -40,6 +40,14 @@ lc_core_identify_displays(core, peer_id, 3);
 // ABI 10: what a Mac's modifier keys play as on a PC (or a PC's on a Mac)
 lc_core_set_modifier_map(core, "{\"super\":\"control\",\"control\":\"super\",\"alt\":\"alt\"}");
 
+// ABI 11: while a peer drives this device and its pointer is on an attached screen
+lc_core_set_relay_target(core, kvm_peer_id); // pass input on to it (NULL: stop)
+lc_core_relay_input(core, &event);           // in the attached peer's own space
+
+// Within ABI 11: settings of a device without a screen (a KVM), shown on another
+lc_core_set_device_settings(core, "{\"usb\":{\"product\":\"Rinflow KVM\"}}"); // on the KVM
+lc_core_change_device_settings(core, kvm_peer_id, "{\"usb\":{\"product\":\"Keyboard\"}}");
+
 // Arrangement (logical points)
 lc_core_set_local_displays(core, "[{\"x\":0,\"y\":0,\"width\":1512,\"height\":982,\"scale\":2}]");
 lc_core_place_beside(core, peer_id, "right");                 // centred on that side
@@ -71,6 +79,7 @@ Every call except `lc_core_destroy` only queues a command and returns right away
 | `trusted_peers` | `[]` | Paired peers, as reported by `paired`: `[{"peer_id":"…","fingerprint":"<64 hex digits>"}]`. Remove an entry when `unpaired` reports it. |
 | `require_pairing` | `false` | Only paired peers may connect: unknown ones pair first. Change it later with `lc_core_set_require_pairing`. |
 | `auto_connect` | `true` | Keep the user's devices connected without being asked (see "Staying connected" under [How it works](architecture.md)). The shell needs no reconnect timer of its own. |
+| `attachable` | `false` | This device has no keyboard and mouse of its own (a KVM): placed right beside another device, it becomes that device's attached screen ([attached-screens.md](attached-screens.md)). Capability bit 15. ABI 11. |
 
 ## Events (the `json` passed to `LcEventCallback`)
 
@@ -105,6 +114,10 @@ Every event with a `reason`, and every `error` event, also has `reason_code`: a 
 | `lock_requested` | `peer_id`. That device's user locked it. |
 | `identify_displays` | `peer_id`, `first`. That device's user asked to identify the displays: show `first` on this device's first display (in the order given to `lc_core_set_local_displays`), `first + 1` on the next, for a few seconds, in the same place on every screen. Within ABI 11. |
 | `peer_pointer_lock` | `peer_id`, `locked`. A game on that peer holds its pointer (or no longer does): while driving it, send all motion and do not cross at its edges. |
+| `attached_screens` | `screens`: `[{"peer_id","offset","displays"}]`, each attached screen's displays in this device's space, and its placement (subtract `offset` for a point in the screen's own space). Sent whenever that changes. Peers in a session are told these displays as this device's own ([attached-screens.md](attached-screens.md)). ABI 11. |
+| `relay_ended` | `peer_id`, `reason`. Input is no longer passed on to that attached screen without the shell asking: `"control ended"` (the peer that drove this device stopped or was replaced), `"not attached"`, `"not driven"` (nobody drives this device) or `"revoked"` (another device took the screen over). End the relay in the shell too. ABI 11. |
+| `peer_settings` | `peer_id`, `settings`. What that peer is set to (`lc_core_set_device_settings` there): a JSON object the shells agree on, which the core carries unread. Sent when the peer connects and whenever it changes. Within ABI 11. |
+| `settings_change_requested` | `peer_id`, `settings`. That peer asks this device to change these settings (`lc_core_change_device_settings` there). The shell decides, applies, and calls `lc_core_set_device_settings` with what it is set to now. Within ABI 11. |
 | `files_receiving` / `files_sending` / `files_send_ended` | Progress of file transfers on both sides; see [clipboard-and-files.md](clipboard-and-files.md) and the header. |
 | `error` | `message` |
 | `stopped` | n/a. Also emitted on startup if a socket can't be bound (preceded by an `error`). |

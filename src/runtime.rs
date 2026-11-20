@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+pub(crate) mod attached;
 mod data;
 mod discovery;
 mod file_streams;
@@ -18,10 +19,11 @@ use crate::input::{
 use crate::layout::{self, Display, Offset, Side, validate_displays};
 use crate::media::MediaHub;
 use crate::model::{
-    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_IDENTIFY_DISPLAYS, CAPABILITY_INPUT_ECHO,
-    CAPABILITY_INPUT_V2, CAPABILITY_MEDIA, CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE,
-    CoreConfig, DISCOVERY_GROUP, LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer,
-    PlacementRecord, WireMessage, negotiate_protocol,
+    Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_DEVICE_SETTINGS,
+    CAPABILITY_IDENTIFY_DISPLAYS, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2, CAPABILITY_MEDIA,
+    CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
+    LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
+    negotiate_protocol,
 };
 use crate::quic::QuicEndpoints;
 use crate::remap::ModifierMap;
@@ -93,6 +95,10 @@ pub enum Command {
     SendInput(LcInputEvent),
     /// Releases everything the input target holds and tells it control ended.
     ResetInput,
+    /// Starts passing input on to an attached screen while a peer drives
+    /// this device, or stops (see `docs/attached-screens.md`).
+    SetRelayTarget(Option<String>),
+    RelayInput(LcInputEvent),
     InputReady,
     /// This device's displays changed (logical points, see `layout.rs`).
     SetLocalDisplays(Vec<Display>),
@@ -147,6 +153,14 @@ pub enum Command {
     /// A game or a pointer-lock page holds this device's pointer: whoever
     /// drives it stops crossing at its edges meanwhile.
     SetPointerLocked(bool),
+    /// What this device is set to, for peers to show (`DeviceSettings`): a
+    /// JSON object.
+    SetDeviceSettings(Value),
+    /// Asks a peer to change its settings (`DeviceSettingsChange`).
+    ChangeDeviceSettings {
+        peer_id: String,
+        settings: Value,
+    },
     Stop,
 }
 
@@ -178,7 +192,11 @@ impl CoreThread {
                 // This thread runs the core's loop, which all input passes.
                 crate::priority::raise_current_thread();
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    // Two, or one where there is one processor (a KVM): a
+                    // second thread there only hands work back and forth.
+                    .worker_threads(
+                        std::thread::available_parallelism().map_or(2, |n| n.get().min(2)),
+                    )
                     .enable_all()
                     .thread_name("rinflow-io")
                     .on_thread_start(crate::priority::raise_current_thread)
@@ -218,6 +236,19 @@ impl CoreThread {
             }
             Command::ResetInput => {
                 let should_notify = self.platform_input.push_control(PlatformEntry::Reset);
+                self.notify_input(should_notify)
+            }
+            Command::RelayInput(event) => {
+                let (_, should_notify) = self
+                    .platform_input
+                    .push_relay(event)
+                    .map_err(str::to_owned)?;
+                self.notify_input(should_notify)
+            }
+            Command::SetRelayTarget(peer_id) => {
+                let should_notify = self
+                    .platform_input
+                    .push_control(PlatformEntry::SetRelay(peer_id));
                 self.notify_input(should_notify)
             }
             Command::Connect(peer_id) => {
@@ -315,9 +346,13 @@ async fn run(
     let (connection_events_tx, mut connection_events_rx) = mpsc::unbounded_channel();
     let mut announce_timer = tokio::time::interval(Duration::from_secs(2));
     let mut maintenance_timer = tokio::time::interval(Duration::from_secs(1));
+    // How each link of this device's picture did (`media_link`): often, so
+    // its encoder can follow a struggling link quickly.
+    let mut media_timer = tokio::time::interval(crate::media::REPORT_INTERVAL);
     // After the system slept, one tick each rather than every one missed.
     announce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     maintenance_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    media_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut state = Runtime {
         config: &config,
         sink: &sink,
@@ -339,6 +374,7 @@ async fn run(
         answered_probes: HashMap::new(),
         modifier_map: config.modifier_map,
         pointer_locked: false,
+        device_settings: None,
         refitting: false,
         capabilities,
         fingerprint: fingerprint.clone(),
@@ -367,6 +403,8 @@ async fn run(
         controlling: None,
         input_suspended: false,
         remote_control_allowed: true,
+        attached: Vec::new(),
+        relay: None,
         data_links: HashMap::new(),
         offer: None,
         // Unpredictable, and unlikely to match another device's numbers.
@@ -430,7 +468,17 @@ async fn run(
                         state.identify_displays(&peer_id, first)
                     }
                     Some(Command::SetPointerLocked(locked)) => state.set_pointer_locked(locked),
-                    Some(Command::SendInput(_) | Command::SetInputTarget(_) | Command::ResetInput) => {
+                    Some(Command::SetDeviceSettings(settings)) => state.set_device_settings(&settings),
+                    Some(Command::ChangeDeviceSettings { peer_id, settings }) => {
+                        state.change_device_settings(&peer_id, &settings)
+                    }
+                    Some(
+                        Command::SendInput(_)
+                        | Command::SetInputTarget(_)
+                        | Command::ResetInput
+                        | Command::RelayInput(_)
+                        | Command::SetRelayTarget(_),
+                    ) => {
                         unreachable!("input commands are queued by CoreThread")
                     }
                     Some(Command::Stop) | None => break,
@@ -489,6 +537,7 @@ async fn run(
                 state.probe_manual();
             }
             _ = maintenance_timer.tick() => state.maintenance(),
+            _ = media_timer.tick(), if config.media_source => media.report_links(),
         }
         // Probes and answers queued meanwhile (see `manual.rs`).
         for (datagram, target) in std::mem::take(&mut state.datagrams) {
@@ -616,6 +665,8 @@ struct Runtime<'a> {
     modifier_map: ModifierMap,
     /// A game or a pointer-lock page holds this device's pointer.
     pointer_locked: bool,
+    /// What this device is set to, as its shell said (`SetDeviceSettings`).
+    device_settings: Option<String>,
     /// Placements are being fitted again after a change (`refit_others`);
     /// the moves that makes do not start another round.
     refitting: bool,
@@ -655,6 +706,11 @@ struct Runtime<'a> {
     /// Peers may drive this device. When not, a peer that drives it or
     /// starts to is told to give control back (`ControlRevoke`).
     remote_control_allowed: bool,
+    /// Attached screens, by peer ID (see `attached.rs`).
+    attached: Vec<attached::AttachedScreen>,
+    /// Input passed on to an attached screen while a peer drives this
+    /// device.
+    relay: Option<attached::Relay>,
     /// Data links by connection ID.
     data_links: HashMap<u64, DataLink>,
     /// Files on this device's clipboard.
@@ -701,6 +757,24 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Whether a device's settings, as JSON text, go in one message.
+fn settings_fit(settings: &str) -> bool {
+    settings.len() <= crate::model::MAX_DEVICE_SETTINGS_LENGTH
+}
+
+/// `peer_settings` or `settings_change_requested`, unless what the peer sent
+/// is not a JSON object.
+fn emit_settings(sink: &EventSink, event: &str, peer_id: Option<&str>, settings: &str) {
+    match serde_json::from_str::<Value>(settings) {
+        Ok(settings) if settings.is_object() => sink.emit_value(json!({
+            "event": event,
+            "peer_id": peer_id,
+            "settings": settings
+        })),
+        _ => {}
+    }
 }
 
 impl Runtime<'_> {
@@ -900,6 +974,8 @@ impl Runtime<'_> {
                     self.input_suspended = false;
                     self.reset_target_input();
                 }
+                PlatformEntry::Relay(event) => self.relay_input(event),
+                PlatformEntry::SetRelay(peer_id) => self.set_relay(peer_id),
             }
         }
     }
@@ -934,6 +1010,8 @@ impl Runtime<'_> {
             session.revoked = true;
             end_remote_control(&mut session.remote_input, sink, reason, peer_id.as_deref());
         }
+        // Relaying served the peer that drove this device.
+        self.check_relay();
     }
 
     /// Ends this device's own control of a peer because it lost it: the
@@ -965,6 +1043,8 @@ impl Runtime<'_> {
         else {
             return;
         };
+        // An attached screen this device relays to was taken over.
+        self.relay_revoked(&peer_id);
         // Already given back otherwise; that reset is on its way to the peer.
         if self.controlling.as_deref() == Some(peer_id.as_str()) {
             if handoff {
@@ -1057,6 +1137,9 @@ impl Runtime<'_> {
 
     /// The discovery datagram, and the probe that asks for an answer.
     fn rebuild_announcements(&mut self) {
+        // Only this device's own displays: attached screens go to peers in
+        // sessions, so an attached screen never sees itself overlapping its
+        // host (see `attached.rs`).
         let mut announcement = Announcement::from_config(
             self.config,
             &self.local_displays,
@@ -1202,6 +1285,55 @@ impl Runtime<'_> {
         }
     }
 
+    /// This device's settings changed, or are known at last: peers hear.
+    /// Also when they are as they were: that is the answer to a peer that
+    /// asked for a change that was not made.
+    fn set_device_settings(&mut self, settings: &Value) {
+        let settings = settings.to_string();
+        if !settings_fit(&settings) {
+            return;
+        }
+        self.device_settings = Some(settings);
+        let ids: Vec<u64> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.tell_device_settings(id);
+        }
+    }
+
+    /// Tells a peer what this device is set to, if its shell said.
+    fn tell_device_settings(&self, id: u64) {
+        let (Some(session), Some(settings)) = (self.sessions.get(&id), &self.device_settings)
+        else {
+            return;
+        };
+        if session.established()
+            && session.connection.capabilities & CAPABILITY_DEVICE_SETTINGS != 0
+        {
+            let _ = session
+                .connection
+                .send_control(WireMessage::DeviceSettings {
+                    settings: settings.clone(),
+                });
+        }
+    }
+
+    fn change_device_settings(&mut self, peer_id: &str, settings: &Value) {
+        let settings = settings.to_string();
+        let session = self
+            .established_session(peer_id)
+            .and_then(|id| self.sessions.get(&id));
+        let Some(session) = session else {
+            return;
+        };
+        if settings_fit(&settings)
+            && session.connection.capabilities & CAPABILITY_DEVICE_SETTINGS != 0
+        {
+            let _ = session
+                .connection
+                .send_control(WireMessage::DeviceSettingsChange { settings });
+        }
+    }
+
     // ---- Arrangement ----------------------------------------------------
 
     /// Records a peer's displays and reports a change.
@@ -1219,6 +1351,7 @@ impl Runtime<'_> {
         // (this device's displays may also have changed while it was off).
         self.refit_placement(peer_id);
         self.publish_portals();
+        self.refresh_attached();
     }
 
     /// Reports where the pointer crosses into each placed peer, whenever that
@@ -1304,14 +1437,15 @@ impl Runtime<'_> {
     }
 
     /// Whether the peer's placement touches this device itself, rather than
-    /// only another placed peer (see `layout.rs`, chained arrangements).
+    /// only another placed peer (see `layout.rs`, chained arrangements). An
+    /// attached screen counts as this device: the peer sees it as one.
     fn touches_local(&self, peer_id: &str) -> bool {
         self.placements
             .get(peer_id)
             .and_then(|record| record.offset)
             .is_some_and(|offset| {
-                !layout::portals(&self.local_displays, &self.peer_layout(peer_id), offset)
-                    .is_empty()
+                let own = self.described_displays(peer_id);
+                !layout::portals(&own, &self.peer_layout(peer_id), offset).is_empty()
             })
     }
 
@@ -1325,15 +1459,10 @@ impl Runtime<'_> {
         }
         self.local_displays = displays;
         self.rebuild_announcements();
-        let info = WireMessage::ScreenInfo {
-            displays: self.local_displays.clone(),
-        };
-        for session in self
-            .sessions
-            .values()
-            .filter(|session| session.established())
-        {
-            let _ = session.connection.send_control(info.clone());
+        // Peers hear of the displays before any placement moved because of
+        // them.
+        if !self.refresh_attached() {
+            self.publish_displays();
         }
         // A monitor was unplugged or resized: move placements that no longer
         // touch this desktop to the nearest spot that does.
@@ -1461,6 +1590,8 @@ impl Runtime<'_> {
         }
         self.publish_portals();
         self.refit_others(peer_id);
+        // An attached screen moved, came or went.
+        self.refresh_attached();
     }
 
     /// Tells the peer where it sits. A peer placed against another peer
@@ -1623,6 +1754,7 @@ impl Runtime<'_> {
                 WireMessage::ScreenInfo { .. }
                 | WireMessage::Placement { .. }
                 | WireMessage::MediaOffer { .. }
+                | WireMessage::DeviceSettings { .. }
                 | WireMessage::DataInvite { .. } => {
                     let kind = std::mem::discriminant(&message);
                     session
@@ -1676,6 +1808,7 @@ impl Runtime<'_> {
                 // Whatever was copied here while it drove this device goes
                 // back with the control.
                 self.sync_clipboard(id);
+                self.check_relay();
             }
             WireMessage::Ping { sequence } => {
                 let _ = session
@@ -1752,6 +1885,18 @@ impl Runtime<'_> {
                     "peer_id": session.peer_id(),
                     "locked": locked
                 }));
+            }
+            // Both are the shells' business: the core only carries them.
+            WireMessage::DeviceSettings { settings } => {
+                emit_settings(self.sink, "peer_settings", session.peer_id(), &settings);
+            }
+            WireMessage::DeviceSettingsChange { settings } => {
+                emit_settings(
+                    self.sink,
+                    "settings_change_requested",
+                    session.peer_id(),
+                    &settings,
+                );
             }
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
@@ -1995,16 +2140,19 @@ impl Runtime<'_> {
         // peer does the same; whichever placement is newer wins on both sides.
         if let Some(session) = self.sessions.get(&id) {
             let _ = session.connection.send_control(WireMessage::ScreenInfo {
-                displays: self.local_displays.clone(),
+                displays: self.described_displays(&peer_id),
             });
         }
         self.send_placement(&peer_id);
         self.invite_data_link(id);
         self.offer_media(id);
+        self.tell_device_settings(id);
         // What the peer sent while it waited for this side.
         for message in held {
             self.message(id, message, None);
         }
+        // The peer may be an attached screen.
+        self.refresh_attached();
         // A disconnect held back for this peer is moot now.
         self.flush_disconnects(false);
     }
@@ -2116,6 +2264,10 @@ impl Runtime<'_> {
             if self.established_session(peer_id).is_none() {
                 self.media.session_ended(peer_id);
             }
+        }
+        // An attached screen gone, or the peer a relay served.
+        if !self.refresh_attached() {
+            self.check_relay();
         }
         // An automatic attempt the shell never heard of ends quietly, unless
         // the device turned out not to be the one paired.

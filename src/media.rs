@@ -36,16 +36,32 @@
 //!
 //! **Late is useless.** A link that carries less than the encoder puts out
 //! must not grow a queue: the picture would fall behind for good. So each
-//! watching peer has a short queue ([`MAX_WAITING_FRAMES`]); when it is
-//! full everything waiting is dropped and frames are skipped up to the next
+//! watching peer has a short queue: frames wait at most [`MAX_WAIT`] (and
+//! never more than [`MAX_WAITING_FRAMES`]), whatever the frame rate. Past
+//! that everything waiting is dropped and frames are skipped up to the next
 //! key frame, which the shell is asked for (`media_key_frame_wanted`). A
 //! decoder never sees a frame whose predecessor it did not get.
+//!
+//! **How each link is doing.** Every [`REPORT_INTERVAL`] the source reports every
+//! watching peer's link (`media_link`): round trip, packets lost, frames
+//! sent and dropped, the bit rate that actually went out and the longest
+//! wait of a frame. Its shell can fit the encoder to the link with them
+//! (a lower bit rate or frame rate while a link struggles, more once it
+//! keeps up); the core itself never changes the picture.
+//!
+//! **Sound** goes with the picture, either way: the source's to those who
+//! watch, and a watching device's (a microphone) to the source. A few
+//! milliseconds of plain samples a packet ([`MediaAudio`]), each in a QUIC
+//! datagram on the media link: not sent again when lost, and dropped rather
+//! than sent late.
 
 use crate::secure::peer_fingerprint;
+use bytes::Bytes;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Flags, sequence, time stamp.
@@ -53,9 +69,13 @@ pub const HEADER_LENGTH: usize = 1 + 8 + 8;
 const FLAG_KEY_FRAME: u8 = 1;
 /// A frame larger than this is not a frame: the stream is refused.
 pub const MAX_FRAME_BYTES: usize = 8 << 20;
-/// Frames that may wait for one watching peer's link: about a tenth of a
-/// second at thirty frames a second.
-const MAX_WAITING_FRAMES: usize = 3;
+/// How often the source hears how each link does (`media_link`).
+pub const REPORT_INTERVAL: Duration = Duration::from_millis(250);
+/// How long frames may wait for one watching peer's link: a frame that
+/// waited this long would show that much late.
+const MAX_WAIT: Duration = Duration::from_millis(100);
+/// And how many, at most, whatever the frame rate.
+const MAX_WAITING_FRAMES: usize = 8;
 /// The first message on a media link is at most this long.
 const MAX_HELLO_BYTES: usize = 8 + 2 + 256;
 const ACCEPTED: u8 = 1;
@@ -70,7 +90,8 @@ pub struct MediaFrame {
     pub sequence: u64,
     /// The source's clock, in microseconds; only differences mean anything.
     pub timestamp_micros: u64,
-    pub data: Vec<u8>,
+    /// Shared, not copied, between the peers it goes to and with QUIC.
+    pub data: Bytes,
 }
 
 impl MediaFrame {
@@ -83,33 +104,127 @@ impl MediaFrame {
     }
 
     /// A frame as it came off its stream.
-    fn decode(mut bytes: Vec<u8>) -> Option<Self> {
+    fn decode(bytes: Vec<u8>) -> Option<Self> {
         let header: [u8; HEADER_LENGTH] = bytes.get(..HEADER_LENGTH)?.try_into().ok()?;
         if header[0] & !FLAG_KEY_FRAME != 0 {
             return None;
         }
-        bytes.drain(..HEADER_LENGTH);
         Some(Self {
             key_frame: header[0] & FLAG_KEY_FRAME != 0,
             sequence: u64::from_le_bytes(header[1..9].try_into().ok()?),
             timestamp_micros: u64::from_le_bytes(header[9..17].try_into().ok()?),
-            data: bytes,
+            // The bytes as they came, not moved up over the header.
+            data: Bytes::from(bytes).slice(HEADER_LENGTH..),
         })
     }
 }
+
+/// Format, channels, sequence: the head of a packet of sound.
+const AUDIO_HEADER_LENGTH: usize = 1 + 1 + 4;
+/// Signed 16-bit little-endian samples, 48 000 a second, channels
+/// interleaved: the only format so far.
+const AUDIO_PCM_48K: u8 = 1;
+/// The most samples one packet carries, in bytes: with its header it fits
+/// one QUIC packet on any link (5 ms of stereo, 10 ms of mono).
+pub const MAX_AUDIO_BYTES: usize = 960;
+/// How much sound may wait for a link, either way: what waits longer is
+/// better lost than heard late.
+pub(crate) const AUDIO_WAITING_BYTES: usize = 16 * 1024;
+
+/// A few milliseconds of sound that goes with a picture: what the computer
+/// behind a KVM plays, or what a watching device's microphone hears.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaAudio {
+    /// 1 or 2.
+    pub channels: u8,
+    /// Counts the sender's packets (and wraps): a gap is sound that was
+    /// lost.
+    pub sequence: u32,
+    /// Signed 16-bit little-endian samples at 48 kHz, channels interleaved.
+    pub samples: Bytes,
+}
+
+impl MediaAudio {
+    fn encode(&self) -> Bytes {
+        let mut bytes = Vec::with_capacity(AUDIO_HEADER_LENGTH + self.samples.len());
+        bytes.extend_from_slice(&[AUDIO_PCM_48K, self.channels]);
+        bytes.extend_from_slice(&self.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.samples);
+        bytes.into()
+    }
+
+    /// A packet as it came. `None` for a format this version does not know.
+    fn decode(bytes: Bytes) -> Option<Self> {
+        let header: [u8; AUDIO_HEADER_LENGTH] =
+            bytes.get(..AUDIO_HEADER_LENGTH)?.try_into().ok()?;
+        let samples = bytes.slice(AUDIO_HEADER_LENGTH..);
+        let channels = header[1];
+        if header[0] != AUDIO_PCM_48K
+            || !(1..=2).contains(&channels)
+            || samples.is_empty()
+            || !samples.len().is_multiple_of(2 * usize::from(channels))
+        {
+            return None;
+        }
+        Some(Self {
+            channels,
+            sequence: u32::from_le_bytes(header[2..].try_into().ok()?),
+            samples,
+        })
+    }
+}
+
+/// Called with the peer's device ID for every packet of sound from it, on
+/// the core's threads, in the order they came.
+pub type AudioSink = Arc<dyn Fn(&str, MediaAudio) + Send + Sync>;
 
 /// Called with the peer's device ID for every frame of a watched picture,
 /// on the core's threads, in order.
 pub type FrameSink = Arc<dyn Fn(&str, MediaFrame) + Send + Sync>;
 type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
 
-/// The frames waiting for one watching peer's link.
+/// The frames waiting for one watching peer's link, with when each came.
 struct Queue {
-    frames: VecDeque<Arc<MediaFrame>>,
+    frames: VecDeque<(Arc<MediaFrame>, Instant)>,
     /// Frames are skipped until a key frame comes.
     wants_key_frame: bool,
     skipped: u64,
+    /// Times the link fell too far behind and what waited was dropped.
+    overflows: u64,
     closed: bool,
+    /// Since the last `media_link` report.
+    counts: LinkCounts,
+}
+
+/// What went over one watching peer's link since it was last reported.
+struct LinkCounts {
+    since: Instant,
+    frames: u64,
+    bytes: u64,
+    /// The longest a frame waited, from `send_frame` until the link took
+    /// all of it.
+    worst_wait: Duration,
+    /// `Queue::skipped`, `Queue::overflows` and the connection's packet
+    /// counts at the last report.
+    skipped: u64,
+    overflows: u64,
+    sent_packets: u64,
+    lost_packets: u64,
+}
+
+impl LinkCounts {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            worst_wait: Duration::ZERO,
+            skipped: 0,
+            overflows: 0,
+            sent_packets: 0,
+            lost_packets: 0,
+        }
+    }
 }
 
 /// What became of a frame offered to a queue.
@@ -129,30 +244,37 @@ impl Queue {
             // A decoder can only start from a key frame.
             wants_key_frame: true,
             skipped: 0,
+            overflows: 0,
             closed: false,
+            counts: LinkCounts::new(),
         }
     }
 
-    fn offer(&mut self, frame: &Arc<MediaFrame>) -> Offered {
+    fn offer(&mut self, frame: &Arc<MediaFrame>, now: Instant) -> Offered {
         if frame.key_frame {
             // Everything before a key frame is of no use once it is here.
             self.skipped += self.frames.len() as u64;
             self.frames.clear();
             self.wants_key_frame = false;
-            self.frames.push_back(frame.clone());
+            self.frames.push_back((frame.clone(), now));
             return Offered::Queued;
         }
         if self.wants_key_frame {
             self.skipped += 1;
             return Offered::Skipped;
         }
-        if self.frames.len() >= MAX_WAITING_FRAMES {
+        let too_late = self
+            .frames
+            .front()
+            .is_some_and(|(_, since)| now.duration_since(*since) >= MAX_WAIT);
+        if too_late || self.frames.len() >= MAX_WAITING_FRAMES {
             self.skipped += self.frames.len() as u64 + 1;
+            self.overflows += 1;
             self.frames.clear();
             self.wants_key_frame = true;
             return Offered::Overflowed;
         }
-        self.frames.push_back(frame.clone());
+        self.frames.push_back((frame.clone(), now));
         Offered::Queued
     }
 }
@@ -200,8 +322,34 @@ struct State {
     /// `watch` meanwhile must not dial again.
     connecting: HashSet<String>,
     frame_sink: Option<FrameSink>,
+    audio_sink: Option<AudioSink>,
+    /// Counts the packets of sound this device sends.
+    audio_sequence: u32,
     /// The core's runtime and this device's endpoint, while the core runs.
     running: Option<(tokio::runtime::Handle, quinn::Endpoint, String)>,
+}
+
+impl State {
+    /// The next packet of sound from this device, ready to send. `None`
+    /// for what is not a packet (see [`MediaAudio`]).
+    fn audio_packet(&mut self, channels: u8, samples: &[u8]) -> Option<Bytes> {
+        if !(1..=2).contains(&channels)
+            || samples.is_empty()
+            || samples.len() > MAX_AUDIO_BYTES
+            || !samples.len().is_multiple_of(2 * usize::from(channels))
+        {
+            return None;
+        }
+        self.audio_sequence = self.audio_sequence.wrapping_add(1);
+        Some(
+            MediaAudio {
+                channels,
+                sequence: self.audio_sequence,
+                samples: Bytes::copy_from_slice(samples),
+            }
+            .encode(),
+        )
+    }
 }
 
 /// Everything about pictures a core holds. Shared by the core's loop (which
@@ -255,6 +403,62 @@ impl MediaHub {
         self.state().frame_sink = Some(sink);
     }
 
+    pub fn set_audio_sink(&self, sink: AudioSink) {
+        self.state().audio_sink = Some(sink);
+    }
+
+    /// Sound of this device's picture, for every peer watching: up to
+    /// [`MAX_AUDIO_BYTES`] of samples (see [`MediaAudio`]). Not repeated
+    /// when lost, and dropped rather than sent late.
+    pub fn send_audio(&self, channels: u8, samples: &[u8]) {
+        let (packet, viewers) = {
+            let mut state = self.state();
+            if state.viewers.is_empty() {
+                return;
+            }
+            (state.audio_packet(channels, samples), state.viewers.clone())
+        };
+        let Some(packet) = packet else {
+            return;
+        };
+        for viewer in viewers {
+            let _ = viewer.connection.send_datagram(packet.clone());
+        }
+    }
+
+    /// Sound for the peer whose picture this device watches (a microphone,
+    /// for the computer behind a KVM). As [`MediaHub::send_audio`].
+    pub fn send_audio_to(&self, peer_id: &str, channels: u8, samples: &[u8]) {
+        let (packet, connection) = {
+            let mut state = self.state();
+            let Some(connection) = state
+                .watching
+                .get(peer_id)
+                .map(|watching| watching.connection.clone())
+            else {
+                return;
+            };
+            (state.audio_packet(channels, samples), connection)
+        };
+        if let Some(packet) = packet {
+            let _ = connection.send_datagram(packet);
+        }
+    }
+
+    /// Hands the sound that comes over a media link to the audio sink until
+    /// the link ends.
+    fn receive_audio(self: &Arc<Self>, connection: &quinn::Connection, peer_id: &str) {
+        let (hub, connection, peer_id) = (self.clone(), connection.clone(), peer_id.to_owned());
+        tokio::spawn(async move {
+            while let Ok(bytes) = connection.read_datagram().await {
+                let sink = hub.state().audio_sink.clone();
+                if let (Some(sink), Some(packet)) = (sink, MediaAudio::decode(bytes)) {
+                    sink(&peer_id, packet);
+                }
+            }
+        });
+    }
+
     // ---- Source ---------------------------------------------------------
 
     /// A session with a peer that can watch is established: a token for it.
@@ -273,7 +477,8 @@ impl MediaHub {
     }
 
     /// One frame of this device's picture, for every peer watching.
-    pub fn send_frame(&self, key_frame: bool, timestamp_micros: u64, data: Vec<u8>) {
+    pub fn send_frame(&self, key_frame: bool, timestamp_micros: u64, data: impl Into<Bytes>) {
+        let data = data.into();
         let (frame, viewers) = {
             let mut state = self.state();
             if state.viewers.is_empty() {
@@ -289,12 +494,13 @@ impl MediaHub {
             (frame, state.viewers.clone())
         };
         let mut wanted = false;
+        let now = Instant::now();
         for viewer in viewers {
             let offered = viewer
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .offer(&frame);
+                .offer(&frame, now);
             match offered {
                 Offered::Queued => viewer.wake.notify_one(),
                 Offered::Skipped => {}
@@ -368,6 +574,7 @@ impl MediaHub {
             viewer
         };
         answer.write_all(&[ACCEPTED]).await.map_err(|_| "closed")?;
+        self.receive_audio(&connection, &viewer.peer_id);
         self.report_viewers();
         // It starts from a key frame.
         (self.events)(json!({ "event": "media_key_frame_wanted" }));
@@ -396,6 +603,46 @@ impl MediaHub {
         close_viewer(&viewer, "ended");
         self.report_viewers();
         Ok(())
+    }
+
+    /// Reports how each watching peer's link did since the last report
+    /// (`media_link`). The core calls it every [`REPORT_INTERVAL`].
+    pub fn report_links(&self) {
+        let viewers = self.state().viewers.clone();
+        for viewer in viewers {
+            let path = viewer.connection.stats().path;
+            let report = {
+                let mut queue = viewer
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (skipped, overflows) = (queue.skipped, queue.overflows);
+                let counts = std::mem::replace(&mut queue.counts, LinkCounts::new());
+                queue.counts.skipped = skipped;
+                queue.counts.overflows = overflows;
+                queue.counts.sent_packets = path.sent_packets;
+                queue.counts.lost_packets = path.lost_packets;
+                let seconds = counts.since.elapsed().as_secs_f64().max(0.001);
+                json!({
+                    "event": "media_link",
+                    "peer_id": viewer.peer_id,
+                    "rtt_ms": path.rtt.as_secs_f64() * 1000.0,
+                    "min_rtt_ms": path.min_rtt.as_secs_f64() * 1000.0,
+                    "sent_packets": path.sent_packets.saturating_sub(counts.sent_packets),
+                    "lost_packets": path.lost_packets.saturating_sub(counts.lost_packets),
+                    "frames": counts.frames,
+                    "overflows": overflows.saturating_sub(counts.overflows),
+                    "skipped": skipped.saturating_sub(counts.skipped),
+                    "kbps": counts.bytes as f64 * 8.0 / 1000.0 / seconds,
+                    "worst_wait_ms": counts.worst_wait.as_secs_f64() * 1000.0,
+                    // What the connection may have on its way at once: when
+                    // frames wait though nothing is lost and the round trip
+                    // is short, this says whether it was the limit.
+                    "cwnd": path.cwnd
+                })
+            };
+            (self.events)(report);
+        }
     }
 
     fn report_viewers(&self) {
@@ -479,7 +726,7 @@ impl MediaHub {
     }
 
     async fn receive(
-        &self,
+        self: &Arc<Self>,
         endpoint: &quinn::Endpoint,
         device_id: &str,
         peer_id: &str,
@@ -520,6 +767,7 @@ impl MediaHub {
             );
             state.frame_sink.clone()
         };
+        self.receive_audio(&connection, peer_id);
         (self.events)(json!({ "event": "media_started", "peer_id": peer_id }));
 
         // Frames are read in the order their streams were opened, which is
@@ -625,7 +873,7 @@ async fn send_frames(viewer: &Viewer) {
             }
             queue.frames.pop_front()
         };
-        let Some(frame) = frame else {
+        let Some((frame, since)) = frame else {
             viewer.wake.notified().await;
             continue;
         };
@@ -633,11 +881,20 @@ async fn send_frames(viewer: &Viewer) {
             return;
         };
         if stream.write_all(&frame.header()).await.is_err()
-            || stream.write_all(&frame.data).await.is_err()
+            // The frame itself, not a copy: QUIC keeps it until it is sent.
+            || stream.write_chunk(frame.data.clone()).await.is_err()
             || stream.finish().is_err()
         {
             return;
         }
+        let mut queue = viewer
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counts = &mut queue.counts;
+        counts.frames += 1;
+        counts.bytes += (HEADER_LENGTH + frame.data.len()) as u64;
+        counts.worst_wait = counts.worst_wait.max(since.elapsed());
     }
 }
 
@@ -658,7 +915,7 @@ mod tests {
             key_frame,
             sequence,
             timestamp_micros: sequence * 33_333,
-            data: vec![sequence as u8; 4],
+            data: vec![sequence as u8; 4].into(),
         })
     }
 
@@ -668,7 +925,7 @@ mod tests {
             key_frame: true,
             sequence: 7,
             timestamp_micros: 1_234_567,
-            data: vec![0, 0, 0, 1, 0x67],
+            data: vec![0, 0, 0, 1, 0x67].into(),
         };
         let mut bytes = original.header().to_vec();
         bytes.extend_from_slice(&original.data);
@@ -678,38 +935,75 @@ mod tests {
         assert_eq!(MediaFrame::decode(vec![0x80; HEADER_LENGTH]), None);
     }
 
-    #[test]
-    fn a_new_queue_waits_for_a_key_frame() {
-        let mut queue = Queue::new();
-        assert_eq!(queue.offer(&frame(1, false)), Offered::Skipped);
-        assert_eq!(queue.offer(&frame(2, true)), Offered::Queued);
-        assert_eq!(queue.offer(&frame(3, false)), Offered::Queued);
-        let waiting: Vec<u64> = queue.frames.iter().map(|frame| frame.sequence).collect();
-        assert_eq!(waiting, [2, 3]);
+    /// Offers a frame that comes right after the one before.
+    fn offer(queue: &mut Queue, frame: Arc<MediaFrame>) -> Offered {
+        queue.offer(&frame, Instant::now())
+    }
+
+    fn waiting(queue: &Queue) -> Vec<u64> {
+        queue
+            .frames
+            .iter()
+            .map(|(frame, _)| frame.sequence)
+            .collect()
     }
 
     #[test]
-    fn a_full_queue_empties_and_skips_to_the_next_key_frame() {
+    fn a_new_queue_waits_for_a_key_frame() {
         let mut queue = Queue::new();
-        assert_eq!(queue.offer(&frame(1, true)), Offered::Queued);
-        assert_eq!(queue.offer(&frame(2, false)), Offered::Queued);
-        assert_eq!(queue.offer(&frame(3, false)), Offered::Queued);
-        // The link took nothing meanwhile.
-        assert_eq!(queue.offer(&frame(4, false)), Offered::Overflowed);
+        assert_eq!(offer(&mut queue, frame(1, false)), Offered::Skipped);
+        assert_eq!(offer(&mut queue, frame(2, true)), Offered::Queued);
+        assert_eq!(offer(&mut queue, frame(3, false)), Offered::Queued);
+        assert_eq!(waiting(&queue), [2, 3]);
+    }
+
+    #[test]
+    fn frames_wait_a_tenth_of_a_second_then_the_queue_skips_to_a_key_frame() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // Thirty frames a second, and the link takes none of them.
+        let mut queue = Queue::new();
+        assert_eq!(queue.offer(&frame(1, true), at(0)), Offered::Queued);
+        assert_eq!(queue.offer(&frame(2, false), at(33)), Offered::Queued);
+        assert_eq!(queue.offer(&frame(3, false), at(66)), Offered::Queued);
+        assert_eq!(queue.offer(&frame(4, false), at(99)), Offered::Queued);
+        assert_eq!(queue.offer(&frame(5, false), at(133)), Offered::Overflowed);
         assert!(queue.frames.is_empty());
-        assert_eq!(queue.offer(&frame(5, false)), Offered::Skipped);
-        assert_eq!(queue.offer(&frame(6, true)), Offered::Queued);
-        assert_eq!(queue.skipped, 5);
-        assert_eq!(queue.frames.front().map(|frame| frame.sequence), Some(6));
+        assert_eq!(queue.offer(&frame(6, false), at(166)), Offered::Skipped);
+        assert_eq!(queue.offer(&frame(7, true), at(199)), Offered::Queued);
+        assert_eq!((queue.skipped, queue.overflows), (6, 1));
+        assert_eq!(waiting(&queue), [7]);
+
+        // Sixty a second: the same tenth of a second holds twice as many.
+        let mut queue = Queue::new();
+        queue.offer(&frame(1, true), at(0));
+        for sequence in 2..=6 {
+            let ms = (sequence - 1) * 50 / 3;
+            assert_eq!(
+                queue.offer(&frame(sequence, false), at(ms)),
+                Offered::Queued
+            );
+        }
+        assert_eq!(queue.offer(&frame(7, false), at(100)), Offered::Overflowed);
+    }
+
+    #[test]
+    fn no_more_than_a_few_frames_wait_however_fast_they_come() {
+        let now = Instant::now();
+        let mut queue = Queue::new();
+        queue.offer(&frame(1, true), now);
+        for sequence in 2..=MAX_WAITING_FRAMES as u64 {
+            assert_eq!(queue.offer(&frame(sequence, false), now), Offered::Queued);
+        }
+        assert_eq!(queue.offer(&frame(99, false), now), Offered::Overflowed);
     }
 
     #[test]
     fn a_key_frame_replaces_what_waits() {
         let mut queue = Queue::new();
-        queue.offer(&frame(1, true));
-        queue.offer(&frame(2, false));
-        assert_eq!(queue.offer(&frame(3, true)), Offered::Queued);
-        let waiting: Vec<u64> = queue.frames.iter().map(|frame| frame.sequence).collect();
-        assert_eq!(waiting, [3]);
+        offer(&mut queue, frame(1, true));
+        offer(&mut queue, frame(2, false));
+        assert_eq!(offer(&mut queue, frame(3, true)), Offered::Queued);
+        assert_eq!(waiting(&queue), [3]);
     }
 }

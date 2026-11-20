@@ -25,17 +25,21 @@ mod transport;
 mod android_jni;
 
 pub use api::Core;
+pub use bytes::Bytes;
 pub use clipboard::{
     CLIPBOARD_CHUNK_SIZE, Clipboard, ClipboardFormat, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
     MIME_TEXT,
 };
-pub use ffi::{LcCore, LcEventCallback, LcInputCallback, LcMediaCallback, LcMediaFrame};
+pub use ffi::{
+    LcCore, LcEventCallback, LcInputCallback, LcMediaAudio, LcMediaAudioCallback, LcMediaCallback,
+    LcMediaFrame,
+};
 pub use file_stream::{MAX_READ_SIZE, RemoteFileLease};
 pub use files::MIME_URI_LIST;
 pub use files::{
     Entry as FileEntry, Manifest as FileManifest, sanitize_name as sanitize_file_name,
 };
-pub use media::MediaFrame;
+pub use media::{MAX_AUDIO_BYTES, MediaAudio, MediaFrame};
 pub use model::{
     CoreConfig, LC_INPUT_FLAG_ABSOLUTE_POSITION, LC_INPUT_FLAG_KEY_REPEAT,
     LC_INPUT_FLAG_PRECISE_SCROLL, LC_INPUT_KEY_DOWN, LC_INPUT_KEY_UP, LC_INPUT_MOUSE_BUTTON_DOWN,
@@ -496,6 +500,49 @@ mod tests {
             .recv_timeout(Duration::from_secs(4))
             .expect("a frame");
         assert_eq!((frame.sequence, frame.key_frame), (5, true));
+
+        // Four times a second the source hears how the link did: what went out
+        // (the key frame just sent), and that it kept up (nothing had to be
+        // dropped for being late).
+        let report = wait_for_event(&source.events, Duration::from_secs(3), |event| {
+            event["event"] == "media_link" && event["frames"].as_u64() > Some(0)
+        });
+        assert_eq!(report["peer_id"], "picture-watcher");
+        assert_eq!(report["overflows"], 0);
+        assert!(report["rtt_ms"].as_f64().unwrap() > 0.0);
+        assert!(report["kbps"].as_f64().unwrap() > 0.0);
+
+        // Sound goes with the picture, either way: the source's to those
+        // who watch, a watching device's (a microphone) to the source.
+        let (heard_tx, heard) = std::sync::mpsc::channel();
+        for core in [&watcher, &source] {
+            let heard_tx = heard_tx.clone();
+            core.thread
+                .media
+                .set_audio_sink(std::sync::Arc::new(move |peer: &str, sound| {
+                    let _ = heard_tx.send((peer.to_owned(), sound));
+                }));
+        }
+        source.thread.media.send_audio(2, &[1, 0, 2, 0]);
+        let (peer, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(peer, "picture-source");
+        assert_eq!((sound.channels, &sound.samples[..]), (2, &[1, 0, 2, 0][..]));
+        watcher
+            .thread
+            .media
+            .send_audio_to("picture-source", 1, &[5, 0]);
+        let (peer, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(peer, "picture-watcher");
+        assert_eq!((sound.channels, &sound.samples[..]), (1, &[5, 0][..]));
+        // Half a sample is not sound, nor is more than fits a packet.
+        source.thread.media.send_audio(2, &[1, 0, 2]);
+        source
+            .thread
+            .media
+            .send_audio(1, &vec![0; crate::MAX_AUDIO_BYTES + 2]);
+        source.thread.media.send_audio(1, &[9, 0]);
+        let (_, sound) = heard.recv_timeout(Duration::from_secs(4)).expect("sound");
+        assert_eq!(&sound.samples[..], &[9, 0][..]);
 
         watcher.thread.media.unwatch("picture-source");
         wait_for_event(&watcher.events, Duration::from_secs(4), |event| {
@@ -2278,6 +2325,172 @@ mod tests {
         c.thread.stop_and_join();
     }
 
+    /// A host with a KVM placed on its right, connected, and a Mac driving
+    /// the host (`docs/attached-screens.md`). Returns them once the host
+    /// reports the KVM as its attached screen.
+    fn attached_cores(prefix: &str, discovery_port: u16) -> (TestCore, TestCore, TestCore) {
+        let host_id = format!("{prefix}-host");
+        let kvm_id = format!("{prefix}-kvm");
+        let host = test_core_with(&host_id, discovery_port, |config| {
+            config.displays = vec![display(1440.0, 900.0)];
+        });
+        let kvm = test_core_with(&kvm_id, discovery_port, |config| {
+            config.displays = vec![display(1920.0, 1080.0)];
+            config.attachable = true;
+        });
+        let mac = test_core_with(&format!("{prefix}-mac"), discovery_port, |config| {
+            config.displays = vec![display(1512.0, 982.0)];
+        });
+        wait_for_peers(&host, &[&kvm_id]);
+        wait_for_peers(&mac, &[&host_id]);
+        host.thread
+            .send(Command::PlaceBeside {
+                peer_id: kvm_id.clone(),
+                side: Side::Right,
+            })
+            .unwrap();
+        wait_for_placement(&host, &kvm_id, "local");
+        host.thread.send(Command::Connect(kvm_id.clone())).unwrap();
+        wait_connected(&host, &kvm_id);
+        let attached = wait_for_event(&host.events, Duration::from_secs(3), |event| {
+            event["event"] == "attached_screens"
+        });
+        assert_eq!(attached["screens"][0]["peer_id"], kvm_id.as_str());
+        assert_eq!(attached["screens"][0]["displays"][0]["x"], 1440.0);
+        assert_eq!(attached["screens"][0]["offset"]["x"], 1440.0);
+        mac.thread.send(Command::Connect(host_id.clone())).unwrap();
+        wait_connected(&mac, &host_id);
+        (host, kvm, mac)
+    }
+
+    fn wait_relay_ended(core: &TestCore, peer_id: &str, reason: &str) {
+        wait_for_event(&core.events, Duration::from_secs(3), |event| {
+            event["event"] == "relay_ended"
+                && event["peer_id"] == peer_id
+                && event["reason"] == reason
+        });
+    }
+
+    #[test]
+    fn an_attached_screen_counts_among_its_hosts_displays_for_other_peers_only() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let (mut host, mut kvm, mut mac) = attached_cores("screen", discovery_port);
+
+        // The Mac sees the host with the KVM's display beside its own.
+        let host_displays =
+            |event: &Value| event["event"] == "peer_displays" && event["peer_id"] == "screen-host";
+        let seen = wait_for_event(&mac.events, Duration::from_secs(3), |event| {
+            host_displays(event) && event["displays"].as_array().unwrap().len() == 2
+        });
+        assert_eq!(seen["displays"][1]["x"], 1440.0);
+        assert_eq!(seen["displays"][1]["width"], 1920.0);
+        // The KVM never sees itself among the host's displays.
+        std::thread::sleep(Duration::from_millis(300));
+        let kvm_seen = events_named(&kvm, "peer_displays");
+        assert!(
+            kvm_seen
+                .iter()
+                .filter(|event| event["peer_id"] == "screen-host")
+                .all(|event| event["displays"].as_array().unwrap().len() == 1),
+            "{kvm_seen:?}"
+        );
+
+        // Moved away from the host, it is no longer attached.
+        host.thread
+            .send(Command::SetPlacement {
+                peer_id: "screen-kvm".to_owned(),
+                offset: None,
+            })
+            .unwrap();
+        let detached = wait_for_event(&host.events, Duration::from_secs(3), |event| {
+            event["event"] == "attached_screens"
+        });
+        assert_eq!(detached["screens"], serde_json::json!([]));
+        wait_for_event(&mac.events, Duration::from_secs(3), |event| {
+            host_displays(event) && event["displays"].as_array().unwrap().len() == 1
+        });
+
+        host.thread.stop_and_join();
+        kvm.thread.stop_and_join();
+        mac.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_driven_host_relays_to_its_attached_screen_without_giving_up_control() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let (mut host, mut kvm, mut mac) = attached_cores("relay", discovery_port);
+        let mut other = test_core("relay-other", discovery_port);
+        let relay_to = |core: &TestCore, peer_id: Option<&str>| {
+            core.thread
+                .send(Command::SetRelayTarget(peer_id.map(str::to_owned)))
+                .unwrap();
+        };
+
+        // Nobody drives the host yet: there is nothing to relay for.
+        relay_to(&host, Some("relay-kvm"));
+        wait_relay_ended(&host, "relay-kvm", "not driven");
+
+        // The Mac drives the host, whose pointer goes on to the KVM.
+        mac.thread.send(Command::SendInput(motion(1.0))).unwrap();
+        assert_eq!(received(&host, Duration::from_millis(400)), vec![1.0]);
+        relay_to(&host, Some("relay-kvm"));
+        host.thread.send(Command::RelayInput(motion(5.0))).unwrap();
+        assert_eq!(received(&kvm, Duration::from_millis(400)), vec![5.0]);
+        // The Mac still drives the host.
+        mac.thread.send(Command::SendInput(motion(2.0))).unwrap();
+        assert_eq!(received(&host, Duration::from_millis(400)), vec![2.0]);
+        assert!(events_named(&mac, "control_revoked").is_empty());
+
+        // Another device takes the KVM over: only the relay ends.
+        wait_for_peers(&other, &["relay-kvm"]);
+        other
+            .thread
+            .send(Command::Connect("relay-kvm".into()))
+            .unwrap();
+        wait_connected(&other, "relay-kvm");
+        other.thread.send(Command::SendInput(motion(3.0))).unwrap();
+        assert_eq!(received(&kvm, Duration::from_millis(400)), vec![3.0]);
+        wait_relay_ended(&host, "relay-kvm", "revoked");
+        host.thread.send(Command::RelayInput(motion(6.0))).unwrap();
+        assert!(received(&kvm, Duration::from_millis(300)).is_empty());
+        mac.thread.send(Command::SendInput(motion(4.0))).unwrap();
+        assert_eq!(received(&host, Duration::from_millis(400)), vec![4.0]);
+
+        // Relaying again takes the KVM back, the newest controller as ever.
+        relay_to(&host, Some("relay-kvm"));
+        host.thread.send(Command::RelayInput(motion(7.0))).unwrap();
+        assert_eq!(received(&kvm, Duration::from_millis(400)), vec![7.0]);
+        wait_revoked(&other, "relay-kvm", "revoked");
+
+        // The Mac gives control back: so does the relay, and the KVM is
+        // released.
+        mac.thread.send(Command::ResetInput).unwrap();
+        wait_relay_ended(&host, "relay-kvm", "control ended");
+        wait_control_ended(&kvm, "relay-host");
+        host.thread.send(Command::RelayInput(motion(8.0))).unwrap();
+        assert!(received(&kvm, Duration::from_millis(300)).is_empty());
+
+        // Someone at the host pushes into the KVM while the Mac drives the
+        // host and relays: the host's own user wins, as ever.
+        mac.thread.send(Command::SendInput(motion(9.0))).unwrap();
+        assert_eq!(received(&host, Duration::from_millis(400)), vec![9.0]);
+        relay_to(&host, Some("relay-kvm"));
+        host.thread
+            .send(Command::SetInputTarget(Some("relay-kvm".into())))
+            .unwrap();
+        host.thread.send(Command::SendInput(motion(10.0))).unwrap();
+        assert_eq!(received(&kvm, Duration::from_millis(400)), vec![10.0]);
+        wait_relay_ended(&host, "relay-kvm", "control ended");
+        wait_revoked(&mac, "relay-host", "revoked");
+
+        host.thread.stop_and_join();
+        kvm.thread.stop_and_join();
+        mac.thread.stop_and_join();
+        other.thread.stop_and_join();
+    }
+
     #[test]
     fn a_controller_that_cannot_be_told_is_ignored_until_it_resets() {
         let _network = network_test();
@@ -3513,6 +3726,51 @@ mod tests {
         a.thread.stop_and_join();
         b.thread.stop_and_join();
         c.thread.stop_and_join();
+    }
+
+    #[test]
+    fn a_device_tells_its_settings_and_is_asked_to_change_them() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("settings-a", discovery_port);
+        let mut b = test_core("settings-b", discovery_port);
+        let told = |name: &'static str| {
+            wait_for_event(&a.events, Duration::from_secs(2), move |event| {
+                event["event"] == "peer_settings"
+                    && event["peer_id"] == "settings-b"
+                    && event["settings"]["usb"]["product"] == name
+            })
+        };
+        // Said before anybody is connected: told when somebody is.
+        let settings = |name: &str| serde_json::json!({ "usb": { "product": name } });
+        b.thread
+            .send(Command::SetDeviceSettings(settings("first")))
+            .unwrap();
+        wait_for_peers(&a, &["settings-b"]);
+        a.thread
+            .send(Command::Connect("settings-b".into()))
+            .unwrap();
+        wait_connected(&a, "settings-b");
+        wait_connected(&b, "settings-a");
+        told("first");
+        // A asks; B's shell hears, changes and says so.
+        a.thread
+            .send(Command::ChangeDeviceSettings {
+                peer_id: "settings-b".into(),
+                settings: settings("second"),
+            })
+            .unwrap();
+        wait_for_event(&b.events, Duration::from_secs(2), |event| {
+            event["event"] == "settings_change_requested"
+                && event["peer_id"] == "settings-a"
+                && event["settings"]["usb"]["product"] == "second"
+        });
+        b.thread
+            .send(Command::SetDeviceSettings(settings("second")))
+            .unwrap();
+        told("second");
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
     }
 
     #[test]

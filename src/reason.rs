@@ -17,6 +17,7 @@
 //! (`EventSink::emit_value`), so no call site has to remember it.
 
 use crate::files::{TOO_DEEP, TOO_MANY_FILES};
+use crate::runtime::attached::{CONTROL_ENDED, NOT_ATTACHED, NOT_DRIVEN};
 use crate::runtime::reconnect::{GOING_TO_SLEEP, INCOMPATIBLE, LOCAL_REQUEST, WRONG_DEVICE};
 use crate::runtime::trust::{
     IDENTITY_CHANGED, PAIRING_BUSY, PAIRING_FAILED, PAIRING_OUTDATED, PAIRING_REJECTED,
@@ -68,6 +69,10 @@ const REASONS: &[(&str, &str)] = &[
     ("remote control turned off", "remote_control_off"),
     ("taken_over", "taken_over"),
     ("revoked", "revoked"),
+    // Relaying to an attached screen (`relay_ended`).
+    (CONTROL_ENDED, "control_ended"),
+    (NOT_ATTACHED, "not_attached"),
+    (NOT_DRIVEN, "not_driven"),
     // Files (`files_failed`, `files_send_ended`, `files_not_shared`, …).
     ("done", "done"),
     ("cancelled", "cancelled"),

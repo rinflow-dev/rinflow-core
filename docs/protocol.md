@@ -20,6 +20,8 @@
 | 22 | `PairReveal` | 32 bytes: the dialer's nonce, sent once it holds the other side's. |
 | 29 | `InputEcho` | The `timestamp_micros` (`u64`) of the newest input event the sender just received, unchanged: from a driven device to the one driving it, at most every 100 ms. Only to peers with capability bit 13 (`INPUT_ECHO`). |
 | 30 | `MediaOffer` | Token (`u64`) and the UDP port (`u16`) of the sender's media endpoint, where its picture can be watched ([media.md](media.md)). Only to peers with capability bit 14 (`MEDIA`). |
+| 31 | `DeviceSettings` | What the sender is set to, where another device may show and change it (a KVM's USB identity): a `u16` length and that many bytes of JSON text, an object, at most 4096 bytes. The core carries it unread. Sent when the session starts and whenever it changes. Only to peers with capability bit 16 (`DEVICE_SETTINGS`). |
+| 32 | `DeviceSettingsChange` | Same layout: the settings the sender asks the receiver to change. The receiver's shell decides and answers with `DeviceSettings`. Only to peers with capability bit 16. |
 | 33 | `IdentifyDisplays` | `first` (`u32`): the number of the receiver's first display, as the sender numbered the displays of its arrangement. The receiver shows `first`, `first + 1`, … on its displays in the order of its `ScreenInfo`. Only to peers with capability bit 17 (`IDENTIFY_DISPLAYS`). |
 
 Types 8–13 are the clipboard and file messages of the data link ([clipboard-and-files.md](clipboard-and-files.md)). `DataInvite` (type 9) carries the token (`u64`) and the UDP port (`u16`, never 0) of the core's second endpoint, where the data link goes.
@@ -40,7 +42,7 @@ Devices update one at a time, so a peer may run an older core for a long time. C
 - A limit both sides must agree on (such as the clipboard size) is a capability too.
 
 - The **protocol version** is set by `PROTOCOL_MIN_VERSION` / `PROTOCOL_MAX_VERSION` in [model.rs](../src/model.rs).
-- The **C ABI version** is written by hand in two places: `lc_core_abi_version()` in [ffi.rs](../src/ffi.rs) and `LC_CORE_ABI_VERSION` in the header. Bump both together. It is currently **10**:
+- The **C ABI version** is written by hand in two places: `lc_core_abi_version()` in [ffi.rs](../src/ffi.rs) and `LC_CORE_ABI_VERSION` in the header. Bump both together. It is currently **11**:
   - Version 3 added multiple sessions, `lc_core_disconnect_peer`, `lc_core_set_input_target` and the `peer_id` fields.
   - Version 4 added the arrangement: `lc_core_set_local_displays`, `lc_core_set_placement`, `lc_core_place_beside`, the `displays` / `placements` config keys and the `peer_displays` / `placement_changed` events. It came with wire protocol v3, which does not interoperate with v2, so every device needs a build of this core.
   - Versions 5 and 6 added the clipboard, the data link and files (see [clipboard-and-files.md](clipboard-and-files.md)).
@@ -48,5 +50,6 @@ Devices update one at a time, so a peer may run an older core for a long time. C
   - Version 8 keeps the user's devices connected (`auto_connect`, on by default), adds the `disconnected` reasons `"disconnected on the other device"`, `"refused by the other device"` and `"going to sleep"`, and `lc_core_system_will_sleep` / `lc_core_network_changed`. Shells drop their own reconnect timers.
   - Version 9 finds devices by address (`manual_addresses`), switches shortcut translation at run time, adds presence and pointer lock (capability bits 9 and 10, wire messages 17–19), file progress on both sides (`files_receiving`, `files_sending`, `files_send_ended`; `lc_core_cancel_files` also stops sending), and chained placements. Version 8 cores still connect: the new messages go only to peers that announce them, and older cores ignore the `reply` field of a probe (they do not answer it, but are found through their own multicast).
   - Version 10 makes the modifier keys of a peer of the other platform convention configurable key by key: `modifier_map` and `lc_core_set_modifier_map` replace `shortcut_remap` and `lc_core_set_shortcut_remap`. Nothing changes on the wire.
+  - Version 11 adds attached screens ([attached-screens.md](attached-screens.md)): the `attachable` config key (capability bit 15, `ATTACHABLE`), `lc_core_set_relay_target`, `lc_core_relay_input` and the `attached_screens` / `relay_ended` events. Nothing else changes on the wire: an attached screen's displays travel in the host's `ScreenInfo` like its own.
   - Earlier calls keep their meaning.
 - The header is maintained by hand (no cbindgen). Any change to `LcInputEvent` or the flag/modifier constants in `model.rs` must be copied into it.

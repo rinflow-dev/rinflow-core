@@ -52,8 +52,17 @@
  *    "files_available", "files_unavailable" and "files_stream_ended",
  *    lc_core_open_remote_files, lc_file_lease_read, lc_file_lease_close and
  *    lc_core_revoke_file_streams (see On-demand files). Within 11:
- *    identifying displays across devices (lc_core_identify_displays, event
- *    "identify_displays"; see Identify displays).
+ *    - attached screens (docs/attached-screens.md): config key
+ *      "attachable", lc_core_set_relay_target, lc_core_relay_input,
+ *      events "attached_screens" and "relay_ended"; capability bit 15,
+ *      nothing else changes on the wire;
+ *    - device settings (lc_core_set_device_settings,
+ *      lc_core_change_device_settings, events "peer_settings" and
+ *      "settings_change_requested"); capability bit 16, wire messages 31
+ *      and 32, only to peers that announce the bit;
+ *    - identifying displays across devices (lc_core_identify_displays,
+ *      event "identify_displays"; see Identify displays); capability bit
+ *      17, wire message 33.
  */
 #define LC_CORE_ABI_VERSION 11
 
@@ -144,8 +153,37 @@ bool lc_core_watch(LcCore *core, const char *peer_id);
 bool lc_core_unwatch(LcCore *core, const char *peer_id);
 /* The decoder lost its place: ask the watched peer for a key frame. */
 bool lc_core_request_media_key_frame(LcCore *core, const char *peer_id);
+
+/* A few milliseconds of the sound that goes with a picture (docs/media.md),
+ * valid until the callback returns. */
+typedef struct LcMediaAudio {
+    uint8_t channels; /* 1 or 2 */
+    uint8_t reserved[3];
+    uint32_t sequence; /* counts the sender's packets (and wraps); a gap: sound was lost */
+    const uint8_t *samples; /* signed 16-bit little endian, 48 kHz, interleaved */
+    size_t length; /* bytes */
+} LcMediaAudio;
+typedef void (*LcMediaAudioCallback)(const char *peer_id, const LcMediaAudio *sound, void *context);
+
+/* Sound of watched pictures (what the computer behind a KVM plays) goes to
+ * the callback, on the core's threads, in the order it came. Lost packets
+ * are not sent again: keep a few tens of milliseconds ahead and skip ahead
+ * when more piles up. */
+bool lc_core_set_media_audio_callback(LcCore *core, LcMediaAudioCallback callback, void *context);
+/* Sound for the peer whose picture is watched (a microphone for that
+ * computer): at most 960 bytes of samples in the same format, channels 1
+ * or 2. The bytes are copied. */
+bool lc_core_send_media_audio_to(
+    LcCore *core,
+    const char *peer_id,
+    uint8_t channels,
+    const uint8_t *samples,
+    size_t length
+);
+
 /* A source, with config key "media_source": one encoded frame for every peer
- * watching (event media_viewers). The bytes are copied. */
+ * watching (event media_viewers; how each viewer's link does, four times a second:
+ * media_link, see docs/media.md). The bytes are copied. */
 bool lc_core_send_media_frame(
     LcCore *core,
     bool key_frame,
@@ -261,6 +299,27 @@ bool lc_core_lock_peers(LcCore *core);
 bool lc_core_set_pointer_locked(LcCore *core, bool locked);
 
 /*
+ * Device settings (within version 11). What a device is set to, where another
+ * device may show and change it: a KVM has no screen of its own for a
+ * settings page, so the device that drives it shows one. The settings are a
+ * JSON object that the two shells agree on (at most 4096 bytes); the core
+ * carries it unread.
+ *
+ * The device that has settings calls lc_core_set_device_settings whenever
+ * they change (and once at start). Each connected peer reports
+ *   {"event":"peer_settings","peer_id":…,"settings":{…}}
+ * then, and when it connects. To change them, a peer calls
+ * lc_core_change_device_settings with the keys it wants changed; the device
+ * reports
+ *   {"event":"settings_change_requested","peer_id":…,"settings":{…}}
+ * and its shell decides, applies and calls lc_core_set_device_settings with
+ * what it is set to now. Only paired (admitted) peers are heard.
+ */
+bool lc_core_set_device_settings(LcCore *core, const char *settings_json);
+bool lc_core_change_device_settings(LcCore *core, const char *peer_id,
+                                    const char *settings_json);
+
+/*
  * Identify displays (within version 11), like Identify in Windows' display
  * settings, across devices. The shell where the user asks numbers the
  * displays of the arrangement: its own from 1, then each placed peer's in
@@ -313,6 +372,32 @@ bool lc_core_reset_input(LcCore *core);
  * (lc_core_send_input ignores what the shell put there).
  */
 bool lc_core_set_remote_control_allowed(LcCore *core, bool allowed);
+
+/*
+ * Attached screens (version 11, docs/attached-screens.md). A peer with
+ * config key "attachable" (a KVM: no keyboard and mouse of its own), placed
+ * right against this device's own displays and connected, is an attached
+ * screen: every other peer is told its displays as this device's own, so a
+ * device driving this one pushes the pointer onto it like onto a monitor.
+ *   {"event":"attached_screens","screens":[{"peer_id":…,"offset":{"x","y"},
+ *    "displays":[…]}]}
+ *       each screen's displays in this device's space and its placement
+ *       (subtract offset for its own space), whenever that changes
+ * While a peer drives this device and its pointer is on an attached screen,
+ * pass the input on to it: lc_core_set_relay_target(core, peer_id), then
+ * lc_core_relay_input with events in the attached peer's own space (absolute
+ * positions are best), and lc_core_set_relay_target(core, NULL) when the
+ * pointer leaves (the screen releases what it holds). Relaying does not
+ * count as driving another device: whoever drives this one carries on. The
+ * relay ends by itself, with
+ *   {"event":"relay_ended","peer_id":…,"reason":…}
+ * "control ended" (the driving peer stopped or was replaced), "not attached"
+ * (the screen went away, or never was one), "not driven" (nobody drives this
+ * device) or "revoked" (another device took the screen over). Input relayed
+ * meanwhile is dropped.
+ */
+bool lc_core_set_relay_target(LcCore *core, const char *peer_id);
+bool lc_core_relay_input(LcCore *core, const LcInputEvent *event);
 
 /*
  * Arrangement (all geometry in logical points: macOS points, or pixels at

@@ -61,9 +61,19 @@ pub const CAPABILITY_INPUT_ECHO: u64 = 1 << 13;
 /// Understands `MediaOffer` and can watch a device's picture over a media
 /// link (see `media.rs`). Announced with `CoreConfig::media`.
 pub const CAPABILITY_MEDIA: u64 = 1 << 14;
+/// Has no keyboard and mouse of its own and is only ever driven, such as a
+/// KVM: placed right against a device, it becomes that device's attached
+/// screen (see `docs/attached-screens.md`). Announced with
+/// `CoreConfig::attachable`.
+pub const CAPABILITY_ATTACHABLE: u64 = 1 << 15;
+/// Understands `DeviceSettings` and `DeviceSettingsChange`: what a device is
+/// set to, shown and changed from another device.
+pub const CAPABILITY_DEVICE_SETTINGS: u64 = 1 << 16;
+/// A device's settings on the wire (JSON text), at most.
+pub const MAX_DEVICE_SETTINGS_LENGTH: usize = 4096;
 /// Understands `IdentifyDisplays`: the receiver shows the numbers the
 /// sender gives its displays on its screens. Sent only to peers with this
-/// bit. (Bits 15 and 16 are taken by attached screens and device settings.)
+/// bit.
 pub const CAPABILITY_IDENTIFY_DISPLAYS: u64 = 1 << 17;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -76,6 +86,7 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_POINTER_LOCK
     | CAPABILITY_PAIRING_V2
     | CAPABILITY_INPUT_ECHO
+    | CAPABILITY_DEVICE_SETTINGS
     | CAPABILITY_IDENTIFY_DISPLAYS;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
@@ -174,6 +185,10 @@ pub struct CoreConfig {
     /// The shell has a picture to send (`Core::send_media_frame`): peers
     /// with `media` are offered it. A KVM is one. Off by default.
     pub media_source: bool,
+    /// This device has no keyboard and mouse of its own (a KVM): a device
+    /// that places it right beside itself treats it as an attached screen.
+    /// Off by default.
+    pub attachable: bool,
 }
 
 /// A paired peer: its device ID and the fingerprint of its certificate.
@@ -218,6 +233,7 @@ impl Default for CoreConfig {
             manual_addresses: Vec::new(),
             media: false,
             media_source: false,
+            attachable: false,
         }
     }
 }
@@ -234,6 +250,9 @@ impl CoreConfig {
         }
         if self.media {
             capabilities |= CAPABILITY_MEDIA;
+        }
+        if self.attachable {
+            capabilities |= CAPABILITY_ATTACHABLE;
         }
         capabilities
     }
@@ -623,6 +642,20 @@ pub enum WireMessage {
     /// with `CAPABILITY_INPUT_ECHO`.
     InputEcho {
         stamp: u64,
+    },
+    /// What the sender is set to, where another device may show and change
+    /// it (a KVM: how it names itself to the computer on its USB port): a
+    /// JSON object the two shells agree on, which the core carries unread.
+    /// Sent when the session starts and whenever it changes. Only to peers
+    /// with `CAPABILITY_DEVICE_SETTINGS`.
+    DeviceSettings {
+        settings: String,
+    },
+    /// Asks the receiver to change its settings to these (some of them, or
+    /// all). Its shell decides, and answers with `DeviceSettings`. Only to
+    /// peers with `CAPABILITY_DEVICE_SETTINGS`.
+    DeviceSettingsChange {
+        settings: String,
     },
     /// The sender's user asked to identify the displays: the receiver shows
     /// `first` on its first display, `first + 1` on the next, in the order

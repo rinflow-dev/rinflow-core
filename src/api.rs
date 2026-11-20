@@ -194,11 +194,55 @@ impl Core {
         self.thread.send(Command::SetPointerLocked(locked))
     }
 
+    /// What this device is set to, where another device may show and change
+    /// it: a JSON object the shells agree on. Peers report `peer_settings`,
+    /// now and whenever they connect.
+    pub fn set_device_settings(&self, settings: serde_json::Value) -> Result<(), String> {
+        self.thread.send(Command::SetDeviceSettings(settings))
+    }
+
+    /// Asks a connected peer to change its settings: its shell reports
+    /// `settings_change_requested`, and answers with its settings.
+    pub fn change_device_settings(
+        &self,
+        peer_id: &str,
+        settings: serde_json::Value,
+    ) -> Result<(), String> {
+        self.thread.send(Command::ChangeDeviceSettings {
+            peer_id: peer_id.to_owned(),
+            settings,
+        })
+    }
+
     /// Where the frames of watched pictures go (see `media.rs`): called
     /// with the peer's device ID, on the core's threads, in order. Set it
     /// before `watch`.
     pub fn set_media_sink(&self, sink: impl Fn(&str, MediaFrame) + Send + Sync + 'static) {
         self.thread.media.set_frame_sink(std::sync::Arc::new(sink));
+    }
+
+    /// Where the sound that comes with pictures goes, on either side of a
+    /// media link (see `media.rs`): called with the peer's device ID, on
+    /// the core's threads, in the order it came.
+    pub fn set_media_audio_sink(
+        &self,
+        sink: impl Fn(&str, crate::media::MediaAudio) + Send + Sync + 'static,
+    ) {
+        self.thread.media.set_audio_sink(std::sync::Arc::new(sink));
+    }
+
+    /// Sound of this device's picture, for every peer watching it: signed
+    /// 16-bit little-endian samples at 48 kHz, `channels` (1 or 2)
+    /// interleaved, at most `MAX_AUDIO_BYTES` of them. Lost packets are not
+    /// sent again.
+    pub fn send_media_audio(&self, channels: u8, samples: &[u8]) {
+        self.thread.media.send_audio(channels, samples);
+    }
+
+    /// Sound for the peer whose picture this device watches: a microphone
+    /// for the computer behind a KVM. As `send_media_audio`.
+    pub fn send_media_audio_to(&self, peer_id: &str, channels: u8, samples: &[u8]) {
+        self.thread.media.send_audio_to(peer_id, channels, samples);
     }
 
     /// Starts watching a peer's picture, once it has offered one
@@ -220,7 +264,12 @@ impl Core {
     /// One encoded frame of this device's picture, for every peer watching
     /// it (`media_viewers` says who). Needs `CoreConfig::media_source`.
     /// Goes straight to the links: it does not wait for the core's loop.
-    pub fn send_media_frame(&self, key_frame: bool, timestamp_micros: u64, data: Vec<u8>) {
+    pub fn send_media_frame(
+        &self,
+        key_frame: bool,
+        timestamp_micros: u64,
+        data: impl Into<bytes::Bytes>,
+    ) {
         self.thread
             .media
             .send_frame(key_frame, timestamp_micros, data);
@@ -232,5 +281,21 @@ impl Core {
 
     pub fn reset_input(&self) -> Result<(), String> {
         self.thread.send(Command::ResetInput)
+    }
+
+    /// While a peer drives this device, passes the input that lands on an
+    /// attached screen (`attached_screens`) on to it with `relay_input`;
+    /// `None` stops, and the screen releases what it holds. Without a peer
+    /// driving this device, or for a peer that is not attached, the relay
+    /// ends at once (`relay_ended`). See `docs/attached-screens.md`.
+    pub fn set_relay_target(&self, peer_id: Option<&str>) -> Result<(), String> {
+        self.thread
+            .send(Command::SetRelayTarget(peer_id.map(str::to_owned)))
+    }
+
+    /// Input for the attached screen chosen with `set_relay_target`, in its
+    /// own space; dropped while there is none.
+    pub fn relay_input(&self, event: LcInputEvent) -> Result<(), String> {
+        self.thread.send(Command::RelayInput(event))
     }
 }
