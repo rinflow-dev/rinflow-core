@@ -18,7 +18,7 @@ The watching device asks, with `DeviceSettingsChange`:
 
 | Ask | Meaning |
 | --- | --- |
-| `{"window":"front"}` | Show the window in front there: the one the user works in while driving that computer. |
+| `{"window":"front"}` | Show the window in front there: the one the user works in while driving that computer. When the system itself is in front for the moment (a notification, a menu of its own), that is the frontmost window of a program. |
 | `{"window":<id>}` | Show the window of that ID (one the computer told) again, and bring it to the front there: the pointer on the picture reaches whatever is on top. |
 
 The computer says, with `DeviceSettings`:
@@ -28,7 +28,7 @@ The computer says, with `DeviceSettings`:
 | `{"window":{"id":…,"title":…,"x":…,"y":…,"width":…,"height":…}}` | The window it shows. `id` is a number of its own choosing that stays the window's. The place is on its desktop, in the logical points of the arrangement ([architecture.md](architecture.md#arrangement)): what of the window is seen, which is what the picture is of. |
 | `{"window":null}` | It shows none. |
 
-- **When.** Whenever that changes (another window, the window moved or resized, closed), and in answer to every ask, changed or not. An ask that finds nothing to show (the desktop in front, a window since closed) changes nothing, and is answered all the same.
+- **When.** Whenever that changes (another window, the window moved or resized, closed), and in answer to every ask, changed or not. An ask that finds nothing to show (no program's window open, a window since closed) changes nothing, and is answered all the same.
 - **Not every report is an answer.** A device also says its settings when a session starts, so a report can be older than an ask. A watching device that waits for an answer therefore takes only a report with a window for one, and gives up after a moment otherwise.
 - **Only when asked.** A window is shown because a peer asked for it, never because one watches. When the last viewer stops watching, or the window is closed, none is shown.
 - **One at a time.** A source has one picture ([media.md](media.md)), so one window for all who watch.
