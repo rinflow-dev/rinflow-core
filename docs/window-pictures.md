@@ -23,13 +23,18 @@ The watching device asks, with `DeviceSettingsChange`:
 | `{"window":<id>}` | Show the window of that ID (one the computer told) again, and bring it to the front there: the pointer on the picture reaches whatever is on top. |
 | `{"window":{"titled":"<text>"}}` | Show the frontmost window with that text in its title (in capitals or not), wherever it is among the others, also minimized. For a device that knows which program's window it wants without anyone at the computer to bring it to the front. |
 
+An ask may also carry, beside `window`:
+
+- `"screen":{"width":…,"height":…,"scale":…}`: the screen the asker shows the window on, in points, without what it keeps for itself there (a menu bar, a dock), and its pixels to a point. A computer with a monitor nobody looks at makes that monitor its twin (below).
+- `"at":{"x":…,"y":…}`, with a window's ID: put the window with its top left corner there, in points from the top left of the monitor it stands on. The asker's user put the window's picture there on its own screen.
+
 An ask may carry `"ask":<number>` beside `window`, a number of the asker's choosing that it never used before (also not before it restarted: the time will do). The answer then says which ask it answers.
 
 The computer says, with `DeviceSettings`:
 
 | Report | Meaning |
 | --- | --- |
-| `{"window":{"id":…,"title":…,"x":…,"y":…,"width":…,"height":…}}` | The window it shows. `id` is a number of its own choosing that stays the window's. The place is on its desktop, in the logical points of the arrangement ([architecture.md](architecture.md#arrangement)): what of the window is seen, which is what the picture is of. |
+| `{"window":{"id":…,"title":…,"x":…,"y":…,"width":…,"height":…,"screen":{…},"minimized":…}}` | The window it shows. `id` is a number of its own choosing that stays the window's. The place is on its desktop, in the logical points of the arrangement ([architecture.md](architecture.md#arrangement)): what of the window is seen, which is what the picture is of. `screen` is the monitor it stands on, as `x`, `y`, `width` and `height` in the same points. `minimized`: it is put away there, and the place is the one it had. |
 | `{"window":null}` | It shows none. |
 | `"answer":{"ask":<number>,"window":<id>}` beside `window` | The answer to the numbered ask: the ID of the window the ask found (the one now shown), or `null` when it found none (then what was shown before stays). |
 
@@ -43,6 +48,8 @@ The computer says, with `DeviceSettings`:
 
 The window stays on the computer's own desktop: its program must keep drawing it, and the pointer must reach it. Where the computer has a monitor nobody looks at (a virtual display driver's), the window is moved onto that one while it is shown and back where it stood afterwards: off the screens people look at, and not in the way of what happens there. It should look there as it did where it stood: a monitor of another scale has the program draw the window anew, with other pixels, so the computer gives that monitor the scale of the screen the window comes from where it can. Such a monitor is not among the displays the computer tells its peers (`ScreenInfo`), so no pointer wanders onto it; positions on it still mean something to the computer, which is all driving the window needs. Without such a monitor the window stays where it is, on a screen someone may be looking at.
 
+**The window as a window of the watching device.** A watching device can show the picture without a frame of its own, as the window it is: at the place on its screen that the window has on its monitor (`x`, `y` less the corner of `screen`), as large, put away while it is `minimized`. The window's own title bar and edges, in the picture and around it, then do there what they do on the computer: dragging moves it, an edge resizes it (the edge lies just outside what is seen of the window, so the watching device takes the pointer a little outside the picture too), its buttons maximize, minimize and close it. For that the monitor nobody looks at is made the twin of the asker's `screen`: as large in points, and of as many pixels to a point as the driver has a size for, so that what fills it fills that screen and the window is no larger or smaller there than it is shown.
+
 A window taken while it was dragged is let go at a screen edge when the pointer leaves; the computer then puts all of it back on a screen (or on the spare monitor).
 
 ## The picture
@@ -53,7 +60,7 @@ Frames of the window alone, whatever lies over it there, with the computer's cur
 
 The pointer goes as a share of the picture, turned into a position on the computer's desktop with the window's place: `x + share.x × width`, `y + share.y × height`, sent as an absolute move.
 
-- **The place holds through a drag.** Dragging the window by its title moves what the picture is of. A position worked out with the new place would move the pointer again, and the window with it, and so on. So the watching device looks the place up when the pointer moves with no button down, and keeps it from a press to its release.
+- **The place holds through a drag.** Dragging the window by its title moves what the picture is of. A position worked out with the new place would move the pointer again, and the window with it, and so on. So the watching device looks the place up when the pointer moves with no button down, and keeps it from a press to its release; one that moves the picture along with the window keeps where the picture was on its own screen for as long, too.
 - **The window must be on top there.** The watching device asks for it by ID when its user turns to the picture. Whether that succeeds is up to the computer's system; a click on the picture lands on whatever is on top.
 - **One controller at a time** holds as ever: driving the computer from the picture is driving it.
 
