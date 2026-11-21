@@ -21,6 +21,7 @@ The watching device asks, with `DeviceSettingsChange`:
 | `{"window":"front"}` | Show the window in front there: the one the user works in while driving that computer. When the system itself is in front for the moment (a notification, a menu of its own), that is the frontmost window of a program. |
 | `{"window":"dragged"}` | Show the window being dragged with the mouse there right now. The watching device asks this when its pointer is about to leave the computer with a button held: a window dragged to the edge comes along. |
 | `{"window":<id>}` | Show the window of that ID (one the computer told) again, and bring it to the front there: the pointer on the picture reaches whatever is on top. |
+| `{"window":{"titled":"<text>"}}` | Show the frontmost window with that text in its title (in capitals or not), wherever it is among the others, also minimized. For a device that knows which program's window it wants without anyone at the computer to bring it to the front. |
 
 An ask may carry `"ask":<number>` beside `window`, a number of the asker's choosing that it never used before (also not before it restarted: the time will do). The answer then says which ask it answers.
 
