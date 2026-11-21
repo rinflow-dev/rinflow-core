@@ -48,6 +48,10 @@ lc_core_relay_input(core, &event);           // in the attached peer's own space
 lc_core_set_device_settings(core, "{\"usb\":{\"product\":\"Rinflow KVM\"}}"); // on the KVM
 lc_core_change_device_settings(core, kvm_peer_id, "{\"usb\":{\"product\":\"Keyboard\"}}");
 
+// Within ABI 11: waking a sleeping device (see "Waking a device" under How it works)
+lc_core_set_wake_addresses(core, "[\"00:1b:63:84:45:e6\"]"); // what wakes this device
+lc_wake_send("[\"a4:83:e7:2f:10:9c\"]", "192.168.1.20");     // one round of magic packets; no core needed
+
 // Arrangement (logical points)
 lc_core_set_local_displays(core, "[{\"x\":0,\"y\":0,\"width\":1512,\"height\":982,\"scale\":2}]");
 lc_core_place_beside(core, peer_id, "right");                 // centred on that side
@@ -113,6 +117,8 @@ Every event with a `reason`, and every `error` event, also has `reason_code`: a 
 | `peer_active` | `peer_id`. Someone uses that device (see "Presence"). |
 | `lock_requested` | `peer_id`. That device's user locked it. |
 | `identify_displays` | `peer_id`, `first`. That device's user asked to identify the displays: show `first` on this device's first display (in the order given to `lc_core_set_local_displays`), `first + 1` on the next, for a few seconds, in the same place on every screen. Within ABI 11. |
+| `peer_wake` | `peer_id`, `addresses`: the hardware addresses that device can be woken by while it sleeps (`["aa:bb:cc:dd:ee:ff"]`; empty: it cannot be woken), as its shell gave them to `lc_core_set_wake_addresses`. Sent when the peer connects and whenever they change. Save them with the device and pass them to `lc_wake_send` when it is away. Within ABI 11. |
+| `peer_asleep` | `peer_id`. That device is going to sleep (`lc_core_system_will_sleep` there) and closes its session: the ordinary `disconnected` (`"peer closed the connection"`) follows. Within ABI 11. |
 | `peer_pointer_lock` | `peer_id`, `locked`. A game on that peer holds its pointer (or no longer does): while driving it, send all motion and do not cross at its edges. |
 | `attached_screens` | `screens`: `[{"peer_id","offset","displays"}]`, each attached screen's displays in this device's space, and its placement (subtract `offset` for a point in the screen's own space). Sent whenever that changes. Peers in a session are told these displays as this device's own ([attached-screens.md](attached-screens.md)). ABI 11. |
 | `relay_ended` | `peer_id`, `reason`. Input is no longer passed on to that attached screen without the shell asking: `"control ended"` (the peer that drove this device stopped or was replaced), `"not attached"`, `"not driven"` (nobody drives this device) or `"revoked"` (another device took the screen over). End the relay in the shell too. ABI 11. |

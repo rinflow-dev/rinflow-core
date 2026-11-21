@@ -21,7 +21,7 @@ use crate::media::MediaHub;
 use crate::model::{
     Announcement, CAPABILITY_CONTROL_REVOKE, CAPABILITY_DEVICE_SETTINGS,
     CAPABILITY_IDENTIFY_DISPLAYS, CAPABILITY_INPUT_ECHO, CAPABILITY_INPUT_V2, CAPABILITY_MEDIA,
-    CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CoreConfig, DISCOVERY_GROUP,
+    CAPABILITY_POINTER_LOCK, CAPABILITY_PRESENCE, CAPABILITY_WAKE, CoreConfig, DISCOVERY_GROUP,
     LC_INPUT_FLAG_KEY_REPEAT, LC_INPUT_KEY_DOWN, LcInputEvent, Peer, PlacementRecord, WireMessage,
     negotiate_protocol,
 };
@@ -161,6 +161,9 @@ pub enum Command {
         peer_id: String,
         settings: Value,
     },
+    /// The hardware addresses this device can be woken by (`WakeInfo`, see
+    /// `wake.rs`); none if it cannot be woken.
+    SetWakeAddresses(Vec<[u8; 6]>),
     Stop,
 }
 
@@ -375,6 +378,7 @@ async fn run(
         modifier_map: config.modifier_map,
         pointer_locked: false,
         device_settings: None,
+        wake_addresses: None,
         refitting: false,
         capabilities,
         fingerprint: fingerprint.clone(),
@@ -472,6 +476,7 @@ async fn run(
                     Some(Command::ChangeDeviceSettings { peer_id, settings }) => {
                         state.change_device_settings(&peer_id, &settings)
                     }
+                    Some(Command::SetWakeAddresses(addresses)) => state.set_wake_addresses(&addresses),
                     Some(
                         Command::SendInput(_)
                         | Command::SetInputTarget(_)
@@ -667,6 +672,9 @@ struct Runtime<'a> {
     pointer_locked: bool,
     /// What this device is set to, as its shell said (`SetDeviceSettings`).
     device_settings: Option<String>,
+    /// The hardware addresses this device can be woken by, once its shell
+    /// said (`SetWakeAddresses`).
+    wake_addresses: Option<Vec<[u8; 6]>>,
     /// Placements are being fitted again after a change (`refit_others`);
     /// the moves that makes do not start another round.
     refitting: bool,
@@ -1317,6 +1325,33 @@ impl Runtime<'_> {
         }
     }
 
+    /// The hardware addresses this device can be woken by changed, or are
+    /// known at last: peers hear.
+    fn set_wake_addresses(&mut self, addresses: &[[u8; 6]]) {
+        let addresses = crate::wake::normalized(addresses);
+        if self.wake_addresses.as_ref() == Some(&addresses) {
+            return;
+        }
+        self.wake_addresses = Some(addresses);
+        let ids: Vec<u64> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.tell_wake_addresses(id);
+        }
+    }
+
+    /// Tells a peer how to wake this device, if its shell said.
+    fn tell_wake_addresses(&self, id: u64) {
+        let (Some(session), Some(addresses)) = (self.sessions.get(&id), &self.wake_addresses)
+        else {
+            return;
+        };
+        if session.established() && session.connection.capabilities & CAPABILITY_WAKE != 0 {
+            let _ = session.connection.send_control(WireMessage::WakeInfo {
+                addresses: addresses.clone(),
+            });
+        }
+    }
+
     fn change_device_settings(&mut self, peer_id: &str, settings: &Value) {
         let settings = settings.to_string();
         let session = self
@@ -1711,8 +1746,23 @@ impl Runtime<'_> {
             } => {
                 if self.data_links.contains_key(&connection_id) {
                     self.close_data_link(connection_id, &reason);
-                } else if self.sessions.contains_key(&connection_id) {
-                    self.close_session(connection_id, &reason, true);
+                } else if let Some(session) = self.sessions.get(&connection_id) {
+                    // The peer said it goes to sleep: the shell hears that
+                    // first, then the ordinary end of the session (shells
+                    // match on `disconnected` reasons, which stay as they
+                    // were).
+                    let reason = if reason == crate::transport::PEER_ASLEEP {
+                        if session.established() {
+                            self.sink.emit_value(json!({
+                                "event": "peer_asleep",
+                                "peer_id": session.peer_id()
+                            }));
+                        }
+                        crate::transport::PEER_CLOSED
+                    } else {
+                        reason.as_str()
+                    };
+                    self.close_session(connection_id, reason, true);
                 }
             }
         }
@@ -1755,6 +1805,7 @@ impl Runtime<'_> {
                 | WireMessage::Placement { .. }
                 | WireMessage::MediaOffer { .. }
                 | WireMessage::DeviceSettings { .. }
+                | WireMessage::WakeInfo { .. }
                 | WireMessage::DataInvite { .. } => {
                     let kind = std::mem::discriminant(&message);
                     session
@@ -1897,6 +1948,18 @@ impl Runtime<'_> {
                     session.peer_id(),
                     &settings,
                 );
+            }
+            // For the shell to keep: needed when the peer is asleep and gone.
+            WireMessage::WakeInfo { addresses } => {
+                let addresses: Vec<String> = crate::wake::normalized(&addresses)
+                    .into_iter()
+                    .map(crate::wake::format_address)
+                    .collect();
+                self.sink.emit_value(json!({
+                    "event": "peer_wake",
+                    "peer_id": session.peer_id(),
+                    "addresses": addresses
+                }));
             }
             // Data-link messages have no business on a control connection.
             WireMessage::DataHello { .. }
@@ -2147,6 +2210,7 @@ impl Runtime<'_> {
         self.invite_data_link(id);
         self.offer_media(id);
         self.tell_device_settings(id);
+        self.tell_wake_addresses(id);
         // What the peer sent while it waited for this side.
         for message in held {
             self.message(id, message, None);

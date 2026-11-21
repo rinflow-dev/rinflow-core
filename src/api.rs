@@ -214,6 +214,14 @@ impl Core {
         })
     }
 
+    /// The hardware addresses this device can be woken by while it sleeps
+    /// (none: it cannot be). Peers report `peer_wake`, now and whenever they
+    /// connect; their shells keep the addresses and wake this device with
+    /// [`crate::wake::send`]. See `wake.rs`.
+    pub fn set_wake_addresses(&self, addresses: Vec<[u8; 6]>) -> Result<(), String> {
+        self.thread.send(Command::SetWakeAddresses(addresses))
+    }
+
     /// Where the frames of watched pictures go (see `media.rs`): called
     /// with the peer's device ID, on the core's threads, in order. Set it
     /// before `watch`.

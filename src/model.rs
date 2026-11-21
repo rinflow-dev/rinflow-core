@@ -75,6 +75,9 @@ pub const MAX_DEVICE_SETTINGS_LENGTH: usize = 4096;
 /// sender gives its displays on its screens. Sent only to peers with this
 /// bit.
 pub const CAPABILITY_IDENTIFY_DISPLAYS: u64 = 1 << 17;
+/// Understands `WakeInfo`: devices tell each other the hardware addresses
+/// they can be woken by (see `wake.rs`). Sent only to peers with this bit.
+pub const CAPABILITY_WAKE: u64 = 1 << 18;
 /// Files up to this size in all are received without asking.
 pub const DEFAULT_MAX_AUTO_RECEIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
@@ -87,7 +90,8 @@ pub const LOCAL_CAPABILITIES: u64 = CAPABILITY_INPUT_V2
     | CAPABILITY_PAIRING_V2
     | CAPABILITY_INPUT_ECHO
     | CAPABILITY_DEVICE_SETTINGS
-    | CAPABILITY_IDENTIFY_DISPLAYS;
+    | CAPABILITY_IDENTIFY_DISPLAYS
+    | CAPABILITY_WAKE;
 /// Addresses the user added by hand (`CoreConfig::manual_addresses`), at most.
 pub const MAX_MANUAL_ADDRESSES: usize = 32;
 
@@ -663,6 +667,13 @@ pub enum WireMessage {
     /// `CAPABILITY_IDENTIFY_DISPLAYS`.
     IdentifyDisplays {
         first: u32,
+    },
+    /// The hardware addresses the sender can be woken by while it sleeps
+    /// (see `wake.rs`), at most `MAX_WAKE_ADDRESSES`; none if it cannot be
+    /// woken. Sent when the session starts and whenever they change. Only
+    /// to peers with `CAPABILITY_WAKE`.
+    WakeInfo {
+        addresses: Vec<[u8; 6]>,
     },
 }
 

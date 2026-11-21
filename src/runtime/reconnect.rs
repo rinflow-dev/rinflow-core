@@ -27,9 +27,9 @@
 //!
 //! Sleep and network changes, which the shell reports:
 //! - **Going to sleep** (`lc_core_system_will_sleep`): every session ends now,
-//!   in order. Peers see `"peer closed the connection"` (no error), get
-//!   control back and release what this device held, at once instead of
-//!   after a heartbeat timeout. Until the system is asleep, no connections
+//!   in order. Peers see `peer_asleep` and then `"peer closed the
+//!   connection"` (no error), get control back and release what this device
+//!   held, at once instead of after a heartbeat timeout. Until the system is asleep, no connections
 //!   are made or taken, so the peers' attempts to reconnect are refused.
 //! - **Woken up, or the network changed** (`lc_core_network_changed`): this
 //!   device announces itself and rejoins the discovery group now, dials the
@@ -40,7 +40,7 @@
 
 use super::trust;
 use super::{Runtime, SESSION_TIMEOUT};
-use crate::transport::{PAIRING_DECLINED_BY_PEER, PEER_DISCONNECTED, PEER_REFUSED};
+use crate::transport::{CloseCode, PAIRING_DECLINED_BY_PEER, PEER_DISCONNECTED, PEER_REFUSED};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
@@ -128,8 +128,13 @@ impl Runtime<'_> {
         self.asleep_until = Some(Instant::now() + SLEEP_HOLD);
         let ids: Vec<u64> = self.sessions.keys().copied().collect();
         for id in ids {
-            // An ordinary close: the peers try again, and find this device
-            // once it is awake and announces itself.
+            // An ordinary close that says why (peers report `peer_asleep`,
+            // and may wake this device later, see `wake.rs`): the peers try
+            // again, and find this device once it is awake and announces
+            // itself.
+            if let Some(session) = self.sessions.get(&id) {
+                session.connection.close_with(CloseCode::Sleeping);
+            }
             self.close_session(id, GOING_TO_SLEEP, true);
         }
     }

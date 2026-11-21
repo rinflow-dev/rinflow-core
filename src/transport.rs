@@ -42,6 +42,11 @@ pub const PAIRING_TIMED_OUT: &str = "pairing timed out";
 /// takes paired devices, or it forgot this one.
 pub const PEER_REFUSED: &str = "refused by the other device";
 
+/// What a connection ends with when the peer closed it because it is going
+/// to sleep. Not a `disconnected` reason: the runtime reports `peer_asleep`
+/// and then ends the session as for [`PEER_CLOSED`].
+pub const PEER_ASLEEP: &str = "the other device went to sleep";
+
 /// Why this side closes a connection, sent as the application error code of
 /// its QUIC CONNECTION_CLOSE frame. A message queued just before closing
 /// would be dropped with the connection; the close frame always arrives.
@@ -59,6 +64,9 @@ pub enum CloseCode {
     Refused = 3,
     /// Pairing was not confirmed in time: [`PAIRING_TIMED_OUT`].
     PairingTimedOut = 4,
+    /// This device is going to sleep: [`PEER_ASLEEP`]. An older peer takes
+    /// it for an orderly close, as it was before.
+    Sleeping = 5,
 }
 
 impl CloseCode {
@@ -69,6 +77,7 @@ impl CloseCode {
             2 => PEER_DISCONNECTED,
             3 => PEER_REFUSED,
             4 => PAIRING_TIMED_OUT,
+            5 => PEER_ASLEEP,
             _ => PEER_CLOSED,
         }
     }

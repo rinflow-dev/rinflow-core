@@ -20,6 +20,7 @@ mod remap;
 mod runtime;
 mod secure;
 mod transport;
+pub mod wake;
 
 #[cfg(target_os = "android")]
 mod android_jni;
@@ -418,6 +419,26 @@ mod tests {
         let bytes = encode_message(&message).expect("encode");
         assert_eq!(decode_message(&bytes).expect("decode"), Some(message));
         assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn wake_addresses_round_trip_and_are_bounded() {
+        let message = WireMessage::WakeInfo {
+            addresses: vec![[0x00, 0x1b, 0x63, 0x84, 0x45, 0xe6], [2, 0, 0, 0, 0, 1]],
+        };
+        let bytes = encode_message(&message).expect("encode");
+        assert_eq!(decode_message(&bytes).expect("decode"), Some(message));
+        assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+        // A device that cannot be woken says so with none.
+        let none = WireMessage::WakeInfo {
+            addresses: Vec::new(),
+        };
+        let bytes = encode_message(&none).expect("encode");
+        assert_eq!(decode_message(&bytes).expect("decode"), Some(none));
+        let many = WireMessage::WakeInfo {
+            addresses: vec![[2, 0, 0, 0, 0, 1]; crate::wake::MAX_WAKE_ADDRESSES + 1],
+        };
+        assert!(encode_message(&many).is_err());
     }
 
     /// A device with a picture offers it to a peer that can watch; the
@@ -3536,6 +3557,10 @@ mod tests {
             event["event"] == "remote_control_started"
         });
         b.thread.send(Command::WillSleep).unwrap();
+        // A hears why first (it may wake B later), then the ordinary end.
+        wait_for_event(&a.events, Duration::from_secs(2), |event| {
+            event["event"] == "peer_asleep" && event["peer_id"] == "sleep-b"
+        });
         wait_for_event(&a.events, Duration::from_secs(2), |event| {
             event["event"] == "remote_control_ended" && event["peer_id"] == "sleep-b"
         });
@@ -3769,6 +3794,56 @@ mod tests {
             .send(Command::SetDeviceSettings(settings("second")))
             .unwrap();
         told("second");
+        a.thread.stop_and_join();
+        b.thread.stop_and_join();
+    }
+
+    #[test]
+    fn devices_tell_each_other_how_to_wake_them() {
+        let _network = network_test();
+        let discovery_port = free_udp_port();
+        let mut a = test_core("wake-a", discovery_port);
+        let mut b = test_core("wake-b", discovery_port);
+        let first = [0x00, 0x1b, 0x63, 0x84, 0x45, 0xe6];
+        let second = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        // Known before anyone connects: told when the session starts. What
+        // no adapter has for an address is left out.
+        b.thread
+            .send(Command::SetWakeAddresses(vec![first, [0; 6], first]))
+            .unwrap();
+        wait_for_peers(&a, &["wake-b"]);
+        a.thread.send(Command::Connect("wake-b".into())).unwrap();
+        wait_connected(&a, "wake-b");
+        wait_connected(&b, "wake-a");
+        let told = |addresses: Value| {
+            wait_for_event(&a.events, Duration::from_secs(2), move |event| {
+                event["event"] == "peer_wake"
+                    && event["peer_id"] == "wake-b"
+                    && event["addresses"] == addresses
+            })
+        };
+        told(serde_json::json!(["00:1b:63:84:45:e6"]));
+        // A change (another adapter came up) is told at once; the same
+        // addresses again are not.
+        b.thread
+            .send(Command::SetWakeAddresses(vec![first, second]))
+            .unwrap();
+        told(serde_json::json!([
+            "00:1b:63:84:45:e6",
+            "02:11:22:33:44:55"
+        ]));
+        b.thread
+            .send(Command::SetWakeAddresses(vec![first, second]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(events_named(&a, "peer_wake").is_empty());
+        // It can no longer be woken: none.
+        b.thread
+            .send(Command::SetWakeAddresses(Vec::new()))
+            .unwrap();
+        told(serde_json::json!([]));
+        // A never said how to wake it: B hears nothing.
+        assert!(events_named(&b, "peer_wake").is_empty());
         a.thread.stop_and_join();
         b.thread.stop_and_join();
     }

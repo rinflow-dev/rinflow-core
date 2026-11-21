@@ -43,8 +43,9 @@ pub struct LcCore {
 /// `lc_file_lease_close` and `lc_core_revoke_file_streams`.
 /// Within 11: attached screens (config key `attachable`,
 /// `lc_core_set_relay_target`, `lc_core_relay_input`, events
-/// `attached_screens` / `relay_ended`), device settings and identifying
-/// displays.
+/// `attached_screens` / `relay_ended`), device settings, identifying
+/// displays, and waking devices (`lc_core_set_wake_addresses`,
+/// `lc_wake_send`, events `peer_wake` / `peer_asleep`).
 #[unsafe(no_mangle)]
 pub extern "C" fn lc_core_abi_version() -> u32 {
     11
@@ -543,6 +544,53 @@ unsafe fn settings_argument(json: *const c_char) -> Option<serde_json::Value> {
     let settings: serde_json::Value = serde_json::from_str(&json).ok()?;
     (settings.is_object() && json.len() <= crate::model::MAX_DEVICE_SETTINGS_LENGTH)
         .then_some(settings)
+}
+
+/// The hardware addresses this device can be woken by while it sleeps: a
+/// JSON array such as `["aa:bb:cc:dd:ee:ff"]` (empty: it cannot be woken).
+/// Peers report `peer_wake`, now and whenever they connect. Added within
+/// version 11 (capability bit 18, wire message 34; see `wake.rs`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_core_set_wake_addresses(
+    core: *mut LcCore,
+    addresses_json: *const c_char,
+) -> bool {
+    match unsafe { wake_addresses_argument(addresses_json) } {
+        Some(addresses) => send_command(core, Command::SetWakeAddresses(addresses)),
+        None => false,
+    }
+}
+
+/// Sends one round of magic packets for a device with these hardware
+/// addresses (a JSON array, as `peer_wake` reports them), out of every
+/// network interface. `last_address` is the IPv4 address the device was
+/// last seen at, or NULL. Needs no core: the device to wake is not
+/// connected. Send a few rounds, until the device shows up (`peer_up`).
+/// False if nothing could be sent. Added within version 11.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lc_wake_send(
+    addresses_json: *const c_char,
+    last_address: *const c_char,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(addresses) = (unsafe { wake_addresses_argument(addresses_json) }) else {
+            return false;
+        };
+        let last_address =
+            unsafe { string_argument(last_address) }.and_then(|address| address.parse().ok());
+        crate::wake::send(&addresses, last_address).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+/// A JSON array of hardware addresses; `None` if one cannot be read.
+unsafe fn wake_addresses_argument(json: *const c_char) -> Option<Vec<[u8; 6]>> {
+    let json = unsafe { string_argument(json) }?;
+    serde_json::from_str::<Vec<String>>(&json)
+        .ok()?
+        .iter()
+        .map(|address| crate::wake::parse_address(address))
+        .collect()
 }
 
 /// Lets peers drive this device (the default), or stops them. Added within

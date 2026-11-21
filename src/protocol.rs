@@ -6,6 +6,7 @@ use crate::clipboard::{CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_SIZE};
 use crate::files::FILE_CHUNK_SIZE;
 use crate::layout::{Display, MAX_DISPLAYS, Offset, validate_displays};
 use crate::model::{LcInputEvent, MAX_DEVICE_SETTINGS_LENGTH, MAX_INPUT_BATCH_SIZE, WireMessage};
+use crate::wake::MAX_WAKE_ADDRESSES;
 use std::io;
 
 const WIRE_MAGIC: [u8; 2] = *b"LC";
@@ -46,6 +47,7 @@ const MESSAGE_MEDIA_OFFER: u8 = 30;
 const MESSAGE_DEVICE_SETTINGS: u8 = 31;
 const MESSAGE_DEVICE_SETTINGS_CHANGE: u8 = 32;
 const MESSAGE_IDENTIFY_DISPLAYS: u8 = 33;
+const MESSAGE_WAKE_INFO: u8 = 34;
 const MAX_REASON_LENGTH: usize = 256;
 
 pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
@@ -83,6 +85,7 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
         WireMessage::FileOfferRevoke { .. } => MESSAGE_FILE_OFFER_REVOKE,
         WireMessage::DeviceSettings { .. } => MESSAGE_DEVICE_SETTINGS,
         WireMessage::DeviceSettingsChange { .. } => MESSAGE_DEVICE_SETTINGS_CHANGE,
+        WireMessage::WakeInfo { .. } => MESSAGE_WAKE_INFO,
     };
     let mut encoder = Encoder::with_header(message_type);
     match message {
@@ -275,6 +278,15 @@ pub fn encode_message(message: &WireMessage) -> io::Result<Vec<u8>> {
             encoder.bytes.extend_from_slice(settings.as_bytes());
         }
         WireMessage::IdentifyDisplays { first } => encoder.u32(*first),
+        WireMessage::WakeInfo { addresses } => {
+            if addresses.len() > MAX_WAKE_ADDRESSES {
+                return Err(invalid_data("too many wake addresses"));
+            }
+            encoder.u8(addresses.len() as u8);
+            for address in addresses {
+                encoder.bytes.extend_from_slice(address);
+            }
+        }
         WireMessage::PairCommit { commitment: value }
         | WireMessage::PairNonce { nonce: value }
         | WireMessage::PairReveal { nonce: value } => encoder.bytes.extend_from_slice(value),
@@ -528,6 +540,17 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<Option<WireMessage>> {
         MESSAGE_IDENTIFY_DISPLAYS => WireMessage::IdentifyDisplays {
             first: decoder.u32()?,
         },
+        MESSAGE_WAKE_INFO => {
+            let count = decoder.u8()? as usize;
+            if count > MAX_WAKE_ADDRESSES {
+                return Err(invalid_data("too many wake addresses"));
+            }
+            let mut addresses = Vec::with_capacity(count);
+            for _ in 0..count {
+                addresses.push(decoder.array()?);
+            }
+            WireMessage::WakeInfo { addresses }
+        }
         MESSAGE_PAIR_REQUEST => WireMessage::PairRequest,
         MESSAGE_PAIR_ACCEPT => WireMessage::PairAccept,
         MESSAGE_USER_ACTIVE => WireMessage::UserActive,

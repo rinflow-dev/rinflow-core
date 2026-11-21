@@ -62,7 +62,10 @@
  *      and 32, only to peers that announce the bit;
  *    - identifying displays across devices (lc_core_identify_displays,
  *      event "identify_displays"; see Identify displays); capability bit
- *      17, wire message 33.
+ *      17, wire message 33;
+ *    - waking a sleeping device (lc_core_set_wake_addresses, lc_wake_send,
+ *      events "peer_wake" and "peer_asleep"; see Waking a device);
+ *      capability bit 18, wire message 34, close code 5.
  */
 #define LC_CORE_ABI_VERSION 11
 
@@ -334,6 +337,38 @@ bool lc_core_change_device_settings(LcCore *core, const char *peer_id,
  * False for a missing peer_id.
  */
 bool lc_core_identify_displays(LcCore *core, const char *peer_id, uint32_t first);
+
+/*
+ * Waking a device (within version 11): Wake-on-LAN. A sleeping device's
+ * network adapter wakes it on a "magic packet" naming the adapter's
+ * hardware (MAC) address.
+ *
+ * Each shell says which hardware addresses wake its device, at start and
+ * when its adapters change: lc_core_set_wake_addresses with a JSON array
+ * such as ["00:1b:63:84:45:e6"] (at most 8; empty: it cannot be woken).
+ * Peers report
+ *   {"event":"peer_wake","peer_id":…,"addresses":["00:1b:63:84:45:e6"]}
+ * when they connect and whenever the addresses change. Save them with the
+ * device: they are needed once it is gone. A peer whose core is older (no
+ * capability bit 18) is sent nothing and reports nothing.
+ *
+ * A device that goes to sleep (lc_core_system_will_sleep) says so as it
+ * closes its sessions. Its peers report
+ *   {"event":"peer_asleep","peer_id":…}
+ * and then the ordinary "disconnected" ("peer closed the connection").
+ *
+ * lc_wake_send sends one round of magic packets for the given addresses (a
+ * JSON array, as "peer_wake" gave them) out of every IPv4 interface: to
+ * each network's broadcast address, to the limited broadcast, and to
+ * last_address (the device's last IPv4 address, or NULL) if it is on that
+ * network. It takes no core and blocks only for the sends. A device takes
+ * seconds to wake and a packet can be lost: send a round every second or
+ * two until the device shows up ("peer_up"); the core then connects to it
+ * as usual. False if nothing could be sent (no network, no valid address).
+ * Magic packets do not cross routers.
+ */
+bool lc_core_set_wake_addresses(LcCore *core, const char *addresses_json);
+bool lc_wake_send(const char *addresses_json, const char *last_address);
 /* Chooses where lc_core_send_input / lc_core_reset_input go. The previous
  * target gets a reset first. NULL drops input until a target is set. When no
  * target was ever set, the first peer to connect becomes the target. */

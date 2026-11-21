@@ -13,6 +13,7 @@ Notable changes are recorded here. The format follows [Keep a Changelog](https:/
 - Attached screens: a KVM (`attachable`) placed right beside a device counts among that device's displays for every other peer, and while a peer drives the device, input on that screen is passed on to the KVM without giving up control (`lc_core_set_relay_target`, `lc_core_relay_input`)
 - Device settings: a device without a screen of its own (a KVM) says what it is set to (`lc_core_set_device_settings`, event `peer_settings`), and a paired peer asks it to change (`lc_core_change_device_settings`, event `settings_change_requested`); the core carries the JSON unread
 - Identify displays: the device where the user asks numbers the displays of its arrangement, and each connected peer shows its numbers on its own screens (`lc_core_identify_displays`, event `identify_displays`)
+- Waking a device over the network (Wake-on-LAN): devices tell each other the hardware addresses that wake them (`lc_core_set_wake_addresses`, event `peer_wake`), `lc_wake_send` sends the magic packets out of every interface, and a device going to sleep says so (event `peer_asleep`, before the usual `disconnected`)
 
 ## [0.0.1] - 2026-11-16
 
