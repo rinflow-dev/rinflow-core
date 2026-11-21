@@ -82,6 +82,7 @@ Events arrive as JSON strings on the core's own threads. See the [C API](docs/c-
 - [Security design](docs/security.md)
 - [Clipboard and files](docs/clipboard-and-files.md) (in Chinese)
 - [Pictures](docs/media.md): a device's screen sent to the peers that watch it
+- [A window as a picture](docs/window-pictures.md): one window of a computer shown and used on another device
 
 ## Contributing
 
